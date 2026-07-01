@@ -172,6 +172,7 @@ test("risk engine blocks live mode, duplicates, missing exit plans, and daily li
       source: "alpaca",
     },
     exitPlan: createExitPlan({ symbol: "PLTR", side: "buy", entryPrice: 100 }),
+    breaker: { status: "ok" },
     metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 1 },
     limits: { maxDailyLoss: 500, maxDailyTradeCount: 5, maxOpenPositions: 5, minBuyingPower: 1000 },
   });

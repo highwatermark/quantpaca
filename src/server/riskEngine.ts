@@ -7,6 +7,9 @@ type RiskInput = {
   brokerConfig: BrokerConfig;
   portfolio: PortfolioAssessment;
   exitPlan?: ExitPlan;
+  breaker: {
+    status: "ok" | "block_new_buys" | "close_only";
+  };
   metrics: {
     dailyLoss: number;
     dailyTradeCount: number;
@@ -48,6 +51,10 @@ export function reviewRisk(input: RiskInput): RiskDecision {
     parsed.set(fieldName, result.value);
   }
   const num = (fieldName: string): number => parsed.get(fieldName)!;
+
+  if (input.intent.side === "buy" && input.breaker.status !== "ok") {
+    return { status: "rejected", reason: `Portfolio drawdown breaker is ${input.breaker.status}; new buys are blocked.` };
+  }
 
   const symbol = validateSymbol(input.intent.symbol);
   if (!symbol.valid) return { status: "rejected", reason: symbol.reason || "Invalid symbol." };

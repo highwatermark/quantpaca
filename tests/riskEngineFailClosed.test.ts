@@ -40,6 +40,7 @@ const baseInput = () => ({
     regimeChangeAction: "close" as const,
     emergencyAction: "market_sell" as const,
   },
+  breaker: { status: "ok" as const },
   metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 0 },
   limits: { maxDailyLoss: 500, maxDailyTradeCount: 10, maxOpenPositions: 10, minBuyingPower: 100 },
 });

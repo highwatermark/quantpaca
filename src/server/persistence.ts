@@ -29,12 +29,15 @@ export type ProductionStore = {
   listExitPlans(limit?: number): unknown[];
   saveReconciliationReport(report: ReconciliationReport): void;
   latestReconciliationReport(): ReconciliationReport | undefined;
+  saveBreakerState(state: { asOf: string; status: string }): void;
+  latestBreakerState<T = unknown>(): T | undefined;
   close(): void;
 };
 
 export function createProductionStore(dbPath = path.join(process.cwd(), "data", "quantpaca.sqlite")): ProductionStore {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new NodeDatabaseSync(dbPath) as DatabaseSync;
+  db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
   db.exec(`
     CREATE TABLE IF NOT EXISTS audit_events (
       id TEXT PRIMARY KEY,
@@ -77,6 +80,12 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       payload_json TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS reconciliation_reports (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      status TEXT NOT NULL,
+      payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS breaker_states (
       id TEXT PRIMARY KEY,
       timestamp TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -159,6 +168,13 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     },
     latestReconciliationReport() {
       return rowToPayload<ReconciliationReport>(db.prepare("SELECT payload_json FROM reconciliation_reports ORDER BY timestamp DESC LIMIT 1").get());
+    },
+    saveBreakerState(state) {
+      db.prepare("INSERT OR REPLACE INTO breaker_states (id, timestamp, status, payload_json) VALUES (?, ?, ?, ?)")
+        .run(`breaker-${state.asOf}`, state.asOf, state.status, JSON.stringify(state));
+    },
+    latestBreakerState() {
+      return rowToPayload(db.prepare("SELECT payload_json FROM breaker_states ORDER BY timestamp DESC LIMIT 1").get());
     },
     close() {
       db.close();

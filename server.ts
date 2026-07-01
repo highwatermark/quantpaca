@@ -23,6 +23,7 @@ import { reconcileBrokerState } from "./src/server/reconciliationEngine";
 import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, createConfirmationToken, parseTelegramAdminRoles } from "./src/server/telegramEngine";
 import { createExitPlan } from "./src/server/exitEngine";
 import { reviewRisk } from "./src/server/riskEngine";
+import { evaluateBreaker } from "./src/server/breakerEngine";
 import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
@@ -127,6 +128,22 @@ async function executeTradeIntent(input: {
     openOrders: await getAlpacaOpenOrders(brokerConfig),
     source: brokerConfig.configured ? "alpaca" : "local_simulated_snapshot",
   });
+  const previousBreaker = productionStore.latestBreakerState<{ peakEquity: number | null }>();
+  const breakerState = evaluateBreaker({
+    equity: portfolio.equity,
+    // Simulated portfolios have no prior-close equity; treating equity as last_equity
+    // zeroes the daily-loss check offline. A REAL broker account must supply last_equity —
+    // no fallback when brokerConfig.configured is true.
+    lastEquity: brokerConfig.configured ? portfolio.last_equity : (portfolio.last_equity ?? portfolio.equity),
+    previousPeakEquity: previousBreaker?.peakEquity ?? null,
+    baselineEquity: riskLimits.baselineEquity,
+    limits: {
+      maxDailyLossPercent: riskLimits.maxDailyLossPercent,
+      maxDrawdownFromPeakPercent: riskLimits.maxDrawdownFromPeakPercent,
+      maxDrawdownFromBaselinePercent: riskLimits.maxDrawdownFromBaselinePercent,
+    },
+  });
+  productionStore.saveBreakerState(breakerState);
   const exitPlan = createExitPlan({
     symbol: input.request.symbol,
     side: input.request.side,
@@ -148,8 +165,19 @@ async function executeTradeIntent(input: {
     brokerConfig,
     portfolio: portfolioAssessment,
     exitPlan,
+    breaker: { status: breakerState.status },
     metrics: {
-      dailyLoss: 0,
+      dailyLoss: (() => {
+        // Same fallback rule as the breaker input above: a REAL broker must supply
+        // last_equity (missing -> NaN -> reviewRisk fails closed); the simulated
+        // portfolio treats equity as prior close (daily loss 0).
+        const lastEquityForDaily = brokerConfig.configured
+          ? Number(portfolio.last_equity)
+          : Number(portfolio.last_equity ?? portfolio.equity);
+        return breakerState.metrics.equity !== null
+          ? breakerState.metrics.equity - lastEquityForDaily
+          : Number.NaN;
+      })(),
       dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
       openPositionCount: portfolioAssessment.positions.length,
     },
@@ -287,6 +315,7 @@ async function getAlpacaPortfolio(brokerConfig: BrokerConfig = getBrokerConfig()
       buying_power: account.buying_power,
       portfolio_value: account.portfolio_value,
       equity: account.equity,
+      last_equity: account.last_equity,
       long_market_value: account.long_market_value,
       daytrade_count: account.daytrade_count,
       positions: positions.map((p: any) => ({
@@ -625,6 +654,10 @@ app.get("/api/regime/latest", (req, res) => {
   const conservative = detectRegime({});
   productionStore.saveRegimeAssessment(conservative);
   res.json(conservative);
+});
+
+app.get("/api/breaker/latest", (req, res) => {
+  res.json(productionStore.latestBreakerState() || { status: "ok", reasons: ["no_evaluation_yet"], asOf: null });
 });
 
 app.get("/api/portfolio/assessment", async (req, res) => {
