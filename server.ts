@@ -23,6 +23,7 @@ import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, 
 import { createExitPlan } from "./src/server/exitEngine";
 import { reviewRisk } from "./src/server/riskEngine";
 import { validateStartupEnv } from "./src/server/startupChecks";
+import { installProcessGuards } from "./src/server/processGuards";
 
 dotenv.config();
 
@@ -1417,9 +1418,15 @@ async function run() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server starting on port ${PORT}`);
     startTelegramRuntime();
+  });
+
+  installProcessGuards({
+    log: (message, error) => (error === undefined ? console.error(message) : console.error(message, error)),
+    exit: (code) => process.exit(code),
+    closeServer: (onClosed) => httpServer.close(onClosed),
   });
 }
 
