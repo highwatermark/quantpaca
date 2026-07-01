@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -32,8 +33,9 @@ const PORT = 3000;
 
 app.use(express.json());
 
-const DB_PATH = path.join(process.cwd(), "data", "db.json");
-const productionStore = createProductionStore(path.join(process.cwd(), "data", "quantpaca.sqlite"));
+const DATA_DIR = process.env.QUANTPACA_DATA_DIR || path.join(process.cwd(), "data");
+const DB_PATH = path.join(DATA_DIR, "db.json");
+const productionStore = createProductionStore(path.join(DATA_DIR, "quantpaca.sqlite"));
 
 // Simple queue-based lock to serialize all operations that read or write to DB
 class DBConcurrencyMutex {
@@ -73,6 +75,12 @@ function appendAuditEvents(db: any, events: AuditEvent[]) {
   productionStore.appendAuditEvents(events);
 }
 
+function tokensMatch(provided: string, expected: string): boolean {
+  const a = crypto.createHash("sha256").update(provided).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 function requireAdminCommand(req: express.Request, res: express.Response, next: express.NextFunction) {
   const expectedToken = process.env.ADMIN_API_TOKEN;
   if (!expectedToken) {
@@ -81,7 +89,8 @@ function requireAdminCommand(req: express.Request, res: express.Response, next: 
     });
     return;
   }
-  if (req.header("x-admin-token") !== expectedToken) {
+  const providedToken = req.header("x-admin-token") || "";
+  if (!tokensMatch(providedToken, expectedToken)) {
     res.status(401).json({ error: "Unauthorized command request." });
     return;
   }
@@ -554,13 +563,16 @@ app.get("/api/config", (req, res) => {
   res.json(redactConfigForClient(db.config));
 });
 
-app.post("/api/config", async (req, res) => {
+app.post("/api/config", requireAdminCommand, async (req, res) => {
   const release = await dbMutex.acquire();
   try {
     const db = readDB();
     db.config = stripPersistedSecrets({ ...db.config, ...req.body });
     writeDB(db);
     res.json({ success: true, config: redactConfigForClient(db.config) });
+  } catch (error) {
+    console.error("Config update failed:", error);
+    res.status(500).json({ error: "Failed to update configuration." });
   } finally {
     release();
   }
@@ -1430,4 +1442,8 @@ async function run() {
   });
 }
 
-run();
+export { app, dbMutex, handleTelegramCommand, readDB };
+
+if (process.env.NODE_ENV !== "test") {
+  run();
+}
