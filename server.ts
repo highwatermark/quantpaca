@@ -388,81 +388,81 @@ async function handleTelegramCommand(update: any) {
   const userId = String(message?.from?.id || "");
   if (!text || !chatId || !userId) return;
 
-  const db = readDB();
   const command = text.split(/\s+/)[0];
   const roles = parseTelegramAdminRoles(process.env.TELEGRAM_ADMIN_ROLES);
   const auth = authorizeTelegramCommand({ userId, command, roles });
-  const auditEvent: AuditEvent = {
-    id: `tg-${update.update_id || Date.now()}`,
-    timestamp: new Date().toISOString(),
-    type: "telegram",
-    actor: userId,
-    message: `Telegram command ${command} ${auth.allowed ? "accepted" : "rejected"}`,
-    details: { command, chatId, auth },
-  };
-  appendAuditEvents(db, [auditEvent]);
 
-  if (!auth.allowed) {
-    writeDB(db);
-    await sendTelegramBotMessage(chatId, `Rejected: ${auth.reason || "unauthorized"}.`);
-    return;
-  }
+  const outbound: string[] = [];
+  let needsReadOnlyReply = false;
 
-  if (command === "/confirm") {
-    const tokenValue = text.split(/\s+/)[1];
-    const token = pendingTelegramConfirmations.get(tokenValue);
-    if (!token) {
-      writeDB(db);
-      await sendTelegramBotMessage(chatId, "Confirmation rejected: unknown token.");
-      return;
+  const release = await dbMutex.acquire();
+  try {
+    const db = readDB();
+    const auditEvent: AuditEvent = {
+      id: `tg-${update.update_id || Date.now()}`,
+      timestamp: new Date().toISOString(),
+      type: "telegram",
+      actor: userId,
+      message: `Telegram command ${command} ${auth.allowed ? "accepted" : "rejected"}`,
+      details: { command, chatId, auth },
+    };
+    appendAuditEvents(db, [auditEvent]);
+
+    if (!auth.allowed) {
+      outbound.push(`Rejected: ${auth.reason || "unauthorized"}.`);
+    } else if (command === "/confirm") {
+      const tokenValue = text.split(/\s+/)[1];
+      const token = pendingTelegramConfirmations.get(tokenValue);
+      if (!token) {
+        outbound.push("Confirmation rejected: unknown token.");
+      } else {
+        const consumed = consumeConfirmationToken({ token, userId, action: token.action });
+        if (!consumed.accepted) {
+          outbound.push(`Confirmation rejected: ${consumed.reason}.`);
+        } else {
+          pendingTelegramConfirmations.delete(tokenValue);
+          outbound.push(`Confirmed action: ${token.action}. Submit through the admin API to execute.`);
+        }
+      }
+    } else if (command === "/close_all") {
+      const token = createConfirmationToken({ userId, action: "close_all" });
+      pendingTelegramConfirmations.set(token.token, token);
+      outbound.push(`Close-all requires confirmation. Reply: /confirm ${token.token}`);
+    } else if (command === "/pause" || command === "/block_buys") {
+      db.config.system.autoTrading = false;
+      outbound.push("Auto trading paused. New buys are blocked.");
+    } else if (command === "/resume") {
+      db.config.system.autoTrading = true;
+      outbound.push("Auto trading resumed subject to risk checks.");
+    } else {
+      needsReadOnlyReply = true;
     }
-    const consumed = consumeConfirmationToken({ token, userId, action: token.action });
-    if (!consumed.accepted) {
-      writeDB(db);
-      await sendTelegramBotMessage(chatId, `Confirmation rejected: ${consumed.reason}.`);
-      return;
-    }
-    pendingTelegramConfirmations.delete(tokenValue);
+
     writeDB(db);
-    await sendTelegramBotMessage(chatId, `Confirmed action: ${token.action}. Submit through the admin API to execute.`);
-    return;
+  } finally {
+    release();
   }
 
-  if (command === "/close_all") {
-    const token = createConfirmationToken({ userId, action: "close_all" });
-    pendingTelegramConfirmations.set(token.token, token);
-    writeDB(db);
-    await sendTelegramBotMessage(chatId, `Close-all requires confirmation. Reply: /confirm ${token.token}`);
-    return;
+  if (needsReadOnlyReply) {
+    // Read-only replies may hit the broker; never do this while holding the db lock.
+    const portfolio = command === "/positions" ? await getAlpacaPortfolio().catch(() => null) : null;
+    const reply = {
+      "/status": "Quantpaca online. Broker writes require pipeline approval.",
+      "/health": `Broker configured: ${getBrokerConfig().configured}; mode: ${getBrokerConfig().tradingMode}; live enabled: ${getBrokerConfig().liveTradingEnabled}.`,
+      "/positions": portfolio ? JSON.stringify(portfolio.positions || []).slice(0, 3500) : "Positions unavailable.",
+      "/orders": JSON.stringify(await getAlpacaOpenOrders().catch(() => [])).slice(0, 3500),
+      "/trades": JSON.stringify(productionStore.listTradeIntents(10)).slice(0, 3500),
+      "/sync": "Sync command accepted. Use admin API with ADMIN_API_TOKEN for execution.",
+      "/dry_run": "Dry-run path available through reviewed signals, sizing, risk, and audit endpoints.",
+      "/risk": JSON.stringify(productionStore.listRiskDecisions(10)).slice(0, 3500),
+      "/regime": JSON.stringify(productionStore.latestRegimeAssessment() || detectRegime({})).slice(0, 3500),
+    }[command] || "Command recognized.";
+    outbound.push(reply);
   }
 
-  if (command === "/pause" || command === "/block_buys") {
-    db.config.system.autoTrading = false;
-    writeDB(db);
-    await sendTelegramBotMessage(chatId, "Auto trading paused. New buys are blocked.");
-    return;
+  for (const reply of outbound) {
+    await sendTelegramBotMessage(chatId, reply);
   }
-  if (command === "/resume") {
-    db.config.system.autoTrading = true;
-    writeDB(db);
-    await sendTelegramBotMessage(chatId, "Auto trading resumed subject to risk checks.");
-    return;
-  }
-
-  writeDB(db);
-  const portfolio = command === "/positions" ? await getAlpacaPortfolio().catch(() => null) : null;
-  const reply = {
-    "/status": "Quantpaca online. Broker writes require pipeline approval.",
-    "/health": `Broker configured: ${getBrokerConfig().configured}; mode: ${getBrokerConfig().tradingMode}; live enabled: ${getBrokerConfig().liveTradingEnabled}.`,
-    "/positions": portfolio ? JSON.stringify(portfolio.positions || []).slice(0, 3500) : "Positions unavailable.",
-    "/orders": JSON.stringify(await getAlpacaOpenOrders().catch(() => [])).slice(0, 3500),
-    "/trades": JSON.stringify(productionStore.listTradeIntents(10)).slice(0, 3500),
-    "/sync": "Sync command accepted. Use admin API with ADMIN_API_TOKEN for execution.",
-    "/dry_run": "Dry-run path available through reviewed signals, sizing, risk, and audit endpoints.",
-    "/risk": JSON.stringify(productionStore.listRiskDecisions(10)).slice(0, 3500),
-    "/regime": JSON.stringify(productionStore.latestRegimeAssessment() || detectRegime({})).slice(0, 3500),
-  }[command] || "Command recognized.";
-  await sendTelegramBotMessage(chatId, reply);
 }
 
 function startTelegramRuntime() {
