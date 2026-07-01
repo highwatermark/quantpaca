@@ -46,6 +46,15 @@ export function reviewRisk(input: RiskInput): RiskDecision {
   for (const [value, fieldName] of numericFields) {
     const result = parseFiniteNumber(value, fieldName);
     if (!result.ok) {
+      // metrics.dailyLoss is REQUIRED for buys but OPTIONAL for sells: the
+      // daily-loss cap limits NEW risk, and a sell reduces risk, so an
+      // unavailable figure must not block flattening a position (e.g. a
+      // stop-loss sell or Emergency Close All) when broker data is degraded.
+      // Fail closed only for buys; for sells, mark it unavailable and skip
+      // just the daily-loss comparison below (every other check still runs).
+      if (fieldName === "metrics.dailyLoss" && input.intent.side === "sell") {
+        continue;
+      }
       return { status: "rejected", reason: `Risk input "${fieldName}" is not a finite number; failing closed.` };
     }
     parsed.set(fieldName, result.value);
@@ -65,7 +74,7 @@ export function reviewRisk(input: RiskInput): RiskDecision {
   if (num("intent.qty") <= 0 || num("intent.notional") <= 0) {
     return { status: "rejected", reason: "Sized trade intent has no executable quantity." };
   }
-  if (num("metrics.dailyLoss") <= -Math.abs(num("limits.maxDailyLoss"))) {
+  if (parsed.has("metrics.dailyLoss") && num("metrics.dailyLoss") <= -Math.abs(num("limits.maxDailyLoss"))) {
     return { status: "rejected", reason: "Maximum daily loss reached." };
   }
   if (num("metrics.dailyTradeCount") >= num("limits.maxDailyTradeCount")) {

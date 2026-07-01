@@ -73,3 +73,19 @@ test("NaN qty from a malformed request rejects", () => {
 test("valid input still approves", () => {
   assert.equal(reviewRisk(baseInput() as any).status, "approved");
 });
+
+test("sell intent with unavailable dailyLoss (NaN) still approves — sells reduce risk", () => {
+  const input = baseInput() as any;
+  input.intent.side = "sell";
+  input.intent.qty = 5;
+  input.intent.notional = 100;
+  input.metrics.dailyLoss = NaN;
+  assert.equal(reviewRisk(input).status, "approved");
+});
+
+test("buy intent with unavailable dailyLoss (NaN) still rejects — side asymmetry", () => {
+  const input = baseInput() as any;
+  input.intent.side = "buy";
+  input.metrics.dailyLoss = NaN;
+  assert.equal(reviewRisk(input).status, "rejected");
+});
