@@ -22,6 +22,7 @@ import { reconcileBrokerState } from "./src/server/reconciliationEngine";
 import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, createConfirmationToken, parseTelegramAdminRoles } from "./src/server/telegramEngine";
 import { createExitPlan } from "./src/server/exitEngine";
 import { reviewRisk } from "./src/server/riskEngine";
+import { validateStartupEnv } from "./src/server/startupChecks";
 
 dotenv.config();
 
@@ -1391,6 +1392,16 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
 
 // Dev support or vite mounting
 async function run() {
+  const startupIssues = validateStartupEnv(process.env);
+  for (const issue of startupIssues) {
+    const log = issue.level === "fatal" ? console.error : console.warn;
+    log(`[startup:${issue.level}] ${issue.message}`);
+  }
+  if (startupIssues.some((issue) => issue.level === "fatal")) {
+    console.error("[startup] Fatal configuration issues found. Refusing to start.");
+    process.exit(1);
+  }
+
   const distPath = path.join(process.cwd(), "dist");
 
   if (process.env.NODE_ENV !== "production") {
