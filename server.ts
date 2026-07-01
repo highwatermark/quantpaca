@@ -25,6 +25,7 @@ import { createExitPlan } from "./src/server/exitEngine";
 import { reviewRisk } from "./src/server/riskEngine";
 import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
+import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
 
 dotenv.config();
 
@@ -66,6 +67,21 @@ class DBConcurrencyMutex {
 }
 
 const dbMutex = new DBConcurrencyMutex();
+
+// Risk limits load ONCE at module scope (not inside run()) so that test imports of
+// server.ts also get valid limits. See docs/LOOP_ARCHITECTURE.md "Structural
+// Immutability of Risk Thresholds" — limits are fatal at startup if unparsable and are
+// never re-read at runtime.
+let riskLimits: RiskLimits;
+{
+  const loaded = loadRiskLimits(process.env);
+  if (loaded.ok === false) {
+    for (const error of loaded.errors) console.error(`[startup:fatal] ${error}`);
+    console.error("[startup] Invalid risk limit configuration. Refusing to start.");
+    process.exit(1);
+  }
+  riskLimits = loaded.limits;
+}
 
 const getBrokerConfig = () => buildBrokerConfigFromEnv(process.env);
 
@@ -138,10 +154,10 @@ async function executeTradeIntent(input: {
       openPositionCount: portfolioAssessment.positions.length,
     },
     limits: {
-      maxDailyLoss: 500,
-      maxDailyTradeCount: 10,
-      maxOpenPositions: 10,
-      minBuyingPower: 100,
+      maxDailyLoss: riskLimits.maxDailyLoss,
+      maxDailyTradeCount: riskLimits.maxDailyTradeCount,
+      maxOpenPositions: riskLimits.maxOpenPositions,
+      minBuyingPower: riskLimits.minBuyingPower,
     },
   });
   const result = await submitTradeThroughPipeline({
