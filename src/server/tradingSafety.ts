@@ -170,45 +170,6 @@ export function stripPersistedSecrets(config: Partial<AppConfig> = {}): Partial<
   };
 }
 
-export function createDefaultExitPlan(request: TradeRequest): ExitPlan {
-  const price = assertPositiveNumber(request.estimatedPrice, "estimatedPrice");
-  const stopMultiplier = request.side === "buy" ? 0.95 : 1.05;
-  const profitMultiplier = request.side === "buy" ? 1.15 : 0.85;
-  return {
-    initialStopLossPrice: roundMoney(price * stopMultiplier),
-    takeProfitPrice: roundMoney(price * profitMultiplier),
-    timeExitAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-    thesisInvalidation: "Original trade thesis invalidated or source signal confidence deteriorates.",
-    regimeChangeAction: "close",
-    emergencyAction: "market_sell",
-  };
-}
-
-export function basicRiskReview(input: {
-  request: TradeRequest;
-  brokerConfig: BrokerConfig;
-  maxNotional?: number;
-}): RiskDecision {
-  const symbol = validateSymbol(input.request.symbol);
-  if (!symbol.valid) return { status: "rejected", reason: symbol.reason || "Invalid symbol." };
-
-  if (!Number.isFinite(input.request.qty) || input.request.qty <= 0) {
-    return { status: "rejected", reason: "Quantity must be greater than zero." };
-  }
-  if (!Number.isFinite(input.request.estimatedPrice) || input.request.estimatedPrice <= 0) {
-    return { status: "rejected", reason: "Estimated price must be greater than zero." };
-  }
-  if (input.brokerConfig.tradingMode === "live" && !input.brokerConfig.liveTradingEnabled) {
-    return { status: "rejected", reason: "Live trading is blocked unless LIVE_TRADING_ENABLED=true." };
-  }
-  const notional = input.request.qty * input.request.estimatedPrice;
-  if (input.maxNotional && notional > input.maxNotional) {
-    const adjustedQty = Math.floor(input.maxNotional / input.request.estimatedPrice);
-    if (adjustedQty <= 0) return { status: "rejected", reason: "Trade exceeds max notional." };
-    return { status: "approved_with_reduced_size", adjustedQty, reason: "Quantity reduced to satisfy max notional." };
-  }
-  return { status: "approved", reason: "Basic deterministic risk checks passed." };
-}
 
 export async function submitTradeThroughPipeline(input: SubmitTradeInput): Promise<{
   trade: PipelineTrade;
@@ -314,13 +275,3 @@ function normalizeAlpacaBaseUrl(url: string) {
   return trimmed.endsWith("/v2") ? trimmed : `${trimmed}/v2`;
 }
 
-function assertPositiveNumber(value: number, name: string) {
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${name} must be greater than zero.`);
-  }
-  return value;
-}
-
-function roundMoney(value: number) {
-  return Math.round(value * 100) / 100;
-}
