@@ -27,6 +27,7 @@ import { evaluateBreaker } from "./src/server/breakerEngine";
 import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
+import { sizeTradeIntent } from "./src/server/sizingEngine";
 
 dotenv.config();
 
@@ -1151,43 +1152,75 @@ Return your response in strict JSON format matching this schema:
           // Verify current position size limit
           const portfolio = await getAlpacaPortfolio();
           const currentShares = portfolio.positions.find((p: any) => p.symbol === item.symbol);
-          const portfolioValue = parseFloat(portfolio.portfolio_value) || 100000;
-          const maxPositionValue = (portfolioValue * (currentConfig.system.maxPositionSizePercent / 100));
+          const parsedPortfolioValue = Number(portfolio.portfolio_value);
+          if (!Number.isFinite(parsedPortfolioValue) || parsedPortfolioValue <= 0) {
+            addLog("error", `Order skipped for ${item.symbol}. Portfolio value is not a finite number; failing closed.`);
+            continue;
+          }
+          const maxPositionValue = parsedPortfolioValue * (currentConfig.system.maxPositionSizePercent / 100);
 
           let price = 0;
           try {
             // Get current price if possible
             const brokerConfig = getBrokerConfig();
             if (brokerConfig.configured) {
-              const latestBar = await fetch(`${brokerConfig.baseUrl}/last/stocks/${item.symbol}`, {
-                headers: { "APCA-API-KEY-ID": brokerConfig.apiKey || "", "APCA-API-SECRET-KEY": brokerConfig.secretKey || "" }
+              // Market data lives on data.alpaca.markets, not the trading host.
+              const dataBaseUrl = process.env.ALPACA_DATA_URL || "https://data.alpaca.markets";
+              const latestTrade = await fetch(`${dataBaseUrl}/v2/stocks/${item.symbol}/trades/latest`, {
+                headers: {
+                  "APCA-API-KEY-ID": brokerConfig.apiKey || "",
+                  "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
+                },
               });
-              if (latestBar.ok) {
-                const bar = await latestBar.json();
-                price = Number(bar.last?.price || 0);
+              if (latestTrade.ok) {
+                const body = await latestTrade.json();
+                price = Number(body.trade?.p || 0);
               }
             } else {
               const simulatedPos = (portfolio.positions || []).find((p: any) => p.symbol === item.symbol);
               price = Number(simulatedPos?.current_price || 0);
             }
-          } catch(e) {}
+          } catch (e) {
+            addLog("error", `Price lookup failed for ${item.symbol}: ${e instanceof Error ? e.message : String(e)}`);
+          }
 
-          if (!price || !Number.isFinite(price)) {
+          if (!price || !Number.isFinite(price) || price <= 0) {
             addLog("error", `Order skipped for ${item.symbol}. No deterministic market price was available.`);
             continue;
           }
 
           if (item.decision === "BUY") {
-            const currentPositionVal = currentShares ? parseFloat(currentShares.market_value) : 0;
-            const remainingAllocation = maxPositionValue - currentPositionVal;
+            const portfolioAssessment = assessPortfolio({
+              account: portfolio,
+              positions: portfolio.positions || [],
+              openOrders: await getAlpacaOpenOrders(),
+              source: getBrokerConfig().configured ? "alpaca" : "local_simulated_snapshot",
+            });
+            const regime = productionStore.latestRegimeAssessment() || detectRegime({});
+            const stopLossPercent = Number(currentConfig.system.stopLossPercent);
+            if (!Number.isFinite(stopLossPercent) || stopLossPercent <= 0) {
+              addLog("error", `Order skipped for ${item.symbol}. stopLossPercent is not a positive finite number.`);
+              continue;
+            }
+            const sized = sizeTradeIntent({
+              reviewedSignal,
+              regime,
+              portfolio: portfolioAssessment,
+              side: "buy",
+              estimatedPrice: price,
+              stopLossPrice: price * (1 - stopLossPercent / 100),
+              limits: {
+                maxSinglePositionPercent: currentConfig.system.maxPositionSizePercent,
+                maxPortfolioExposurePercent: 100,
+                maxNotionalPerTrade: maxPositionValue,
+                minBuyingPowerAfterTrade: riskLimits.minBuyingPower,
+              },
+            });
 
-            if (remainingAllocation <= 100) {
-              addLog("error", `Order rejected for ${item.symbol}. Maximum position allocation reached (${currentConfig.system.maxPositionSizePercent}% of portfolio).`);
+            if (sized.qty < 1) {
+              addLog("error", `Order skipped for ${item.symbol}. Sizing produced no executable quantity (${sized.sizingReason}; caps: ${sized.capsApplied.join(", ")}).`);
             } else {
-              // Calculate shares count
-              const purchaseAmount = Math.min(remainingAllocation, maxPositionValue);
-              const qty = Math.floor(purchaseAmount / price) || 10;
-
+              const qty = sized.qty;
               addLog("sync", `Submitting buy intent for ${qty} shares of ${item.symbol} at approx $${price} through safety pipeline...`);
               const newTrade = await executeTradeIntent({
                 db,
@@ -1214,7 +1247,7 @@ Return your response in strict JSON format matching this schema:
               newTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, item);
 
               db.trades.unshift(newTrade);
-              
+
               // Update simulation list
               if (!getBrokerConfig().configured && newTrade.status !== "BrokerFailed" && newTrade.status !== "RiskRejected") {
                 const currentSim = db.simulatedPortfolio;

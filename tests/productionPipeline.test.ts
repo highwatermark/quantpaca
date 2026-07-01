@@ -143,6 +143,50 @@ test("sizing respects buying power, max position, portfolio exposure, stop dista
   assert.ok(intent.capsApplied.includes("regime_multiplier"));
 });
 
+test("sizing a sub-one-share allocation yields qty 0, never a fallback quantity", () => {
+  const sized = sizeTradeIntent({
+    reviewedSignal: {
+      id: "rs-2",
+      rawSignalId: "raw-2",
+      symbol: "NVDA",
+      source: "email",
+      sourceTimestamp: "2026-06-29T19:00:00.000Z",
+      freshnessStatus: "fresh",
+      confidenceScore: 80,
+      classification: "bullish",
+      thesisSummary: "strong",
+      invalidationConditions: ["breakdown"],
+      evidence: [],
+      status: "accepted",
+    },
+    regime: { id: "r-2", timestamp: "", marketMode: "unclear", volatilityLevel: "normal", tradePermission: "allow", sizeMultiplier: 1, reason: "" },
+    portfolio: {
+      timestamp: "",
+      cash: 1000,
+      buyingPower: 1000,
+      equity: 1000,
+      longMarketValue: 0,
+      totalLongExposurePercent: 0,
+      pendingOrderNotional: 0,
+      positions: [],
+      openOrders: [],
+      perSymbolConcentration: {},
+      source: "alpaca",
+    },
+    side: "buy",
+    estimatedPrice: 900, // max position 10% of $1000 = $100 < one $900 share
+    stopLossPrice: 855,
+    limits: {
+      maxSinglePositionPercent: 10,
+      maxPortfolioExposurePercent: 100,
+      maxNotionalPerTrade: 100,
+      minBuyingPowerAfterTrade: 0,
+    },
+  });
+
+  assert.equal(sized.qty, 0);
+});
+
 test("risk engine blocks live mode, duplicates, missing exit plans, and daily limits", () => {
   const baseIntent = {
     id: "sti-1",
