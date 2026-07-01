@@ -128,6 +128,43 @@ test("orders require risk approval and an exit plan", async () => {
   assert.equal(rejectedRisk.trade.status, "RiskRejected");
 });
 
+test("unknown or missing risk status never reaches the broker", async () => {
+  for (const status of [undefined, "aproved", "APPROVED", "ok", 42] as any[]) {
+    let brokerCalled = false;
+    const result = await submitTradeThroughPipeline({
+      request: {
+        source: "manual",
+        symbol: "PLTR",
+        side: "buy",
+        qty: 1,
+        estimatedPrice: 20,
+        reasoning: "allowlist test",
+      },
+      brokerConfig: {
+        configured: true,
+        tradingMode: "paper",
+        liveTradingEnabled: false,
+        baseUrl: "https://paper-api.alpaca.markets/v2",
+      },
+      riskDecision: { status, reason: "synthetic" } as any,
+      exitPlan: {
+        initialStopLossPrice: 19,
+        takeProfitPrice: 23,
+        timeExitAt: "2026-06-30T20:00:00.000Z",
+        thesisInvalidation: "n/a",
+        regimeChangeAction: "close",
+        emergencyAction: "market_sell",
+      },
+      brokerSubmit: async () => {
+        brokerCalled = true;
+        return { id: "should-never-happen", status: "accepted" };
+      },
+    });
+    assert.equal(brokerCalled, false, `broker was called for status ${String(status)}`);
+    assert.equal(result.trade.status, "RiskRejected");
+  }
+});
+
 test("config responses do not expose broker secrets", () => {
   const redacted = redactConfigForClient({
     alpaca: {

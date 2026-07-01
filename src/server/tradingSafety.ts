@@ -221,8 +221,17 @@ export async function submitTradeThroughPipeline(input: SubmitTradeInput): Promi
     audit("RiskRejected", "Order blocked because no exit plan is attached.", "PendingApproval");
     return { trade: baseTrade, auditEvents };
   }
-  if (input.riskDecision.status === "rejected" || input.riskDecision.status === "requires_human_approval") {
-    audit("RiskRejected", input.riskDecision.reason, "PendingApproval");
+  const APPROVED_RISK_STATUSES: ReadonlyArray<RiskDecision["status"]> = [
+    "approved",
+    "approved_with_reduced_size",
+  ];
+  if (!APPROVED_RISK_STATUSES.includes(input.riskDecision.status)) {
+    audit(
+      "RiskRejected",
+      input.riskDecision.reason ||
+        `Risk status "${String(input.riskDecision.status)}" is not an approved status.`,
+      "PendingApproval",
+    );
     return { trade: baseTrade, auditEvents };
   }
   if (input.brokerConfig.tradingMode === "live" && !input.brokerConfig.liveTradingEnabled) {
