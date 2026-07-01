@@ -1,0 +1,94 @@
+export interface AlpacaConfig {
+  apiKeyId: string;
+  secretKey: string;
+  paper: boolean;
+}
+
+export interface NotionConfig {
+  token: string;
+  databaseId: string;
+}
+
+export interface TelegramConfig {
+  botToken: string;
+  chatId: string;
+  enabled: boolean;
+}
+
+export interface GoogleConfig {
+  spreadsheetId: string;
+  enabled: boolean;
+}
+
+export interface SystemConfig {
+  autoTrading: boolean;
+  runIntervalMins: number;
+  maxPositionSizePercent: number;
+  stopLossPercent: number;
+  targetProfitPercent: number;
+}
+
+export interface AppConfig {
+  alpaca: AlpacaConfig;
+  notion: NotionConfig;
+  telegram: TelegramConfig;
+  google: GoogleConfig;
+  system: SystemConfig;
+}
+
+export interface StockAnalysis {
+  id: string;
+  symbol: string;
+  source: 'email' | 'youtube';
+  sourceTitle: string;
+  sourceContent: string;
+  growthScore: number; // 0-100
+  sentimentScore: number; // -100 to 100
+  riskProfile: 'Low' | 'Medium' | 'High';
+  reasoning: string;
+  whipsawCheck: string; // Explains whether whipsaw or genuine trend reversal
+  decision: 'BUY' | 'SELL' | 'HOLD' | 'NONE';
+  timestamp: string;
+}
+
+export interface Trade {
+  id: string;
+  symbol: string;
+  qty: number;
+  price: number;
+  side: 'buy' | 'sell';
+  status: string;
+  timestamp: string;
+  reasoning: string;
+  notifiedTelegram: boolean;
+  exportedSheets: boolean;
+  loggedNotion: boolean;
+}
+
+export interface SyncLog {
+  id: string;
+  timestamp: string;
+  type: 'sync' | 'trade' | 'error' | 'override' | 'sentiment';
+  message: string;
+  details?: string;
+}
+
+export interface AlpacaPosition {
+  symbol: string;
+  qty: string;
+  market_value: string;
+  cost_basis: string;
+  unrealized_pl: string;
+  unrealized_plpc: string;
+  current_price: string;
+  avg_entry_price: string;
+}
+
+export interface AlpacaAccount {
+  cash: string;
+  buying_power: string;
+  portfolio_value: string;
+  equity: string;
+  long_market_value: string;
+  daytrade_count: number;
+}
