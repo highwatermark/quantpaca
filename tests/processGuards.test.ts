@@ -43,3 +43,12 @@ test("shutdown signal closes the server then exits 0 exactly once", () => {
   assert.equal(calls.closed, true);
   assert.deepEqual(calls.exitCodes, [0]);
 });
+
+test("repeated shutdown signals are idempotent", () => {
+  const { calls, deps } = makeDeps();
+  const handlers = createProcessGuardHandlers(deps);
+  handlers.onShutdownSignal("SIGTERM");
+  handlers.onShutdownSignal("SIGTERM");
+  assert.equal(calls.closed, true);
+  assert.deepEqual(calls.exitCodes, [0]);
+});

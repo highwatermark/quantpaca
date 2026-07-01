@@ -7,6 +7,7 @@ export interface ProcessGuardDeps {
 const SHUTDOWN_GRACE_MS = 5000;
 
 export function createProcessGuardHandlers(deps: ProcessGuardDeps) {
+  let shuttingDown = false;
   return {
     onUncaughtException(error: unknown) {
       deps.log("[fatal] Uncaught exception — shutting down.", error);
@@ -17,6 +18,8 @@ export function createProcessGuardHandlers(deps: ProcessGuardDeps) {
       deps.exit(1);
     },
     onShutdownSignal(signal: string) {
+      if (shuttingDown) return;
+      shuttingDown = true;
       deps.log(`[shutdown] Received ${signal}; closing HTTP server.`);
       let exited = false;
       const finish = () => {
@@ -36,7 +39,7 @@ export function installProcessGuards(deps: ProcessGuardDeps) {
   const handlers = createProcessGuardHandlers(deps);
   process.on("uncaughtException", handlers.onUncaughtException);
   process.on("unhandledRejection", handlers.onUnhandledRejection);
-  process.on("SIGTERM", () => handlers.onShutdownSignal("SIGTERM"));
-  process.on("SIGINT", () => handlers.onShutdownSignal("SIGINT"));
+  process.once("SIGTERM", () => handlers.onShutdownSignal("SIGTERM"));
+  process.once("SIGINT", () => handlers.onShutdownSignal("SIGINT"));
   return handlers;
 }
