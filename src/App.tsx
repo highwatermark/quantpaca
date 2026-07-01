@@ -20,6 +20,7 @@ import ZipTraderCard from "./components/ZipTraderCard";
 import TradeLogsTable from "./components/TradeLogsTable";
 import SettingsCard from "./components/SettingsCard";
 import ServerStatusLogs from "./components/ServerStatusLogs";
+import AdminTokenCard from "./components/AdminTokenCard";
 import { loginWithGoogle, logoutGoogle, getCachedToken, getGoogleUser, setCachedToken, setGoogleUser } from "./services/googleAuth";
 
 function ReviewMetric({ label, value, detail }: { label: string; value: string; detail: string }) {
@@ -56,6 +57,17 @@ export default function App() {
   // Auth statuses
   const [googleUser, setUserGoogle] = useState<{ name: string; email: string } | null>(getGoogleUser());
   const [googleToken, setTokenGoogle] = useState<string | null>(getCachedToken());
+
+  // Admin command token (localStorage-backed; sent as x-admin-token on admin routes)
+  const [adminToken, setAdminToken] = useState<string>(
+    () => localStorage.getItem("quantpaca_admin_token") || "",
+  );
+  const saveAdminToken = (token: string) => {
+    localStorage.setItem("quantpaca_admin_token", token);
+    setAdminToken(token);
+  };
+  const adminHeaders = (): Record<string, string> =>
+    adminToken ? { "x-admin-token": adminToken } : {};
 
   // Loading indicator states
   const [isLoading, setIsLoading] = useState(true);
@@ -126,7 +138,7 @@ export default function App() {
     try {
       const res = await fetch("/api/config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...adminHeaders() },
         body: JSON.stringify(updated),
       });
       if (res.ok) {
@@ -134,9 +146,13 @@ export default function App() {
         setConfigs(data.config);
         fetchAllStates();
         alert("Settings configuration saved successfully.");
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || `Saving settings failed (HTTP ${res.status}). Check the admin token in Settings.`);
       }
     } catch (err) {
       console.error("Save config error:", err);
+      alert("Saving settings failed: network error.");
     }
   };
 
@@ -145,7 +161,10 @@ export default function App() {
     setIsSyncing(true);
     try {
       // Pass oauth token in authorization header if logged in
-      const headers: HeadersInit = googleToken ? { Authorization: `Bearer ${googleToken}` } : {};
+      const headers: HeadersInit = {
+        ...(googleToken ? { Authorization: `Bearer ${googleToken}` } : {}),
+        ...adminHeaders(),
+      };
       const res = await fetch("/api/sync", {
         method: "POST",
         headers,
@@ -167,7 +186,7 @@ export default function App() {
   const handleManualTrade = async (symbol: string, qty: number, side: "buy" | "sell", price: number) => {
     setIsTrading(true);
     try {
-      const headers: HeadersInit = { "Content-Type": "application/json" };
+      const headers: HeadersInit = { "Content-Type": "application/json", ...adminHeaders() };
       if (googleToken) headers["Authorization"] = `Bearer ${googleToken}`;
 
       const res = await fetch("/api/override/trade", {
@@ -194,7 +213,10 @@ export default function App() {
   const handleEmergencyClose = async () => {
     setIsEmergencyClosing(true);
     try {
-      const res = await fetch("/api/override/close-all", { method: "POST" });
+      const res = await fetch("/api/override/close-all", {
+        method: "POST",
+        headers: adminHeaders(),
+      });
       if (res.ok) {
         alert("Emergency close request submitted through the risk pipeline.");
         await fetchAllStates();
@@ -413,6 +435,7 @@ export default function App() {
           </div>
         ) : (
           <div className="space-y-6">
+            <AdminTokenCard token={adminToken} onSaveToken={saveAdminToken} />
             {configs ? (
               <SettingsCard
                 config={configs}
