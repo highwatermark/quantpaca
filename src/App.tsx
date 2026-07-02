@@ -156,7 +156,7 @@ export default function App() {
     }
   };
 
-  // Sync core logic triggering (checks GMail and does Gemini calculations)
+  // Sync core logic triggering (checks GMail and does Claude calculations)
   const handleForceSync = async () => {
     setIsSyncing(true);
     try {

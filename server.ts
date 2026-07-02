@@ -4,7 +4,7 @@ import fs from "fs";
 import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
-import { GoogleGenAI, Type } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 import { AppConfig, StockAnalysis, Trade, SyncLog } from "./src/types";
 import {
   AuditEvent,
@@ -269,21 +269,22 @@ function writeDB(data: any) {
   }
 }
 
-// Global Gemini client
-const getGeminiClient = () => {
-  const apiKey = process.env.GEMINI_API_KEY;
+// Global Claude client. Constructing without a key throws; both call sites
+// run inside try/catch blocks that fall back to simulated analysis.
+const getClaudeClient = () => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    console.warn("No GEMINI_API_KEY environment variable found. Gemini calls will fail.");
+    console.warn("No ANTHROPIC_API_KEY environment variable found. Claude calls will fail.");
   }
-  return new GoogleGenAI({
-    apiKey: apiKey || "MOCK_KEY",
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      }
-    }
-  });
+  return new Anthropic({ apiKey });
 };
+
+const claudeText = (response: Anthropic.Message): string =>
+  response.content
+    .filter((block): block is Anthropic.TextBlock => block.type === "text")
+    .map((block) => block.text)
+    .join("")
+    .trim();
 
 /* ==========================================================
    INTEGRATIONS IMPLEMENTATION
@@ -1031,27 +1032,33 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     });
   }
 
-  // 2. Fetch YouTube News & Sentiment using Gemini Search Grounding
+  // 2. Fetch YouTube News & Sentiment using Claude web search
   let youtubeSentiment = "No recent video found in search.";
   try {
-    addLog("sync", "Querying Gemini Search Grounding for recent ZipTrader YouTube video sentiment...");
-    const ai = getGeminiClient();
-    const queryRes = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: "Find recent YouTube video titles and market opinions from the 'ZipTrader' channel in 2026. What stocks is he discussing and what is his current sentiment?",
-      config: {
-        tools: [{ googleSearch: {} }],
-      },
+    addLog("sync", "Querying Claude web search for recent ZipTrader YouTube video sentiment...");
+    const anthropic = getClaudeClient();
+    const queryRes = await anthropic.messages.create({
+      model: "claude-opus-4-8",
+      max_tokens: 16000,
+      thinking: { type: "adaptive" },
+      tools: [{ type: "web_search_20260209", name: "web_search" }],
+      messages: [
+        {
+          role: "user",
+          content:
+            "Find recent YouTube video titles and market opinions from the 'ZipTrader' channel in 2026. What stocks is he discussing and what is his current sentiment?",
+        },
+      ],
     });
-    youtubeSentiment = queryRes.text || "ZipTrader channel continues to emphasize accumulation patterns for PLTR and TSLA following volatility.";
+    youtubeSentiment = claudeText(queryRes) || "ZipTrader channel continues to emphasize accumulation patterns for PLTR and TSLA following volatility.";
     addLog("sentiment", "ZipTrader YouTube Sentinel scan completed successfully.", youtubeSentiment.substring(0, 300) + "...");
   } catch (err: any) {
-    console.error("Gemini grounding error:", err);
+    console.error("Claude web search error:", err);
     youtubeSentiment = "ZipTrader channel sentiment: Bullish on growth tech pullbacks, emphasizing MARA and PLTR accumulation.";
     addLog("sentiment", "YouTube sentiment simulated using default quantitative engine.");
   }
 
-  // 3. Process each scanned thesis with Gemini 3.5-flash
+  // 3. Process each scanned thesis with Claude
   const scanTargets = [
     ...emailsToScan,
     { source: "youtube", title: "ZipTrader Channel Feed Analyzed", content: youtubeSentiment }
@@ -1061,13 +1068,19 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
   for (const target of scanTargets) {
     try {
-      addLog("sync", `Analyzing thesis with Gemini: "${target.title.substring(0, 45)}..."`);
-      const ai = getGeminiClient();
+      addLog("sync", `Analyzing thesis with Claude: "${target.title.substring(0, 45)}..."`);
+      const anthropic = getClaudeClient();
 
-      // Ask Gemini for strict quantitative evaluation
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: `Analyze the following stock newsletter or trading commentary from ZipTrader.
+      // Ask Claude for strict quantitative evaluation; the JSON schema below is
+      // enforced by the API (structured outputs), not just requested in the prompt.
+      const response = await anthropic.messages.create({
+        model: "claude-opus-4-8",
+        max_tokens: 16000,
+        thinking: { type: "adaptive" },
+        messages: [
+          {
+            role: "user",
+            content: `Analyze the following stock newsletter or trading commentary from ZipTrader.
 Source Type: ${target.source}
 Title: ${target.title}
 Content: ${target.content}
@@ -1076,35 +1089,31 @@ You must extract the stock ticker symbol mentioned (like PLTR, MARA, TSLA, NVDA)
 Crucially, when the stock goes down for any reason, assess whether it is a support level 'whipsaw' because of the overall market volatility OR a genuine 'trend reversal' before deciding to act. Validate the fundamentals and the core thesis.
 Set a decision: 'BUY' (if sentiment is very bullish & whipsaw check passes), 'SELL' (if trend reversal is verified or target stop loss hit), 'HOLD', or 'NONE' (if no clear ticker discussed).
 
-Return your response in strict JSON format matching this schema:
-{
-  "symbol": "THE_STOCK_TICKER",
-  "growthScore": 85,
-  "sentimentScore": 75,
-  "riskProfile": "Low" | "Medium" | "High",
-  "reasoning": "A concise human sentence explaining the fundamental thesis validation.",
-  "whipsawCheck": "Definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal.",
-  "decision": "BUY" | "SELL" | "HOLD" | "NONE"
-}`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              symbol: { type: Type.STRING },
-              growthScore: { type: Type.INTEGER },
-              sentimentScore: { type: Type.INTEGER },
-              riskProfile: { type: Type.STRING },
-              reasoning: { type: Type.STRING },
-              whipsawCheck: { type: Type.STRING },
-              decision: { type: Type.STRING }
+For "reasoning", write a concise human sentence explaining the fundamental thesis validation. For "whipsawCheck", give a definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal. If no clear ticker is discussed, set "symbol" to "UNKNOWN".`,
+          },
+        ],
+        output_config: {
+          format: {
+            type: "json_schema",
+            schema: {
+              type: "object",
+              properties: {
+                symbol: { type: "string" },
+                growthScore: { type: "integer" },
+                sentimentScore: { type: "integer" },
+                riskProfile: { type: "string", enum: ["Low", "Medium", "High"] },
+                reasoning: { type: "string" },
+                whipsawCheck: { type: "string" },
+                decision: { type: "string", enum: ["BUY", "SELL", "HOLD", "NONE"] },
+              },
+              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "decision"],
+              additionalProperties: false,
             },
-            required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "decision"]
-          }
-        }
+          },
+        },
       });
 
-      const text = response.text || "{}";
+      const text = claudeText(response) || "{}";
       const parsed = JSON.parse(text);
 
       if (parsed.symbol && parsed.symbol !== "UNKNOWN" && parsed.symbol !== "THE_STOCK_TICKER") {

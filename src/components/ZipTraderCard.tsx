@@ -197,7 +197,7 @@ export default function ZipTraderCard({ analyses, onForceSync, isSyncing }: ZipT
             <div className="border border-[#E9ECEF] rounded p-5 space-y-2">
               <h5 className="font-bold text-[#1A1A1A] uppercase tracking-wider text-xs">Automation Parameters</h5>
               <p className="text-[11px] leading-relaxed">
-                The quant engine operates in a server-side cycle. Every 15 minutes, the system reads Charlie's letters, scans YouTube grounded metrics using Gemini, executes paper instructions to Alpaca safely and routes real-time alerts to the active Telegram Chat Group as requested by user.
+                The quant engine operates in a server-side cycle. Every 15 minutes, the system reads Charlie's letters, scans YouTube grounded metrics using Claude, executes paper instructions to Alpaca safely and routes real-time alerts to the active Telegram Chat Group as requested by user.
               </p>
             </div>
           </div>
