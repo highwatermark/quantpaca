@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync as NodeDatabaseSync } from "node:sqlite";
-import { AuditEvent, PipelineTrade } from "./tradingSafety";
+import { AuditEvent, ExitPlan, PipelineTrade } from "./tradingSafety";
 import { ReconciliationReport, RegimeAssessment, ReviewedSignal, SizedTradeIntent } from "./domainTypes";
 
 type DatabaseSync = {
@@ -28,6 +28,13 @@ export type ProductionStore = {
   listRiskDecisions(limit?: number): unknown[];
   saveExitPlan(tradeId: string, exitPlan: unknown): void;
   listExitPlans(limit?: number): unknown[];
+  // Most recent exit plan whose owning trade was a BUY on `symbol` -- the plan that
+  // protects a currently-open long position. Only BUY-originated plans qualify: a
+  // plan attached to a SELL trade describes closing/reducing a position, not
+  // protecting one, and would carry inverted stop/take-profit multipliers if
+  // reused to evaluate a still-open long. Undefined if no such plan exists (e.g.
+  // a manual buy or pre-existing position that predates exit-plan persistence).
+  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan } | undefined;
   saveReconciliationReport(report: ReconciliationReport): void;
   latestReconciliationReport(): ReconciliationReport | undefined;
   saveBreakerState(state: { asOf: string; status: string }): void;
@@ -185,6 +192,28 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     },
     listExitPlans(limit = 250) {
       return rowsToPayloads(db.prepare("SELECT payload_json FROM exit_plans ORDER BY timestamp DESC LIMIT ?").all(limit));
+    },
+    latestBuySideExitPlanForSymbol(symbol) {
+      // Recent-first scan over this symbol's exit plans (joined to the owning
+      // trade for its symbol/side), picking the first one whose trade was a
+      // BUY. Bounded scan (50) rather than a single most-recent row, since the
+      // single most-recent trade for an open symbol could be a partial SELL.
+      const rows = db.prepare(`
+        SELECT ep.payload_json AS exit_payload, ti.payload_json AS trade_payload
+        FROM exit_plans ep
+        JOIN trade_intents ti ON ep.trade_id = ti.id
+        WHERE ti.symbol = ?
+        ORDER BY ep.timestamp DESC
+        LIMIT 50
+      `).all(symbol);
+      for (const row of rows) {
+        const tradePayload = JSON.parse(String(row.trade_payload)) as { side?: "buy" | "sell" };
+        if (tradePayload.side !== "buy") continue;
+        const exitPayload = JSON.parse(String(row.exit_payload)) as { exitPlan?: ExitPlan };
+        if (!exitPayload.exitPlan) continue;
+        return { side: "buy" as const, exitPlan: exitPayload.exitPlan };
+      }
+      return undefined;
     },
     saveReconciliationReport(report) {
       db.prepare("INSERT OR REPLACE INTO reconciliation_reports (id, timestamp, status, payload_json) VALUES (?, ?, ?, ?)")

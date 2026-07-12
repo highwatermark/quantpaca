@@ -27,6 +27,7 @@ import { assessPortfolio } from "./src/server/portfolioEngine";
 import { reconcileBrokerState } from "./src/server/reconciliationEngine";
 import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, createConfirmationToken, parseTelegramAdminRoles } from "./src/server/telegramEngine";
 import { createExitPlan } from "./src/server/exitEngine";
+import { evaluateOpenPositionExits } from "./src/server/exitMonitor";
 import { reviewRisk } from "./src/server/riskEngine";
 import { evaluateBreaker } from "./src/server/breakerEngine";
 import { validateStartupEnv } from "./src/server/startupChecks";
@@ -979,72 +980,114 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     }
 
     // ==========================================================
-    // MODULE 2: ACTIVE PORTFOLIO RISK CONTROLLER (AUTOMATED STOP LOSS)
+    // MODULE 2: ACTIVE PORTFOLIO RISK CONTROLLER
+    // Evaluates each open position's persisted exit plan (stop-loss,
+    // take-profit, time-exit, thesis-invalidation -- see exitEngine.ts) via
+    // evaluateOpenPositionExits (src/server/exitMonitor.ts). A position with no
+    // plan, or a plan that fails numeric validation, falls back to the legacy
+    // hardcoded 5% unrealized_plpc stop-loss so it is never left unprotected.
+    // See docs/GO_LIVE_PLAN.md Phase 1.2.
     // ==========================================================
     if (currentConfig.system && currentConfig.system.autoTrading) {
-      addLog("sync", "Active risk evaluator: Checking portfolio stop-loss limits...");
+      addLog("sync", "Active risk evaluator: Checking portfolio exit plans and stop-loss limits...");
       try {
         const portfolio = await getAlpacaPortfolio();
         const stopPercent = currentConfig.system.stopLossPercent || 5.0; // percentage trigger
-        
-        for (const pos of (portfolio.positions || [])) {
-          const unrealizedLossPercent = parseFloat(pos.unrealized_plpc) * 100;
-          
-          if (unrealizedLossPercent <= -stopPercent) {
-            addLog("trade", `PROTECTIVE BOUND REACHED: Position in ${pos.symbol} is at ${unrealizedLossPercent.toFixed(2)}% loss (Limit: -${stopPercent}%). Exercising Stop Loss sell execution!`);
-            
-            const sellQty = Math.floor(parseFloat(pos.qty));
-            if (sellQty > 0) {
-              const liquidationTrade = await executeTradeIntent({
-                db,
-                config: currentConfig,
-                request: {
-                  source: "stop_loss",
-                  symbol: pos.symbol,
-                  qty: sellQty,
-                  estimatedPrice: parseFloat(pos.current_price) || 0,
-                  side: "sell",
-                  reasoning: `Automatic stop-loss protection executed. Loss of ${unrealizedLossPercent.toFixed(2)}% reached the threshold of -${stopPercent}%. Position was automatically liquidated.`,
-                },
-              });
-              Object.assign(liquidationTrade, {
-                symbol: pos.symbol,
-                qty: sellQty,
-                price: parseFloat(pos.current_price) || 50,
-                side: "sell",
-              });
-              
-              const tgAlertMsg = `🚨 <b>STOP LOSS EXECUTION WARNING</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Trigger Loss:</b> ${unrealizedLossPercent.toFixed(2)}%\n<b>Limit Threshold:</b> -${stopPercent}%\nAutomatically liquidated ${sellQty} shares to shield capital assets from further dropdowns.`;
-              liquidationTrade.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgAlertMsg);
-              liquidationTrade.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, liquidationTrade);
-              liquidationTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, {
-                id: "an-" + Math.random().toString(36).substr(2, 9),
-                symbol: pos.symbol,
-                source: "email",
-                sourceTitle: "Protective Capital Liquidation",
-                sourceContent: "Loss threshold exceeded",
-                growthScore: 0,
-                sentimentScore: -100,
-                riskProfile: "High",
-                reasoning: liquidationTrade.reasoning,
-                whipsawCheck: "Stop Limit breach verified, trend reversal detected.",
-                decision: "SELL",
-                timestamp: liquidationTrade.timestamp
-              });
-              
-              db.trades.unshift(liquidationTrade);
-              
-              // Clean local simulated portfolio if offline mode
-              if (!getBrokerConfig().configured && liquidationTrade.status !== "BrokerFailed" && liquidationTrade.status !== "RiskRejected") {
-                db.simulatedPortfolio.positions = (db.simulatedPortfolio.positions || []).filter((p: any) => p.symbol !== pos.symbol);
-                const fundBack = sellQty * (parseFloat(pos.current_price) || 50);
-                db.simulatedPortfolio.cash = String(parseFloat(db.simulatedPortfolio.cash) + fundBack);
-                db.simulatedPortfolio.long_market_value = String(parseFloat(db.simulatedPortfolio.long_market_value) - fundBack);
-              }
-              
-              addLog("trade", `Liquidated ${sellQty} shares of ${pos.symbol} due to stop loss limit hit.`);
-            }
+        const positions = portfolio.positions || [];
+        const positionBySymbol = new Map(positions.map((pos: any) => [pos.symbol, pos]));
+
+        const exitEvaluation = evaluateOpenPositionExits({
+          positions: positions.map((pos: any) => ({
+            symbol: pos.symbol,
+            qty: pos.qty,
+            currentPrice: pos.current_price,
+            unrealizedPlPercent: parseFloat(pos.unrealized_plpc) * 100,
+          })),
+          now: new Date(),
+          legacyStopLossPercent: stopPercent,
+          lookupPlan: (symbol) => productionStore.latestBuySideExitPlanForSymbol(symbol),
+        });
+
+        for (const skipped of exitEvaluation.skippedPlans) {
+          addLog("error", `Exit plan evaluation skipped for ${skipped.symbol}`, skipped.message);
+        }
+
+        const exitDecisions: Array<
+          | { kind: "plan_exit"; symbol: string; qty: number; reasoning: string; logMessage: string }
+          | { kind: "legacy_stop_loss"; symbol: string; qty: number; reasoning: string; logMessage: string }
+        > = [
+          ...exitEvaluation.planExits.map((exit) => ({
+            kind: exit.kind,
+            symbol: exit.symbol,
+            qty: exit.qty,
+            reasoning: exit.reasoning,
+            logMessage: `PLAN EXIT TRIGGERED: Position in ${exit.symbol} closed by exit plan (${exit.reasoning}).`,
+          })),
+          ...exitEvaluation.legacyExits.map((exit) => ({
+            kind: exit.kind,
+            symbol: exit.symbol,
+            qty: exit.qty,
+            reasoning: exit.reasoning,
+            logMessage: `PROTECTIVE BOUND REACHED: Position in ${exit.symbol} is at ${exit.unrealizedLossPercent.toFixed(2)}% loss (Limit: -${stopPercent}%). Exercising Stop Loss sell execution!`,
+          })),
+        ];
+
+        for (const decision of exitDecisions) {
+          const pos: any = positionBySymbol.get(decision.symbol);
+          if (!pos) continue;
+          addLog("trade", decision.logMessage);
+
+          const sellQty = Math.min(decision.qty, Math.floor(parseFloat(pos.qty)) || 0);
+          if (sellQty <= 0) continue;
+
+          const liquidationTrade = await executeTradeIntent({
+            db,
+            config: currentConfig,
+            request: {
+              source: "stop_loss",
+              symbol: pos.symbol,
+              qty: sellQty,
+              estimatedPrice: parseFloat(pos.current_price) || 0,
+              side: "sell",
+              reasoning: decision.reasoning,
+            },
+          });
+          Object.assign(liquidationTrade, {
+            symbol: pos.symbol,
+            qty: sellQty,
+            price: parseFloat(pos.current_price) || 50,
+            side: "sell",
+          });
+
+          const tgAlertMsg = `🚨 <b>${decision.kind === "plan_exit" ? "EXIT PLAN TRIGGERED" : "STOP LOSS EXECUTION WARNING"}</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Reason:</b> ${decision.reasoning}\nAutomatically liquidated ${sellQty} shares to shield capital assets from further dropdowns.`;
+          liquidationTrade.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgAlertMsg);
+          liquidationTrade.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, liquidationTrade);
+          liquidationTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, {
+            id: "an-" + Math.random().toString(36).substr(2, 9),
+            symbol: pos.symbol,
+            source: "email",
+            sourceTitle: "Protective Capital Liquidation",
+            sourceContent: decision.kind === "plan_exit" ? "Exit plan threshold triggered" : "Loss threshold exceeded",
+            growthScore: 0,
+            sentimentScore: -100,
+            riskProfile: "High",
+            reasoning: liquidationTrade.reasoning,
+            whipsawCheck: "Stop Limit breach verified, trend reversal detected.",
+            decision: "SELL",
+            timestamp: liquidationTrade.timestamp
+          });
+
+          db.trades.unshift(liquidationTrade);
+
+          // Clean local simulated portfolio if offline mode
+          if (!getBrokerConfig().configured && liquidationTrade.status !== "BrokerFailed" && liquidationTrade.status !== "RiskRejected") {
+            db.simulatedPortfolio.positions = (db.simulatedPortfolio.positions || []).filter((p: any) => p.symbol !== pos.symbol);
+            const fundBack = sellQty * (parseFloat(pos.current_price) || 50);
+            db.simulatedPortfolio.cash = String(parseFloat(db.simulatedPortfolio.cash) + fundBack);
+            db.simulatedPortfolio.long_market_value = String(parseFloat(db.simulatedPortfolio.long_market_value) - fundBack);
           }
+
+          addLog("trade", `Liquidated ${sellQty} shares of ${pos.symbol} (${decision.kind === "plan_exit" ? "exit plan" : "legacy stop loss"} trigger).`);
         }
       } catch (riskManagerErr: any) {
         addLog("error", "Portfolio risk evaluator hit error", riskManagerErr.message);

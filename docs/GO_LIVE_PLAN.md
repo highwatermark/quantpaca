@@ -115,11 +115,11 @@ The engines are good; the monolithic `server.ts` bypasses them. Fix the wiring.
   *Accept:* with Gmail unavailable, a sync produces no signals and no trades; a test asserts this.
 - [x] **Per-symbol cooldown.** After any executed trade or rejected/failed order for a symbol, populate `cooldownSymbols` (already supported at `riskEngine.ts:92`) for a configurable window (default 24h).
   *Accept:* a second BUY for the same symbol within the window returns `requires_human_approval`.
-- [ ] **Gate on the whipsaw check.** The LLM's `whipsawCheck` must become a structured field (e.g., `whipsawVerdict: "whipsaw" | "reversal" | "unclear"`) that the signal engine gates on for SELL decisions and haircuts confidence for BUYs — not just pasted into reasoning text (`server.ts:1140`).
+- [x] **Gate on the whipsaw check.** The LLM's `whipsawCheck` must become a structured field (e.g., `whipsawVerdict: "whipsaw" | "reversal" | "unclear"`) that the signal engine gates on for SELL decisions and haircuts confidence for BUYs — not just pasted into reasoning text (`server.ts:1140`).
   *Accept:* unit test shows a "reversal-unverified" SELL is downgraded to HOLD.
 
 ### 1.2 Exits actually execute
-- [ ] **Wire `evaluateExitPlan` into the monitoring loop.** In the portfolio controller (`server.ts:908-979`), load open exit plans and evaluate stop-loss, take-profit, time-exit, and thesis-invalidation against live positions; execute resulting closes through `executeTradeIntent`.
+- [x] **Wire `evaluateExitPlan` into the monitoring loop.** In the portfolio controller (`server.ts:908-979`), load open exit plans and evaluate stop-loss, take-profit, time-exit, and thesis-invalidation against live positions; execute resulting closes through `executeTradeIntent`.
   *Accept:* integration tests for each exit type (position at +take-profit closes; position past `timeExitAt` closes).
 - [ ] **Trailing stop.** Populate and evaluate `trailingStopPercent` (`tradingSafety.ts:43`) in the exit plan.
   *Accept:* unit test: stop ratchets up with price, triggers on retrace.
