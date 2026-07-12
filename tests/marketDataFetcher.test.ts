@@ -7,6 +7,7 @@ import {
   parseCloseSeries,
   fetchMarketRegimeInputs,
   BTC_PROXY_SYMBOL,
+  BARS_LOOKBACK_DAYS,
   TREND_LONG_WINDOW,
   TREND_SHORT_WINDOW,
   VOL_WINDOW,
@@ -197,4 +198,54 @@ test("fetchMarketRegimeInputs: partial failure -- SPY succeeds, QQQ returns non-
   assert.equal(result.inputs.qqqTrendPercent, undefined, "QQQ's non-OK response must not produce a value");
   assert.equal(result.inputs.btcTrendPercent, undefined, "the BTC proxy's thrown error must not produce a value");
   assert.equal(result.unavailableReasons.length, 2, `expected exactly 2 unavailable reasons, got: ${JSON.stringify(result.unavailableReasons)}`);
+});
+
+// --- Regression: Alpaca defaults `start` to "beginning of today" when the ---
+// --- query omits it, which returns `{"bars": null}` on weekends/holidays/  ---
+// --- early mornings (verified live). Every bars request must pass an      ---
+// --- explicit `start` so the fetch works regardless of when it runs.      ---
+
+test("fetchMarketRegimeInputs: every bars request carries a `start` query param ~BARS_LOOKBACK_DAYS in the past", async () => {
+  const fixedNow = new Date("2026-07-12T15:00:00Z");
+  const requestedUrls: string[] = [];
+  await fetchMarketRegimeInputs({
+    brokerConfig: { configured: true, apiKey: "k", secretKey: "s" },
+    dataBaseUrl: "https://data.alpaca.markets",
+    now: () => fixedNow,
+    fetchImpl: (async (input: any) => {
+      requestedUrls.push(String(input));
+      return new Response(JSON.stringify({ bars: mildRiseBars() }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch,
+  });
+
+  assert.equal(requestedUrls.length, 3);
+  const expectedStartMs = fixedNow.getTime() - BARS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+  for (const rawUrl of requestedUrls) {
+    const parsed = new URL(rawUrl);
+    const start = parsed.searchParams.get("start");
+    assert.ok(start, `expected a start param on ${rawUrl}`);
+    const startMs = Date.parse(start!);
+    assert.ok(!Number.isNaN(startMs), `expected start=${start} to parse as a date`);
+    // Tolerance: a few seconds for test execution time.
+    assert.ok(
+      Math.abs(startMs - expectedStartMs) < 5000,
+      `expected start ~${new Date(expectedStartMs).toISOString()} (${BARS_LOOKBACK_DAYS} days before now), got ${start}`,
+    );
+  }
+});
+
+test("fetchMarketRegimeInputs: a `{ bars: null }` response (Alpaca's shape when its default start window has zero bars) is treated as unavailable, not a crash", async () => {
+  const result = await fetchMarketRegimeInputs({
+    brokerConfig: { configured: true, apiKey: "k", secretKey: "s" },
+    dataBaseUrl: "https://data.alpaca.markets",
+    fetchImpl: (async () =>
+      new Response(JSON.stringify({ bars: null }), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch,
+  });
+
+  assert.deepEqual(result.inputs, {}, "no fields should be populated when every symbol returns bars: null");
+  assert.equal(result.unavailableReasons.length, 3, `expected one unavailable reason per symbol, got: ${JSON.stringify(result.unavailableReasons)}`);
+  for (const reason of result.unavailableReasons) {
+    assert.ok(/missing a bars array/.test(reason), `expected a "missing a bars array" reason, got: ${reason}`);
+  }
 });

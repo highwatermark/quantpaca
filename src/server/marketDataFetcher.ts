@@ -35,6 +35,18 @@ export const VOL_WINDOW = 20;
 export const TRADING_DAYS_PER_YEAR = 252;
 export const BARS_LIMIT = 60;
 
+// Alpaca's daily-bars endpoint defaults `start` to the beginning of the
+// current day when the query omits it -- on weekends, holidays, and early
+// mornings before the first bar prints, that default window contains zero
+// bars and the endpoint responds `{"bars": null}` (verified live against
+// Alpaca). Without an explicit `start`, every regime fetch outside trading
+// hours silently degrades to the conservative default forever. 100 calendar
+// days comfortably covers the ~60 *trading* days BARS_LIMIT requests (weekends
+// and holidays mean ~60 trading days spans ~84-90 calendar days) with headroom
+// to spare.
+export const BARS_LOOKBACK_DAYS = 100;
+const BARS_LOOKBACK_MS = BARS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
 // BTC proxy: Alpaca's stocks market-data API doesn't serve crypto, and the
 // existing market-data code in server.ts only ever talks to the stocks bars
 // endpoint. BITO (ProShares Bitcoin Strategy ETF) is a regular US-listed
@@ -183,11 +195,12 @@ type DailyBarsResult = { ok: boolean; bars: unknown[]; reason: string };
 // other two fetches or the caller's control flow.
 async function fetchDailyBars(
   symbol: string,
-  options: { dataBaseUrl: string; apiKey?: string; secretKey?: string; fetchImpl: typeof fetch },
+  options: { dataBaseUrl: string; apiKey?: string; secretKey?: string; fetchImpl: typeof fetch; nowMs: number },
 ): Promise<DailyBarsResult> {
   try {
+    const start = new Date(options.nowMs - BARS_LOOKBACK_MS).toISOString();
     const res = await options.fetchImpl(
-      `${options.dataBaseUrl}/v2/stocks/${symbol}/bars?timeframe=1Day&limit=${BARS_LIMIT}`,
+      `${options.dataBaseUrl}/v2/stocks/${symbol}/bars?timeframe=1Day&limit=${BARS_LIMIT}&start=${encodeURIComponent(start)}`,
       {
         headers: {
           "APCA-API-KEY-ID": options.apiKey || "",
@@ -243,6 +256,7 @@ export async function fetchMarketRegimeInputs(options: FetchMarketRegimeInputsOp
       apiKey: options.brokerConfig.apiKey,
       secretKey: options.brokerConfig.secretKey,
       fetchImpl,
+      nowMs: now().getTime(),
     });
 
   const [spy, qqq, btc] = await Promise.all([fetchOne("SPY"), fetchOne("QQQ"), fetchOne(BTC_PROXY_SYMBOL)]);
