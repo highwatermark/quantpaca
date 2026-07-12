@@ -35,9 +35,10 @@ import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
 import { loadCooldownConfig } from "./src/server/cooldownConfig";
-import { sizeTradeIntent } from "./src/server/sizingEngine";
+import { sizeTradeIntent, computeCapRoom, capRoomToQty } from "./src/server/sizingEngine";
 import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marketDataFetcher";
 import { RegimeAssessment } from "./src/server/domainTypes";
+import { parseFiniteNumber } from "./src/server/numericSafety";
 
 dotenv.config();
 
@@ -1757,7 +1758,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
 app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
   const release = await dbMutex.acquire();
   try {
-    const { symbol, qty, side, price } = req.body;
+    const { symbol, side } = req.body;
     const db = readDB();
     const authHeader = req.headers.authorization || null;
 
@@ -1768,6 +1769,92 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
       db.syncLogs.unshift({ id: "l-" + Math.random().toString(36).substr(2, 9), timestamp, type, message: msg, details });
     };
 
+    // Fail closed on unparsable request numerics (docs/GO_LIVE_PLAN.md Phase 1.4):
+    // a non-finite/non-positive qty or price is rejected outright rather than
+    // coerced to NaN/0 and passed through to the safety pipeline.
+    const qtyParsed = parseFiniteNumber(req.body.qty, "qty");
+    if (!qtyParsed.ok || qtyParsed.value <= 0) {
+      res.status(400).json({ error: "Manual trade override rejected", details: `Request field "qty" must be a positive finite number.` });
+      return;
+    }
+    const priceParsed = parseFiniteNumber(req.body.price, "price");
+    if (!priceParsed.ok || priceParsed.value <= 0) {
+      res.status(400).json({ error: "Manual trade override rejected", details: `Request field "price" must be a positive finite number.` });
+      return;
+    }
+    const requestedQty: number = qtyParsed.value;
+    const price: number = priceParsed.value;
+
+    let qty: number = requestedQty;
+    let clamp: { requestedQty: number; approvedQty: number; capsApplied: string[] } | undefined;
+
+    // Task 12 (docs/GO_LIVE_PLAN.md Phase 1.4, "Route every buy path through
+    // sizing"): a manual BUY is clamped to the same per-position/exposure/
+    // buying-power/max-notional caps the automation path (/api/sync) uses, via
+    // the computeCapRoom helper shared with sizingEngine.ts's sizeTradeIntent --
+    // no forked math. Deliberately skips sizeTradeIntent's confidence/stop-
+    // distance/regime multipliers: those scale down for automated *signal
+    // quality*, which has no meaning for a human's explicit order. SELLs are
+    // de-risking and stay unrestricted by these caps (unchanged).
+    if (side === "buy") {
+      const brokerConfig = getBrokerConfig();
+      const portfolio = await getAlpacaPortfolio(brokerConfig);
+      const portfolioAssessment = assessPortfolio({
+        account: portfolio,
+        positions: portfolio.positions || [],
+        openOrders: await getAlpacaOpenOrders(brokerConfig),
+        source: brokerConfig.configured ? "alpaca" : "local_simulated_snapshot",
+      });
+      const parsedPortfolioValue = Number(portfolio.portfolio_value);
+      if (!Number.isFinite(parsedPortfolioValue) || parsedPortfolioValue <= 0) {
+        addLog("error", `Manual override BUY rejected for ${symbol}. Portfolio value is not a finite number; failing closed.`);
+        writeDB(db);
+        res.status(422).json({ error: "Manual trade override rejected", details: "Portfolio value is not a finite number; failing closed." });
+        return;
+      }
+      // Same wiring as the automation buy path in /api/sync: max-notional-per-trade
+      // is maxPositionSizePercent of total portfolio value, not equity.
+      const maxNotionalPerTrade = parsedPortfolioValue * (currentConfig.system.maxPositionSizePercent / 100);
+
+      const capRoom = computeCapRoom({
+        portfolio: portfolioAssessment,
+        symbol,
+        limits: {
+          maxSinglePositionPercent: currentConfig.system.maxPositionSizePercent,
+          maxPortfolioExposurePercent: riskLimits.maxPortfolioExposurePercent,
+          maxNotionalPerTrade,
+          minBuyingPowerAfterTrade: riskLimits.minBuyingPower,
+        },
+      });
+      const capQty = capRoomToQty(capRoom.allowedNotional, price);
+
+      if (capQty <= 0) {
+        const capNames = capRoom.capsApplied.join(", ") || "no room remaining";
+        addLog("error", `Manual override BUY rejected for ${symbol}. No executable quantity remains under cap(s): ${capNames}.`);
+        writeDB(db);
+        res.status(422).json({
+          error: "Manual trade override rejected",
+          details: `No executable quantity remains under cap(s): ${capNames}.`,
+          capsApplied: capRoom.capsApplied,
+        });
+        return;
+      }
+
+      if (capQty < requestedQty) {
+        qty = capQty;
+        clamp = { requestedQty, approvedQty: capQty, capsApplied: capRoom.capsApplied };
+        addLog("override", `Manual override BUY for ${symbol} clamped from ${requestedQty} to ${capQty} shares (cap: ${capRoom.capsApplied.join(", ")}).`);
+        appendAuditEvents(db, [{
+          id: `ae-override-clamp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          type: "risk",
+          actor: "ui",
+          message: `Manual override BUY for ${symbol} clamped from ${requestedQty} to ${capQty} shares by cap(s): ${capRoom.capsApplied.join(", ")}.`,
+          details: { symbol, requestedQty, approvedQty: capQty, capsApplied: capRoom.capsApplied },
+        }]);
+      }
+    }
+
     addLog("override", `Manual Override Triggered: Place market order: ${side.toUpperCase()} ${qty} ${symbol}`);
 
     const tradeVal = await executeTradeIntent({
@@ -1776,10 +1863,12 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
       request: {
         source: "manual",
         symbol,
-        qty: Number(qty),
-        estimatedPrice: Number(price),
+        qty,
+        estimatedPrice: price,
         side,
-        reasoning: "Manual trader override dispatched from dashboard control deck.",
+        reasoning: clamp
+          ? `Manual trader override dispatched from dashboard control deck. Requested ${clamp.requestedQty}, clamped to ${clamp.approvedQty} by cap(s): ${clamp.capsApplied.join(", ")}.`
+          : "Manual trader override dispatched from dashboard control deck.",
         actor: "ui",
       },
     });
@@ -1794,7 +1883,7 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     if (!getBrokerConfig().configured && tradeVal.status !== "BrokerFailed" && tradeVal.status !== "RiskRejected") {
       const currentSim = db.simulatedPortfolio;
       const existingPos = currentSim.positions.find((p: any) => p.symbol === symbol);
-      const sharesCost = parseFloat(String(qty)) * parseFloat(String(price));
+      const sharesCost = qty * price;
 
       if (side === "buy") {
         if (existingPos) {
@@ -1834,7 +1923,7 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     }
 
     writeDB(db);
-    res.json({ success: true, trade: tradeVal });
+    res.json({ success: true, trade: tradeVal, ...(clamp ? { clamp } : {}) });
   } catch (err: any) {
     console.error("Critical error in /api/override/trade:", err);
     res.status(500).json({ error: "Manual trade override failed", details: err.message });
