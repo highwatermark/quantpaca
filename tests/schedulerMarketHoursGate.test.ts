@@ -249,9 +249,27 @@ test("clock fetch failure is treated as closed (fail closed): same reduced-cycle
 async function assertProtectiveSellProceedsWhileClosed(t: any, symbol: string) {
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
-  t.after(() => {
-    listener.close();
+  t.after(async () => {
+    // `openPositions` seeds a SYNTHETIC pre-existing broker position (a
+    // position this test simulates as already held, never bought through
+    // this system) purely so MODULE 2's protective stop-loss has something to
+    // liquidate. Phase 2 Task 7's position reconciliation now runs every
+    // cycle and -- correctly, by design -- treats that same synthetic
+    // position as an `unexpected_position` (broker holds it, the local trade
+    // ledger has no record of ever buying it) while it's seeded, latching
+    // block_new_buys. That latch is deliberately STICKY (a clean comparison
+    // never auto-unlatches; see reconciliationEngine.ts/breakerLatch.ts) so
+    // it would otherwise leak into every later test in this file. Reset it
+    // here (equity is healthy and openPositions is back to [] the moment
+    // this runs, so the reset's own fresh drawdown evaluation genuinely
+    // clears it) -- the same cleanup an operator would do after acknowledging
+    // a one-off test/synthetic drift.
     openPositions = [];
+    await fetch(`http://127.0.0.1:${port}/api/breaker/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-admin-token": ADMIN_TOKEN },
+    }).catch(() => {});
+    listener.close();
   });
 
   await setAutoTrading(port);

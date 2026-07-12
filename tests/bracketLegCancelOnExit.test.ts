@@ -227,6 +227,26 @@ async function runSync(port: number) {
   return res.json() as Promise<any>;
 }
 
+// Phase 2 Task 7 (docs/GO_LIVE_PLAN.md Phase 2.3): position reconciliation now
+// runs every sync cycle. `positionsFixture` here is DECOUPLED from actual
+// trade history by design (module comment above) -- and "cancel failure
+// fails closed" below deliberately leaves a position (BRAK2) locally
+// recorded as still-held with no matching broker entry once `resetMockBroker`
+// wipes `positionsFixture` back to `[]` for a later test. That is a genuine
+// (test-fixture-induced) mismatch reconciliation is correctly designed to
+// catch, and its block_new_buys latch is deliberately sticky (no auto-clear
+// on a later clean comparison -- see reconciliationEngine.ts/breakerLatch.ts),
+// so it would otherwise leak into every later test in this file. Reset it at
+// the start of each test (harmless/idempotent when nothing is latched) --
+// the same cleanup an operator would do after acknowledging a one-off
+// test/synthetic drift.
+async function resetBreakerIfLatched(port: number) {
+  await fetch(`http://127.0.0.1:${port}/api/breaker/reset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-admin-token": ADMIN_TOKEN },
+  }).catch(() => {});
+}
+
 test("software exit with live broker legs: the exit monitor cancels the open bracket legs for the symbol, then submits the liquidation sell", async (t) => {
   resetMockBroker();
   const listener = app.listen(0);
@@ -234,6 +254,7 @@ test("software exit with live broker legs: the exit monitor cancels the open bra
   t.after(() => listener.close());
 
   await setAutoTrading(port);
+  await resetBreakerIfLatched(port);
 
   const buy = await placeOrder(port, { symbol: "BRAK1", qty: 2, side: "buy", price: 100 });
   assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
@@ -280,6 +301,7 @@ test("cancel failure fails closed: when a leg cancel fails, the software exit is
   t.after(() => listener.close());
 
   await setAutoTrading(port);
+  await resetBreakerIfLatched(port);
 
   const buy = await placeOrder(port, { symbol: "BRAK2", qty: 1, side: "buy", price: 100 });
   assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
@@ -333,6 +355,7 @@ test("automation SELL decision on a bracket-protected position: the live legs ar
   t.after(resetAnalysisFixtureToNone);
 
   await setAutoTrading(port);
+  await resetBreakerIfLatched(port);
 
   const buy = await placeOrder(port, { symbol: "AUTOSELL", qty: 2, side: "buy", price: 100 });
   assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
@@ -382,6 +405,7 @@ test("automation SELL where a leg cancel fails: the sell is skipped this cycle (
   t.after(resetAnalysisFixtureToNone);
 
   await setAutoTrading(port);
+  await resetBreakerIfLatched(port);
 
   const buy = await placeOrder(port, { symbol: "AUTOFAIL", qty: 1, side: "buy", price: 100 });
   assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));

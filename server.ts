@@ -5,7 +5,7 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import Anthropic from "@anthropic-ai/sdk";
-import { AppConfig, StockAnalysis, Trade, SyncLog } from "./src/types";
+import { AlpacaPosition, AppConfig, StockAnalysis, Trade, SyncLog } from "./src/types";
 import {
   AuditEvent,
   BROKER_SUCCESS_TRADE_STATUSES,
@@ -34,7 +34,7 @@ import { extractEmailScanTarget, EmailScanTarget } from "./src/server/emailInges
 import { assembleScanTargets, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
 import { detectRegime } from "./src/server/regimeEngine";
 import { assessPortfolio } from "./src/server/portfolioEngine";
-import { reconcileBrokerState } from "./src/server/reconciliationEngine";
+import { buildPositionReconciliationReport, reconcileBrokerState } from "./src/server/reconciliationEngine";
 import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, createConfirmationToken, parseTelegramAdminRoles } from "./src/server/telegramEngine";
 import { createExitPlan } from "./src/server/exitEngine";
 import { evaluateOpenPositionExits } from "./src/server/exitMonitor";
@@ -48,9 +48,9 @@ import { loadCooldownConfig } from "./src/server/cooldownConfig";
 import { sizeTradeIntent, computeCapRoom, capRoomToQty } from "./src/server/sizingEngine";
 import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marketDataFetcher";
 import { checkAssetTradable } from "./src/server/tradabilityGuard";
-import { RegimeAssessment } from "./src/server/domainTypes";
+import { ReconciliationReport, RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
-import { EMPTY_SYNC_ALERT_STATE_KEY, shouldSendThrottledAlert } from "./src/server/alertThrottle";
+import { EMPTY_SYNC_ALERT_STATE_KEY, EMPTY_SYNC_ALERT_WINDOW_MS, shouldSendThrottledAlert } from "./src/server/alertThrottle";
 import { createScheduler, MAX_BUYS_PER_CYCLE, MAX_CONSECUTIVE_FAILURES } from "./src/server/scheduler";
 import {
   buyGateRejectionReason,
@@ -240,6 +240,52 @@ function breakerLatchAuditEvent(input: {
       reasons: input.fresh.reasons,
     },
   };
+}
+
+// Phase 2 Task 7 (docs/GO_LIVE_PLAN.md Phase 2.3): app_state (persistence.ts)
+// keys for position-level reconciliation's own small pieces of cross-restart
+// state -- same "no schema migration needed" convention as
+// EMPTY_SYNC_ALERT_STATE_KEY (alertThrottle.ts) and STARTUP_ORPHANS_APP_STATE_KEY
+// (startupReconciliation.ts).
+const RECONCILIATION_ACKNOWLEDGED_BASELINES_APP_STATE_KEY = "reconciliation_acknowledged_baselines";
+const RECONCILIATION_MISMATCH_ALERT_STATE_KEY = "reconciliation_mismatch_alert_state";
+
+// POST /api/reconciliation/acknowledge (below) writes this map (symbol ->
+// accepted baseline qty); computeExpectedPositions (reconciliationEngine.ts)
+// folds it additively into the expected-position ledger every cycle. Fails
+// closed to {} (no baselines) on any read/parse/shape failure -- an admin's
+// prior acknowledgment silently going missing can only make a real drift MORE
+// visible again (re-flagged as unexpected_position), never less, which is
+// the same fail-closed-into-visibility direction as every other control in
+// this task.
+function readAcknowledgedBaselines(): Record<string, number> {
+  try {
+    const raw = productionStore.getAppState(RECONCILIATION_ACKNOWLEDGED_BASELINES_APP_STATE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const result: Record<string, number> = {};
+    for (const [symbol, qty] of Object.entries(parsed as Record<string, unknown>)) {
+      const parsedQty = parseFiniteNumber(qty, "qty");
+      if (parsedQty.ok) result[symbol] = parsedQty.value;
+    }
+    return result;
+  } catch (err) {
+    console.error("[reconciliation] Failed to read acknowledged baselines; treating as none (fail closed into visibility).", err);
+    return {};
+  }
+}
+
+// Stable signature of a mismatch set -- used to tell "the SAME mismatch is
+// still present" (throttle to once per EMPTY_SYNC_ALERT_WINDOW_MS, reusing
+// Task 1's throttle helper) apart from "a NEW/different mismatch just
+// appeared" (alert immediately, per this task's binding rule), without
+// persisting the full mismatch payload.
+function fingerprintMismatches(mismatches: ReconciliationReport["mismatches"]): string {
+  return mismatches
+    .map((m) => `${m.type}:${m.symbol || ""}:${m.localId || ""}:${m.expected || ""}:${m.actual || ""}`)
+    .sort()
+    .join("|");
 }
 
 async function executeTradeIntent(input: {
@@ -686,6 +732,65 @@ async function getAlpacaPortfolio(brokerConfig: BrokerConfig = getBrokerConfig()
   } catch (err: any) {
     console.error("Alpaca connection error:", err.message);
     throw err;
+  }
+}
+
+// Phase 2 Task 7 (docs/GO_LIVE_PLAN.md Phase 2.3): a dedicated account+positions
+// fetch for position reconciliation ONLY -- deliberately NOT getAlpacaPortfolio
+// above, whose positions fetch silently degrades to an empty array on a non-OK
+// response (`posRes.ok ? await posRes.json() : []`, line ~711). That silent-empty
+// behavior is safe everywhere ELSE it's used (a degraded/empty portfolio view is
+// honest enough for e.g. the dashboard or sizing math to treat conservatively),
+// but for THIS gate it would be actively dangerous: an empty positions list
+// would look exactly like "every expected position was manually closed",
+// fabricating a `missing_position` mismatch for every open lot on a transient
+// Alpaca outage -- precisely the false-positive-drift failure mode this task's
+// binding rule ("absence of data is never drift") exists to prevent. This
+// helper instead fails closed (`ok: false`) on ANY non-OK/malformed response
+// from either endpoint, so the caller can skip the comparison entirely rather
+// than trust a partial read.
+async function fetchAccountAndPositionsForReconciliation(
+  brokerConfig: BrokerConfig,
+): Promise<{ ok: true; account: any; positions: AlpacaPosition[] } | { ok: false; errorMessage: string }> {
+  const headers = {
+    "APCA-API-KEY-ID": brokerConfig.apiKey || "",
+    "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
+    "Content-Type": "application/json",
+  };
+  try {
+    const acctRes = await fetch(`${brokerConfig.baseUrl}/account`, { headers });
+    if (!acctRes.ok) return { ok: false, errorMessage: `GET /account responded with ${acctRes.status}` };
+    const account = await acctRes.json();
+
+    const posRes = await fetch(`${brokerConfig.baseUrl}/positions`, { headers });
+    if (!posRes.ok) return { ok: false, errorMessage: `GET /positions responded with ${posRes.status}` };
+    const rawPositions = await posRes.json();
+    if (!Array.isArray(rawPositions)) return { ok: false, errorMessage: "GET /positions did not return an array" };
+
+    return {
+      ok: true,
+      account: {
+        cash: account.cash,
+        buying_power: account.buying_power,
+        portfolio_value: account.portfolio_value,
+        equity: account.equity,
+        last_equity: account.last_equity,
+        long_market_value: account.long_market_value,
+        daytrade_count: account.daytrade_count,
+      },
+      positions: rawPositions.map((p: any) => ({
+        symbol: p.symbol,
+        qty: p.qty,
+        market_value: p.market_value,
+        cost_basis: p.cost_basis,
+        unrealized_pl: p.unrealized_pl,
+        unrealized_plpc: p.unrealized_plpc,
+        current_price: p.current_price,
+        avg_entry_price: p.avg_entry_price,
+      })),
+    };
+  } catch (err: any) {
+    return { ok: false, errorMessage: err?.message || String(err) };
   }
 }
 
@@ -1570,6 +1675,52 @@ app.post("/api/reconciliation/orphans/clear", requireAdminCommand, async (req, r
   res.json({ cleared: clearedOrphans.length, orphans: clearedOrphans });
 });
 
+// Phase 2 Task 7 (docs/GO_LIVE_PLAN.md Phase 2.3, "known-drift acceptance"):
+// records the accepted qty for a symbol MODULE 1.6's position reconciliation
+// would otherwise keep re-flagging as unexpected_position/quantity_drift/
+// missing_position -- e.g. the operator's own manually-held SGOV, which this
+// system never traded. Does NOT touch the breaker latch itself (it is
+// sticky/human-reset-only, per this task's brief); the very next comparison
+// simply computes a clean expected position for this symbol going forward,
+// so if this was the ONLY mismatch, an admin still needs POST
+// /api/breaker/reset to clear the already-latched block_new_buys (or it
+// clears on the following cycle's re-evaluation once genuinely clean and the
+// admin resets). Each call SETS (overwrites, does not add to) the baseline
+// for `symbol` -- calling it again with a corrected qty is how an admin fixes
+// a mistaken acknowledgment.
+app.post("/api/reconciliation/acknowledge", requireAdminCommand, async (req, res) => {
+  const symbol = typeof req.body?.symbol === "string" ? req.body.symbol.trim() : "";
+  if (!symbol) {
+    res.status(400).json({ error: "Reconciliation acknowledge rejected", details: `Request field "symbol" must be a non-empty string.` });
+    return;
+  }
+  const qtyParsed = parseFiniteNumber(req.body?.qty, "qty");
+  if (!qtyParsed.ok) {
+    res.status(400).json({ error: "Reconciliation acknowledge rejected", details: `Request field "qty" must be a finite number.` });
+    return;
+  }
+  const qty = qtyParsed.value;
+  try {
+    const baselines = readAcknowledgedBaselines();
+    baselines[symbol] = qty;
+    productionStore.setAppState(RECONCILIATION_ACKNOWLEDGED_BASELINES_APP_STATE_KEY, JSON.stringify(baselines));
+    productionStore.appendAuditEvents([
+      {
+        id: `ae-reconciliation-ack-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        type: "broker",
+        actor: "admin_api",
+        message: `Admin acknowledged a baseline position of ${qty} share(s) for ${symbol}; future reconciliation comparisons will include it in the expected position.`,
+        details: { symbol, qty },
+      },
+    ]);
+    res.json({ success: true, symbol, qty, baselines });
+  } catch (err: any) {
+    console.error("[reconciliation] Failed to persist an acknowledged baseline:", err);
+    res.status(500).json({ error: "Reconciliation acknowledge failed", details: err.message });
+  }
+});
+
 app.get("/api/telegram/status", (req, res) => {
   const roles = parseTelegramAdminRoles(process.env.TELEGRAM_ADMIN_ROLES);
   res.json({
@@ -1787,6 +1938,145 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
         "error",
         "Order-status poll failed; continuing this sync cycle without updated broker order state.",
         pollErr?.message || String(pollErr),
+      );
+    }
+
+    // ==========================================================
+    // MODULE 1.6: POSITION-LEVEL RECONCILIATION (Phase 2 Task 7,
+    // docs/GO_LIVE_PLAN.md Phase 2.3: "Scheduled position-level reconciliation"
+    // + "Mismatch halts buys"). Runs EVERY cycle (full AND reduced -- unlike
+    // MODULE 2/2.5 below, this is not gated on autoTrading or reducedCycle:
+    // "positions truth matters every cycle whether or not this cycle places
+    // any new trades", same reasoning MODULE 1.5's poll above already
+    // documents). Compares what our own successfully-placed trades imply we
+    // should hold (reconciliationEngine.ts's computeExpectedPositions) against
+    // Alpaca's live /positions -- the previously-unused `brokerPositions`
+    // input reconcileBrokerState always accepted but never read. Runs AFTER
+    // the order-status poll above so this comparison sees the freshest known
+    // filledQty, and BEFORE every trade-placing module below so a mismatch
+    // found this cycle blocks THIS cycle's own BUYs, not just the next one.
+    //
+    // Gated on the broker being configured (nothing to reconcile against in
+    // dry-run/simulated mode -- same convention as startupReconciliation.ts).
+    // A positions-fetch failure is deliberately NOT treated as drift: absence
+    // of data is never drift (this task's binding fail-closed rule) -- the
+    // comparison is skipped and logged, no report is persisted, and the
+    // breaker latch is left untouched.
+    // ==========================================================
+    try {
+      const reconciliationBrokerConfig = getBrokerConfig();
+      if (!reconciliationBrokerConfig.configured) {
+        addLog("sync", "Position reconciliation skipped: broker not configured (dry-run/simulated mode).");
+      } else {
+        const reconciliationFetch = await fetchAccountAndPositionsForReconciliation(reconciliationBrokerConfig);
+        if (reconciliationFetch.ok === false) {
+          addLog(
+            "error",
+            "Position reconciliation skipped: Alpaca account/positions fetch failed. Absence of data is not drift; latch state left unchanged.",
+            reconciliationFetch.errorMessage,
+          );
+        } else {
+          const reconciliationAccount = reconciliationFetch.account;
+          const ledgerTrades = productionStore.listTradeIntents(250).map((trade) => ({
+            id: trade.id,
+            symbol: trade.symbol,
+            side: trade.side,
+            status: trade.status,
+            qty: trade.qty,
+            filledQty: trade.filledQty,
+          }));
+          const acknowledgedBaselines = readAcknowledgedBaselines();
+          const report = buildPositionReconciliationReport({
+            trades: ledgerTrades,
+            livePositions: reconciliationFetch.positions,
+            acknowledgedBaselines,
+            account: reconciliationAccount,
+          });
+          productionStore.saveReconciliationReport(report);
+          addLog(
+            "sync",
+            `Position reconciliation: ${report.status} (${report.mismatches.length} mismatch(es)).`,
+            report.mismatches.length ? JSON.stringify(report.mismatches) : undefined,
+          );
+          appendAuditEvents(db, [
+            {
+              id: `ae-position-reconciliation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: new Date().toISOString(),
+              type: "sync",
+              actor: "position_reconciliation",
+              message: `Position reconciliation ${report.status}: ${report.mismatches.length} mismatch(es).`,
+              details: { reportId: report.id, status: report.status, mismatches: report.mismatches },
+            },
+          ]);
+
+          if (report.mismatches.length > 0) {
+            // Reuse the EXISTING breaker latch machinery (Task 10,
+            // breakerLatch.ts) -- no parallel latch. Start from a REAL fresh
+            // breaker evaluation (same equity/peakEquity continuity
+            // executeTradeIntent/performBreakerReset already rely on) so
+            // this never corrupts the drawdown breaker's own high-water
+            // mark; a reconciliation mismatch only ever ESCALATES that
+            // fresh status (never downgrades close_only to block_new_buys),
+            // with "reconciliation_mismatch" added to its reasons -- the
+            // additive reason-vocabulary extension this task's brief calls
+            // for.
+            const previousBreaker = productionStore.latestBreakerState<PreviousBreakerRecord>();
+            const freshBreaker = evaluateFreshBreaker(reconciliationAccount, reconciliationBrokerConfig, previousBreaker?.peakEquity ?? null);
+            const escalatedStatus: BreakerState["status"] = freshBreaker.status === "close_only" ? "close_only" : "block_new_buys";
+            const escalatedFresh: BreakerState = {
+              ...freshBreaker,
+              status: escalatedStatus,
+              reasons: [...freshBreaker.reasons, "reconciliation_mismatch"],
+            };
+            const latchResult = applyBreakerLatch(escalatedFresh, previousBreaker?.latch);
+            const toPersist = { ...latchResult.effective, latch: latchResult.latchState };
+            productionStore.saveBreakerState(toPersist);
+            if (latchResult.event !== "none") {
+              appendAuditEvents(db, [
+                breakerLatchAuditEvent({
+                  event: latchResult.event,
+                  corrupt: latchResult.corrupt,
+                  latchedStatus: latchResult.latchState.latchedStatus,
+                  fresh: escalatedFresh,
+                  actor: "reconciliation_engine",
+                }),
+              ]);
+            }
+
+            // Throttled Telegram alert (Task 1's shouldSendThrottledAlert,
+            // reused -- not a new throttle mechanism): a mismatch whose
+            // fingerprint matches the last one alerted on is "persisting"
+            // and only re-alerts once EMPTY_SYNC_ALERT_WINDOW_MS has
+            // elapsed; a NEW/different mismatch fingerprint always alerts
+            // immediately, bypassing the window. Only a DELIVERED alert
+            // advances the stamp (same convention as the empty-sync alert
+            // above) -- an undelivered attempt (Telegram unconfigured/down)
+            // must never suppress the next real alert.
+            const fingerprint = fingerprintMismatches(report.mismatches);
+            let alertState: { fingerprint?: string; lastSentAt?: string } = {};
+            try {
+              const rawAlertState = productionStore.getAppState(RECONCILIATION_MISMATCH_ALERT_STATE_KEY);
+              if (rawAlertState) alertState = JSON.parse(rawAlertState);
+            } catch {
+              alertState = {};
+            }
+            const isNewOrDifferentMismatch = alertState.fingerprint !== fingerprint;
+            const dueByThrottle = shouldSendThrottledAlert(alertState.lastSentAt, Date.now(), EMPTY_SYNC_ALERT_WINDOW_MS);
+            if (isNewOrDifferentMismatch || dueByThrottle) {
+              const tgMsg = `🚨 <b>Reconciliation mismatch detected</b>\n${report.mismatches.length} mismatch(es) between local trade records and Alpaca's live positions. New BUY orders are blocked (sells remain available) until an admin investigates and either acknowledges the drift (POST /api/reconciliation/acknowledge) or resets the breaker (POST /api/breaker/reset) once resolved.\n<b>Details:</b> ${JSON.stringify(report.mismatches).slice(0, 2500)}`;
+              const delivered = await sendTelegramAlert(currentConfig.telegram, tgMsg);
+              if (delivered) {
+                productionStore.setAppState(RECONCILIATION_MISMATCH_ALERT_STATE_KEY, JSON.stringify({ fingerprint, lastSentAt: new Date().toISOString() }));
+              }
+            }
+          }
+        }
+      }
+    } catch (reconciliationErr: any) {
+      addLog(
+        "error",
+        "Position reconciliation failed unexpectedly; continuing this sync cycle without a fresh reconciliation report.",
+        reconciliationErr?.message || String(reconciliationErr),
       );
     }
 

@@ -269,6 +269,23 @@ async function runSync(port: number) {
   return res.json() as Promise<any>;
 }
 
+// Phase 2 Task 7 (docs/GO_LIVE_PLAN.md Phase 2.3): position reconciliation
+// now runs every sync cycle, comparing the local trade ledger against GET
+// /positions -- which this file hardcodes to always return `[]` (this file's
+// subject is order-STATUS polling, not position reconciliation). Once a test
+// here actually marks an order "filled" (several deliberately do, to exercise
+// the poller), the very next reconciliation sees a locally-held position with
+// nothing on the (always-empty) mocked broker and latches block_new_buys --
+// sticky by design (no auto-clear on a later clean comparison), so it would
+// otherwise leak into every later test in this shared-db file. Reset it at
+// the start of each test (harmless/idempotent when nothing is latched).
+async function resetBreakerIfLatched(port: number) {
+  await fetch(`http://127.0.0.1:${port}/api/breaker/reset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-admin-token": ADMIN_TOKEN },
+  }).catch(() => {});
+}
+
 async function auditMessages(port: number): Promise<string[]> {
   const res = await fetch(`http://127.0.0.1:${port}/api/audit`);
   const events = (await res.json()) as any[];
@@ -302,6 +319,7 @@ test("poll cap: 26 pending orders in one cycle only polls 25 (oldest first), and
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   // Degenerate plan -> plain orders, no legs, so each buy contributes exactly
   // one pollable candidate (its own entry order).
@@ -350,6 +368,7 @@ test("Accepted -> poll returns filled: local state becomes Filled, quantities re
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   // Degenerate exit plan -> plain (non-bracket) order, so this test isolates
   // the trade's OWN order-status polling from bracket-leg polling.
@@ -383,6 +402,7 @@ test("partial fill, young: quantities are tracked and no cancel is issued", asyn
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
 
@@ -411,6 +431,7 @@ test("partial fill, stale (>30 min): remainder is canceled, position size adjust
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
 
@@ -442,6 +463,7 @@ test("poll returns rejected: local state updates to Rejected", async (t) => {
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
 
@@ -459,6 +481,7 @@ test("poll returns canceled: local state updates to Canceled", async (t) => {
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
 
@@ -476,6 +499,7 @@ test("poll fetch failure (500): local state is unchanged, lastPollError is recor
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
 
@@ -501,6 +525,7 @@ test('poll returns {status:"filled"} with missing filled_qty: state unchanged + 
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
 
@@ -547,6 +572,7 @@ test("filled TP leg discovered: exit closed broker-side is recorded + audited, a
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, {});
 
@@ -586,6 +612,7 @@ test('422 "not cancelable" on a believed-live leg: re-polling once confirms it i
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, {});
 
@@ -626,6 +653,7 @@ test('422 "not cancelable" on a leg that re-polls as STILL live: fails closed ex
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   await setConfig(port, {});
 
@@ -651,6 +679,7 @@ test("the poller also runs on a REDUCED (scheduled, market-closed) cycle -- orde
   resetMockBroker();
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
+  await resetBreakerIfLatched(port);
   t.after(() => listener.close());
   t.after(() => {
     clockIsOpen = true;

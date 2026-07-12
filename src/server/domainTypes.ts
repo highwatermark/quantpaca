@@ -107,12 +107,30 @@ export type ReconciliationReport = {
   timestamp: string;
   status: "matched" | "mismatch";
   mismatches: Array<{
-    type: "missing_broker_order" | "order_status" | "position";
+    // Phase 2 Task 7 (docs/GO_LIVE_PLAN.md Phase 2.3, scheduled position-level
+    // reconciliation): four additive mismatch types produced by
+    // reconciliationEngine.ts's comparePositions/computeExpectedPositions --
+    // "unexpected_position" (broker holds a symbol the trade ledger doesn't
+    // expect -- a manual buy or unknown fill), "missing_position" (the ledger
+    // expects a symbol the broker doesn't hold -- a manual sell or unknown
+    // close), "quantity_drift" (both hold the symbol but the qty differs
+    // beyond tolerance), and "ledger_gap" (a local trade row's qty/filledQty
+    // was unparsable and had to be skipped from the expected-position sum --
+    // fails closed into visibility rather than silently understating the
+    // expected position). Existing "missing_broker_order"/"order_status"
+    // (order-level reconciliation, reconcileBrokerState) and "position"
+    // (unused legacy placeholder) are untouched.
+    type: "missing_broker_order" | "order_status" | "position" | "unexpected_position" | "missing_position" | "quantity_drift" | "ledger_gap";
     localId?: string;
     brokerId?: string;
     symbol?: string;
     expected?: string;
     actual?: string;
+    // Human-readable detail, currently used by "ledger_gap" (which trade row,
+    // and why it was unparsable) and "quantity_drift" (the tolerance that was
+    // exceeded). Optional/additive -- every existing mismatch producer leaves
+    // this undefined.
+    reason?: string;
   }>;
   account?: AlpacaAccount;
 };
