@@ -1006,6 +1006,13 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
           now: new Date(),
           legacyStopLossPercent: stopPercent,
           lookupPlan: (symbol) => productionStore.latestBuySideExitPlanForSymbol(symbol),
+          onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => {
+            try {
+              productionStore.updateHighWaterMark(tradeId, highWaterMark);
+            } catch (err: any) {
+              console.error(`[trailing-stop] Failed to persist ratcheted high-water mark for ${symbol}:`, err?.message || err);
+            }
+          },
         });
 
         for (const skipped of exitEvaluation.skippedPlans) {

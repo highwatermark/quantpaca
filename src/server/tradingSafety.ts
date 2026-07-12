@@ -41,6 +41,12 @@ export type ExitPlan = {
   initialStopLossPrice: number;
   takeProfitPrice?: number;
   trailingStopPercent?: number;
+  // Entry price the plan was created against. Needed to determine whether a
+  // position has ever appreciated (highWaterMark > entryPrice) -- the signal
+  // that decides whether the trailing stop or the initial stop-loss governs
+  // a retrace. Optional so plans persisted before this field existed (or
+  // constructed directly in tests without it) simply never engage trailing.
+  entryPrice?: number;
   timeExitAt: string;
   thesisInvalidation: string;
   regimeChangeAction: "hold" | "reduce" | "close";

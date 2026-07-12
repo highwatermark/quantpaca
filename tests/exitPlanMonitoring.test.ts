@@ -15,6 +15,11 @@ process.env.ALPACA_SECRET_KEY = "";
 process.env.TRADING_MODE = "paper";
 process.env.LIVE_TRADING_ENABLED = "false";
 process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+// This file's tests share one simulated portfolio/day across many buy+sell
+// pairs; raise the (pre-existing, already-configurable) daily trade cap so a
+// later test in the file isn't spuriously RiskRejected by an earlier test's
+// trade volume. Not a new env var -- see src/server/riskLimits.ts.
+process.env.QUANTPACA_MAX_DAILY_TRADES = "100";
 
 // This test drives /api/sync end-to-end (pattern: syncFallbackRemoval.test.ts /
 // whipsawGateIntegration.test.ts), not a pure function in isolation. Two
@@ -305,4 +310,53 @@ test("per-position fail-closed: a corrupt plan is skipped and covered by the leg
     logLines.some((line) => /CORRUPT/.test(line) && /invalid/i.test(line)),
     `expected a log entry about the corrupt plan being skipped, got: ${JSON.stringify(logLines)}`,
   );
+});
+
+test("trailing stop: price rises then retraces across two sync cycles -- the HWM persists between cycles and the second cycle's sell carries trailing reasoning", async (t) => {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  await setAutoTrading(port, true);
+  const buy = await placeOrder(port, { symbol: "TRAIL", qty: 2, side: "buy", price: 100 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body.trade.riskDecision));
+
+  const rawStore = createProductionStore(sqlitePath);
+  rawStore.saveExitPlan(buy.body.trade.id, {
+    initialStopLossPrice: 50, // far below, so it never confounds the trailing-specific assertions below
+    takeProfitPrice: 1000, // far above, ditto
+    trailingStopPercent: 10,
+    entryPrice: 100,
+    timeExitAt: futureIso(30),
+    thesisInvalidation: "n/a",
+    regimeChangeAction: "close",
+    emergencyAction: "market_sell",
+  });
+  rawStore.close();
+
+  // Cycle 1: price rises to 120 -- ratchets the HWM to 120 but doesn't trigger
+  // (120 is above the trailing threshold of 120 * 0.9 = 108).
+  setSimulatedMarketState("TRAIL", 120, 20);
+  await runSync(port);
+  const afterCycle1 = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  assert.equal(
+    afterCycle1.find((tr) => tr.symbol === "TRAIL" && tr.side === "sell"),
+    undefined,
+    "no exit should fire on cycle 1 -- price is still above the trailing threshold",
+  );
+
+  // The HWM ratcheted during cycle 1 must be durably persisted (not just held
+  // in server memory) -- verified via a freshly-opened store handle.
+  const midCycleStore = createProductionStore(sqlitePath);
+  const persistedRecord = midCycleStore.latestBuySideExitPlanForSymbol("TRAIL");
+  midCycleStore.close();
+  assert.equal(persistedRecord?.highWaterMark, 120, "the ratcheted HWM must be visible via a new store handle between cycles");
+
+  // Cycle 2: price retraces to 107 -- below 120 * 0.9 = 108 -- the trailing exit fires.
+  setSimulatedMarketState("TRAIL", 107, 7);
+  const sync = await runSync(port);
+  const afterCycle2 = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const exitTrade = afterCycle2.find((tr) => tr.symbol === "TRAIL" && tr.side === "sell");
+  assert.ok(exitTrade, `expected a trailing-stop sell closing TRAIL on cycle 2, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
+  assert.match(exitTrade.reasoning, /trailing_stop hit: HWM 120\.00, threshold 108\.00.*current 107\.00/);
 });

@@ -144,3 +144,122 @@ test("positions with non-finite/zero/negative qty are ignored entirely", () => {
   assert.equal(result.legacyExits.length, 0);
   assert.equal(result.skippedPlans.length, 0);
 });
+
+// --- Trailing stop: high-water-mark tracking/supply (Task 7) ---
+
+function trailingBasePlan(overrides: Partial<ExitPlan> = {}): ExitPlan {
+  return basePlan({
+    initialStopLossPrice: 50, // far below entry so it never confounds trailing-specific assertions
+    takeProfitPrice: 1000, // far above entry so it never confounds trailing-specific assertions
+    trailingStopPercent: 10,
+    entryPrice: 100,
+    ...overrides,
+  });
+}
+
+test("trailing stop: price rising above the stored HWM ratchets it up via the callback, but doesn't trigger while still above the threshold", () => {
+  const ratchets: Array<{ tradeId: string; symbol: string; highWaterMark: number }> = [];
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL", qty: 1, currentPrice: 130, unrealizedPlPercent: 30 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      TRL: { side: "buy", exitPlan: trailingBasePlan(), tradeId: "tr-1", highWaterMark: 120 },
+    }),
+    onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => ratchets.push({ tradeId, symbol, highWaterMark }),
+  });
+  assert.equal(result.planExits.length, 0, "130 is above the 117 trailing threshold computed off the freshly-ratcheted 130 HWM");
+  assert.deepEqual(ratchets, [{ tradeId: "tr-1", symbol: "TRL", highWaterMark: 130 }]);
+});
+
+test("trailing stop: acceptance test -- HWM ratchets to 120 then a retrace to 107 triggers a trailing exit with HWM/threshold/current-price reasoning", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL2", qty: 4, currentPrice: 107, unrealizedPlPercent: 7 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      TRL2: { side: "buy", exitPlan: trailingBasePlan(), tradeId: "tr-2", highWaterMark: 120 },
+    }),
+  });
+  assert.equal(result.planExits.length, 1);
+  assert.equal(result.planExits[0].reason, "trailing_stop");
+  assert.equal(result.planExits[0].qty, 4);
+  assert.match(result.planExits[0].reasoning, /trailing_stop hit: HWM 120\.00, threshold 108\.00.*current 107\.00/);
+});
+
+test("trailing stop: a retrace to only 112 (above the 108 threshold) does not trigger", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL3", qty: 1, currentPrice: 112, unrealizedPlPercent: 12 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      TRL3: { side: "buy", exitPlan: trailingBasePlan(), tradeId: "tr-3", highWaterMark: 120 },
+    }),
+  });
+  assert.equal(result.planExits.length, 0);
+});
+
+test("trailing stop: the HWM never ratchets down -- a dip below the stored HWM leaves it untouched and does not persist a lower value", () => {
+  const ratchets: unknown[] = [];
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL4", qty: 1, currentPrice: 110, unrealizedPlPercent: 10 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      TRL4: { side: "buy", exitPlan: trailingBasePlan(), tradeId: "tr-4", highWaterMark: 120 },
+    }),
+    onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => ratchets.push({ tradeId, symbol, highWaterMark }),
+  });
+  // 110 is between the threshold (108) and the HWM (120): no trigger, and since
+  // 110 < 120 the HWM must not move (nor should the ratchet callback fire).
+  assert.equal(result.planExits.length, 0);
+  assert.equal(ratchets.length, 0, "the HWM must never ratchet down or be re-persisted on a mere dip");
+});
+
+test("trailing stop: a position that has never appreciated above entry never fires trailing (initial stop-loss territory)", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL5", qty: 1, currentPrice: 90, unrealizedPlPercent: -10 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      // HWM == entryPrice: the position has only ever dipped since entry.
+      TRL5: { side: "buy", exitPlan: trailingBasePlan(), tradeId: "tr-5", highWaterMark: 100 },
+    }),
+  });
+  assert.equal(result.planExits.length, 0);
+});
+
+test("trailing stop: fail-closed -- a corrupt persisted HWM skips the HWM update and the trailing trigger, but other dimensions of the same plan still evaluate", () => {
+  const ratchets: unknown[] = [];
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL6", qty: 1, currentPrice: 85, unrealizedPlPercent: -15 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      TRL6: {
+        side: "buy",
+        // initialStopLossPrice is 90 here (above the 85 current price) so the plan's
+        // OWN stop-loss dimension -- unrelated to trailing -- should still fire.
+        exitPlan: trailingBasePlan({ initialStopLossPrice: 90 }),
+        tradeId: "tr-6",
+        highWaterMark: "not-a-number" as unknown as number, // simulated DB corruption
+      },
+    }),
+    onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => ratchets.push({ tradeId, symbol, highWaterMark }),
+  });
+  assert.equal(result.planExits.length, 1);
+  assert.equal(result.planExits[0].reason, "stop_loss", "the plan's own stop-loss must still evaluate despite the corrupt HWM");
+  assert.equal(ratchets.length, 0, "a corrupt HWM must never be ratcheted/persisted");
+});
+
+test("trailing stop: a plan lacking trailingStopPercent/entryPrice (pre-existing plan shape) is unaffected -- no trailing dimension engages", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "TRL7", qty: 1, currentPrice: 200, unrealizedPlPercent: 100 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({
+      TRL7: { side: "buy", exitPlan: basePlan({ initialStopLossPrice: 10, takeProfitPrice: 1000 }), tradeId: "tr-7", highWaterMark: 190 },
+    }),
+  });
+  assert.equal(result.planExits.length, 0);
+});

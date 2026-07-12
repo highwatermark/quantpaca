@@ -22,6 +22,17 @@ import { parseFiniteNumber } from "./numericSafety";
 export type ExitPlanRecord = {
   side: "buy" | "sell";
   exitPlan: ExitPlan;
+  // Owning trade id, needed to persist a ratcheted high-water mark back to the
+  // exit_plans row it came from. Optional so records built without trailing in
+  // mind (pre-existing tests, plans predating this feature) keep compiling --
+  // a ratchet simply can't be persisted without it (still evaluated in-memory
+  // for that one cycle).
+  tradeId?: string;
+  // Raw persisted high-water mark for this plan. Typed `unknown` (not `number`)
+  // because it round-trips through storage and must be treated as untrusted --
+  // parsed via parseFiniteNumber below the same way currentPrice/takeProfitPrice
+  // already are elsewhere in this module.
+  highWaterMark?: unknown;
 };
 
 export type OpenPositionSnapshot = {
@@ -35,7 +46,7 @@ export type OpenPositionSnapshot = {
   unrealizedPlPercent: number;
 };
 
-export type PlanExitReason = "take_profit" | "time_exit" | "stop_loss" | "thesis_invalidation" | "regime_change";
+export type PlanExitReason = "take_profit" | "time_exit" | "stop_loss" | "thesis_invalidation" | "regime_change" | "trailing_stop";
 
 export type PlanExitDecision = {
   kind: "plan_exit";
@@ -72,6 +83,12 @@ export function evaluateOpenPositionExits(input: {
   // May throw (e.g. a broken DB handle) -- treated the same as "no plan found":
   // fail closed to the legacy check for that symbol only.
   lookupPlan: (symbol: string) => ExitPlanRecord | undefined;
+  // Called at most once per position, only when the high-water mark actually
+  // ratchets up this cycle (currentPrice > the stored HWM, both numerically
+  // valid). Lets server.ts persist the new HWM without this module touching a
+  // DB handle. Optional; omitting it just means ratchets aren't persisted
+  // (the freshly-ratcheted value is still used for this cycle's evaluation).
+  onHighWaterMarkRatchet?: (tradeId: string, symbol: string, highWaterMark: number) => void;
 }): ExitEvaluationResult {
   const planExits: PlanExitDecision[] = [];
   const legacyExits: LegacyExitDecision[] = [];
@@ -110,11 +127,28 @@ export function evaluateOpenPositionExits(input: {
       continue;
     }
 
+    // High-water mark: ratchet up in-memory (never down) before evaluating the
+    // trailing dimension, so a same-cycle price rise is reflected immediately
+    // (matches the acceptance test: price rises 100->120 in one cycle and the
+    // trailing threshold is computed off 120 that same cycle). A corrupt/missing
+    // stored HWM (fails parseFiniteNumber) fails closed: no ratchet, no persist,
+    // trailing simply doesn't evaluate this cycle -- validated.currentPrice was
+    // already confirmed finite above, so every other dimension is unaffected.
+    const hwmParsed = parseFiniteNumber(record.highWaterMark, "highWaterMark");
+    let effectiveHighWaterMark: number | undefined = hwmParsed.ok ? hwmParsed.value : undefined;
+    if (effectiveHighWaterMark !== undefined && validated.currentPrice > effectiveHighWaterMark) {
+      effectiveHighWaterMark = validated.currentPrice;
+      if (record.tradeId) {
+        input.onHighWaterMarkRatchet?.(record.tradeId, pos.symbol, effectiveHighWaterMark);
+      }
+    }
+
     const evaluation = evaluateExitPlan({
       exitPlan: record.exitPlan,
       side: record.side,
       currentPrice: validated.currentPrice,
       now: input.now,
+      highWaterMark: effectiveHighWaterMark,
     });
 
     if (evaluation.triggered) {
@@ -123,7 +157,7 @@ export function evaluateOpenPositionExits(input: {
         symbol: pos.symbol,
         qty,
         reason: evaluation.reason as PlanExitReason,
-        reasoning: buildPlanReasoning(evaluation.reason as PlanExitReason, record.exitPlan, validated.currentPrice),
+        reasoning: buildPlanReasoning(evaluation.reason as PlanExitReason, record.exitPlan, validated.currentPrice, effectiveHighWaterMark),
       });
     }
     // Plan present and numerically valid: it owns this symbol's exit decision
@@ -177,7 +211,7 @@ function validatePlanInputs(pos: OpenPositionSnapshot, exitPlan: ExitPlan): Plan
   return { ok: true, field: "", currentPrice: currentPriceResult.value };
 }
 
-function buildPlanReasoning(reason: PlanExitReason, plan: ExitPlan, currentPrice: number): string {
+function buildPlanReasoning(reason: PlanExitReason, plan: ExitPlan, currentPrice: number, highWaterMark?: number): string {
   switch (reason) {
     case "take_profit":
       return `take_profit hit: target ${Number(plan.takeProfitPrice).toFixed(2)}, current ${currentPrice.toFixed(2)}`;
@@ -189,6 +223,11 @@ function buildPlanReasoning(reason: PlanExitReason, plan: ExitPlan, currentPrice
       return `thesis_invalidation triggered: ${plan.thesisInvalidation}`;
     case "regime_change":
       return `regime_change triggered: regimeChangeAction=${plan.regimeChangeAction}`;
+    case "trailing_stop": {
+      const hwm = Number(highWaterMark);
+      const threshold = hwm * (1 - Number(plan.trailingStopPercent) / 100);
+      return `trailing_stop hit: HWM ${hwm.toFixed(2)}, threshold ${threshold.toFixed(2)} (trailing ${plan.trailingStopPercent}%), current ${currentPrice.toFixed(2)}`;
+    }
     default:
       return `${reason} triggered by exit plan evaluation`;
   }

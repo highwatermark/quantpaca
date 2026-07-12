@@ -34,7 +34,15 @@ export type ProductionStore = {
   // protecting one, and would carry inverted stop/take-profit multipliers if
   // reused to evaluate a still-open long. Undefined if no such plan exists (e.g.
   // a manual buy or pre-existing position that predates exit-plan persistence).
-  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan } | undefined;
+  // `tradeId` and `highWaterMark` support the trailing stop (Task 7): tradeId
+  // lets the caller persist a ratcheted HWM back via updateHighWaterMark;
+  // highWaterMark is the raw persisted value (undefined if never seeded/set).
+  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan; tradeId: string; highWaterMark?: number } | undefined;
+  // Ratchets the persisted high-water mark for the exit plan owned by `tradeId`.
+  // Callers are expected to only invoke this with a value already confirmed to
+  // be higher than the previous one (see exitMonitor.ts) -- this method itself
+  // performs an unconditional write, it does not re-check monotonicity.
+  updateHighWaterMark(tradeId: string, highWaterMark: number): void;
   saveReconciliationReport(report: ReconciliationReport): void;
   latestReconciliationReport(): ReconciliationReport | undefined;
   saveBreakerState(state: { asOf: string; status: string }): void;
@@ -118,6 +126,15 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     db.exec("ALTER TABLE reviewed_signals ADD COLUMN duplicate_key TEXT");
   }
 
+  // Backfill-safe migration (Task 7, trailing stop): exit_plans rows created
+  // before this column existed won't have it, and CREATE TABLE IF NOT EXISTS
+  // above is a no-op against them.
+  const exitPlansColumns = db.prepare("PRAGMA table_info(exit_plans)").all();
+  const hasHighWaterMarkColumn = exitPlansColumns.some((col) => col.name === "high_water_mark");
+  if (!hasHighWaterMarkColumn) {
+    db.exec("ALTER TABLE exit_plans ADD COLUMN high_water_mark REAL");
+  }
+
   return {
     appendAuditEvents(events) {
       const stmt = db.prepare(`
@@ -187,8 +204,17 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       return rowsToPayloads(db.prepare("SELECT payload_json FROM risk_decisions ORDER BY timestamp DESC LIMIT ?").all(limit));
     },
     saveExitPlan(tradeId, exitPlan) {
-      db.prepare("INSERT OR REPLACE INTO exit_plans (id, timestamp, trade_id, payload_json) VALUES (?, ?, ?, ?)")
-        .run(`exit-${tradeId}`, new Date().toISOString(), tradeId, JSON.stringify({ tradeId, exitPlan }));
+      // Seed the high-water mark at the plan's entryPrice, if the plan carries
+      // one (Task 7, trailing stop). This is what lets the very first
+      // monitoring cycle already have a real HWM to ratchet from, rather than
+      // requiring a second cycle to "discover" one. Plans without an
+      // entryPrice (predating this feature, or constructed directly in tests)
+      // seed NULL -- exitMonitor.ts treats that as "no trailing this cycle",
+      // never as zero/garbage.
+      const entryPrice = (exitPlan as { entryPrice?: unknown } | null | undefined)?.entryPrice;
+      const seedHighWaterMark = typeof entryPrice === "number" && Number.isFinite(entryPrice) ? entryPrice : null;
+      db.prepare("INSERT OR REPLACE INTO exit_plans (id, timestamp, trade_id, payload_json, high_water_mark) VALUES (?, ?, ?, ?, ?)")
+        .run(`exit-${tradeId}`, new Date().toISOString(), tradeId, JSON.stringify({ tradeId, exitPlan }), seedHighWaterMark);
     },
     listExitPlans(limit = 250) {
       return rowsToPayloads(db.prepare("SELECT payload_json FROM exit_plans ORDER BY timestamp DESC LIMIT ?").all(limit));
@@ -199,7 +225,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       // BUY. Bounded scan (50) rather than a single most-recent row, since the
       // single most-recent trade for an open symbol could be a partial SELL.
       const rows = db.prepare(`
-        SELECT ep.payload_json AS exit_payload, ti.payload_json AS trade_payload
+        SELECT ep.trade_id AS trade_id, ep.payload_json AS exit_payload, ep.high_water_mark AS high_water_mark, ti.payload_json AS trade_payload
         FROM exit_plans ep
         JOIN trade_intents ti ON ep.trade_id = ti.id
         WHERE ti.symbol = ?
@@ -211,9 +237,17 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         if (tradePayload.side !== "buy") continue;
         const exitPayload = JSON.parse(String(row.exit_payload)) as { exitPlan?: ExitPlan };
         if (!exitPayload.exitPlan) continue;
-        return { side: "buy" as const, exitPlan: exitPayload.exitPlan };
+        return {
+          side: "buy" as const,
+          exitPlan: exitPayload.exitPlan,
+          tradeId: String(row.trade_id),
+          highWaterMark: typeof row.high_water_mark === "number" ? row.high_water_mark : undefined,
+        };
       }
       return undefined;
+    },
+    updateHighWaterMark(tradeId, highWaterMark) {
+      db.prepare("UPDATE exit_plans SET high_water_mark = ? WHERE trade_id = ?").run(highWaterMark, tradeId);
     },
     saveReconciliationReport(report) {
       db.prepare("INSERT OR REPLACE INTO reconciliation_reports (id, timestamp, status, payload_json) VALUES (?, ?, ?, ?)")
