@@ -18,6 +18,7 @@ import {
 } from "./src/server/tradingSafety";
 import { createProductionStore } from "./src/server/persistence";
 import { createRawSignal } from "./src/server/signalEngine";
+import { applyWhipsawGate, normalizeWhipsawVerdict } from "./src/server/whipsawGate";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
 import { extractEmailScanTarget, EmailScanTarget } from "./src/server/emailIngestion";
 import { assembleScanTargets, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
@@ -1179,7 +1180,8 @@ You must extract the stock ticker symbol mentioned (like PLTR, MARA, TSLA, NVDA)
 Crucially, when the stock goes down for any reason, assess whether it is a support level 'whipsaw' because of the overall market volatility OR a genuine 'trend reversal' before deciding to act. Validate the fundamentals and the core thesis.
 Set a decision: 'BUY' (if sentiment is very bullish & whipsaw check passes), 'SELL' (if trend reversal is verified or target stop loss hit), 'HOLD', or 'NONE' (if no clear ticker discussed).
 
-For "reasoning", write a concise human sentence explaining the fundamental thesis validation. For "whipsawCheck", give a definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal. If no clear ticker is discussed, set "symbol" to "UNKNOWN".`,
+For "reasoning", write a concise human sentence explaining the fundamental thesis validation. For "whipsawCheck", give a definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal.
+For "whipsawVerdict", classify that same judgment into exactly one of three structured values: 'whipsaw' (a temporary shakeout -- the dip is likely to recover), 'reversal' (a verified genuine trend reversal), or 'unclear' (you cannot determine which). This structured value is what the trading system gates SELL decisions and BUY confidence on, so it must reflect your actual judgment, not just be copied from the decision field. If no clear ticker is discussed, set "symbol" to "UNKNOWN".`,
           },
         ],
         output_config: {
@@ -1194,9 +1196,10 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
                 riskProfile: { type: "string", enum: ["Low", "Medium", "High"] },
                 reasoning: { type: "string" },
                 whipsawCheck: { type: "string" },
+                whipsawVerdict: { type: "string", enum: ["whipsaw", "reversal", "unclear"] },
                 decision: { type: "string", enum: ["BUY", "SELL", "HOLD", "NONE"] },
               },
-              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "decision"],
+              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "whipsawVerdict", "decision"],
               additionalProperties: false,
             },
           },
@@ -1207,6 +1210,19 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
       const parsed = JSON.parse(text);
 
       if (parsed.symbol && parsed.symbol !== "UNKNOWN" && parsed.symbol !== "THE_STOCK_TICKER") {
+        // Gate on the whipsaw verdict (docs/GO_LIVE_PLAN.md Phase 1.1): a SELL only
+        // proceeds if the reversal is verified; a BUY's confidence is haircut based
+        // on the verdict. normalizeWhipsawVerdict is defensive parse-site validation
+        // on top of the API-enforced schema -- any value other than the three allowed
+        // strings fails closed to "unclear" before it ever reaches the gate.
+        const whipsawVerdict = normalizeWhipsawVerdict(parsed.whipsawVerdict);
+        const rawAiConfidence = Math.max(0, Math.min(100, Math.round((parsed.growthScore + Math.max(parsed.sentimentScore, 0)) / 2)));
+        const gated = applyWhipsawGate(parsed.decision, whipsawVerdict, rawAiConfidence);
+
+        if (gated.downgraded) {
+          addLog("sentiment", `Whipsaw gate for ${parsed.symbol}: ${gated.note}`);
+        }
+
         const item: StockAnalysis = {
           id: "an-" + Math.random().toString(36).substr(2, 9),
           symbol: parsed.symbol.toUpperCase(),
@@ -1216,9 +1232,12 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
           growthScore: parsed.growthScore,
           sentimentScore: parsed.sentimentScore,
           riskProfile: parsed.riskProfile as any,
-          reasoning: parsed.reasoning,
+          // Honest audit trail: when the gate downgrades a SELL to HOLD, that fact is
+          // recorded directly in the persisted reasoning, not just the sync log.
+          reasoning: gated.downgraded ? `${parsed.reasoning} [Whipsaw gate: ${gated.note}]` : parsed.reasoning,
           whipsawCheck: parsed.whipsawCheck,
-          decision: parsed.decision as any,
+          whipsawVerdict,
+          decision: gated.decision as any,
           // Real source timestamp (Gmail internalDate/Date header for email, or
           // "now" for the just-completed YouTube web search) -- not "now" for
           // every thesis regardless of actual age. This is what lets the signal
@@ -1233,7 +1252,9 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
           symbol: item.symbol,
           thesis: `${item.reasoning} ${item.whipsawCheck}`,
           url: target.source === "youtube" ? "youtube://ziptrader" : "gmail://ziptrader",
-          aiConfidence: Math.max(0, Math.min(100, Math.round((item.growthScore + Math.max(item.sentimentScore, 0)) / 2))),
+          // Confidence already carries the whipsaw haircut (or is unchanged for
+          // whipsaw/HOLD/NONE) -- this is what flows into sizing's confidenceMultiplier.
+          aiConfidence: gated.aiConfidence,
         });
         const reviewedSignal = reviewAndPersistSignal(productionStore, rawSignal);
         if (reviewedSignal.status === "rejected") {
