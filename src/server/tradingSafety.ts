@@ -29,7 +29,12 @@ export type TradeState =
 export type AuditEvent = {
   id: string;
   timestamp: string;
-  type: "trade_state" | "risk" | "broker" | "config" | "telegram" | "breaker";
+  // "sync" (Phase 2 Task 2, docs/GO_LIVE_PLAN.md Phase 2.1): a sync cycle's
+  // trigger-source marker and other scheduler-lifecycle events (auto-pause,
+  // per-cycle BUY cap skips reuse "risk"/"config" like their existing
+  // manual-override analogues -- "sync" is only for events that don't fit
+  // any of the pre-existing categories).
+  type: "trade_state" | "risk" | "broker" | "config" | "telegram" | "breaker" | "sync";
   actor: string;
   entityId?: string;
   fromState?: TradeState;

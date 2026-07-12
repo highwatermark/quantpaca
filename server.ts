@@ -40,6 +40,7 @@ import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marke
 import { RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
 import { EMPTY_SYNC_ALERT_STATE_KEY, shouldSendThrottledAlert } from "./src/server/alertThrottle";
+import { createScheduler, MAX_BUYS_PER_CYCLE, MAX_CONSECUTIVE_FAILURES } from "./src/server/scheduler";
 
 dotenv.config();
 
@@ -229,6 +230,13 @@ async function executeTradeIntent(input: {
   config: AppConfig;
   request: TradeRequest;
   maxNotional?: number;
+  // Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): the order chokepoint for
+  // the market-hours gate. Set true only by a SCHEDULED cycle that found the
+  // clock closed (or unreachable -- fail closed); manual syncs never set
+  // this (human's call). When true, the order is rejected below with an
+  // honest reason before any broker call is made -- same RiskRejected path
+  // every other rejection already uses, so it is audited automatically.
+  marketKnownClosed?: boolean;
 }) {
   const brokerConfig = getBrokerConfig();
   const portfolio = await getAlpacaPortfolio(brokerConfig);
@@ -282,7 +290,9 @@ async function executeTradeIntent(input: {
       cooldownLoadFailed = true;
     }
   }
-  const riskDecision: RiskDecision = cooldownLoadFailed
+  const riskDecision: RiskDecision = input.marketKnownClosed
+    ? { status: "rejected", reason: "Market is closed; order blocked at the per-cycle market-hours chokepoint." }
+    : cooldownLoadFailed
     ? { status: "rejected", reason: "Failed to load symbol cooldown state; failing closed on this buy order." }
     : reviewRisk({
         intent: {
@@ -671,6 +681,41 @@ async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty:
     throw new Error(`Alpaca order rejected: ${errTxt}`);
   }
   return await orderRes.json();
+}
+
+// Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): market-hours gate. Only a
+// SCHEDULED cycle calls this (manual syncs are the human's call and are never
+// gated -- see runSyncCycle below). With no broker configured, there is no
+// real Alpaca clock to ask and the entire order path already dry-runs
+// (placeAlpacaOrder's !brokerConfig.configured branch); treating that as
+// "open" avoids gating local/offline development against a market that, for
+// this deployment, doesn't exist. With a broker configured, a failed or
+// malformed clock fetch fails closed to "closed" -- an unknown market state
+// must never be treated as tradable.
+async function checkMarketOpenForScheduledCycle(brokerConfig: BrokerConfig): Promise<{ isOpen: boolean; log: string }> {
+  if (!brokerConfig.configured) {
+    return { isOpen: true, log: "Market-hours clock check skipped: no broker configured (simulated/dry-run mode); treating the market as open." };
+  }
+  const headers = {
+    "APCA-API-KEY-ID": brokerConfig.apiKey || "",
+    "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
+  };
+  try {
+    const res = await fetch(`${brokerConfig.baseUrl}/clock`, { headers });
+    if (!res.ok) {
+      return { isOpen: false, log: `Market-hours clock check failed (HTTP ${res.status}); failing closed (treating the market as closed).` };
+    }
+    const body = await res.json();
+    if (typeof body?.is_open !== "boolean") {
+      return { isOpen: false, log: "Market-hours clock check returned an unexpected response (missing is_open); failing closed (treating the market as closed)." };
+    }
+    return { isOpen: body.is_open, log: `Market-hours clock check: is_open=${body.is_open}.` };
+  } catch (err: any) {
+    return {
+      isOpen: false,
+      log: `Market-hours clock check threw (${err?.message || String(err)}); failing closed (treating the market as closed).`,
+    };
+  }
 }
 
 // 2. Telegram Notification Helper
@@ -1146,11 +1191,22 @@ app.get("/api/portfolio", async (req, res) => {
 });
 
 // Core Integration execution cycle
-app.post("/api/sync", requireAdminCommand, async (req, res) => {
+// Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): the sync pipeline, callable
+// by both POST /api/sync (trigger "manual") and the scheduler (trigger
+// "scheduled") -- this is the extracted body of what used to be the route
+// handler directly, moved (not rewritten) so both callers share one pipeline.
+// `authHeader` carries the Gmail OAuth bearer token when the caller has one
+// (only ever true for a manual sync driven by a browser session); the
+// scheduler has no user session and always passes null, same as an
+// unauthenticated manual call.
+type SyncCycleResult =
+  | { ok: true; trigger: "manual" | "scheduled"; analyses: StockAnalysis[]; logs: SyncLog[]; failed: boolean }
+  | { ok: false; trigger: "manual" | "scheduled"; error: string };
+
+async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string | null): Promise<SyncCycleResult> {
   const release = await dbMutex.acquire();
   try {
     const db = readDB();
-    const authHeader = req.headers.authorization || null;
 
     const logs: SyncLog[] = [];
     const results: any[] = [];
@@ -1160,7 +1216,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
     // Initialize helper to write log lines
     const addLog = (type: SyncLog["type"], msg: string, details?: string) => {
-      const sl: SyncLog = { id: logId(), timestamp: new Date().toISOString(), type, message: msg, details };
+      const sl: SyncLog = { id: logId(), timestamp: new Date().toISOString(), type, message: msg, details, trigger };
       db.syncLogs.unshift(sl);
       logs.push(sl);
     };
@@ -1168,6 +1224,29 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     const currentConfig: AppConfig = db.config;
 
     addLog("sync", "Starting automation loop & thesis scanner...");
+    appendAuditEvents(db, [{
+      id: `ae-cycle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "sync",
+      actor: trigger === "scheduled" ? "scheduler" : "manual_api",
+      message: `Sync cycle started (trigger: ${trigger}).`,
+      details: { trigger },
+    }]);
+
+    // Phase 2 Task 2: market-hours gate. Only a SCHEDULED cycle consults the
+    // clock and reduces scope -- a manual sync is always full-scope (both
+    // flags stay false when trigger !== "scheduled"), so every gate added
+    // below this point is a structural no-op on the manual path, preserving
+    // its existing behavior byte-for-byte. Clock-fetch failure fails closed
+    // (treated as closed) per the plan's fail-closed rule.
+    let marketKnownClosed = false;
+    let reducedCycle = false;
+    if (trigger === "scheduled") {
+      const clockCheck = await checkMarketOpenForScheduledCycle(getBrokerConfig());
+      addLog("sync", clockCheck.log);
+      marketKnownClosed = !clockCheck.isOpen;
+      reducedCycle = marketKnownClosed;
+    }
 
     // ==========================================================
     // MODULE 1: OUTBOX RESILIENT SYNCHRONIZER QUEUE Retrying Failed Integrations
@@ -1441,6 +1520,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
               side: "sell",
               reasoning: decision.reasoning,
             },
+            marketKnownClosed,
           });
           Object.assign(liquidationTrade, {
             symbol: pos.symbol,
@@ -1484,6 +1564,34 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
       }
     }
 
+    // Phase 2 Task 2: a reduced cycle (scheduled + market closed) skips Gmail/
+    // YouTube ingestion and the whole Claude-driven analysis + order-placement
+    // loop below -- don't burn a Claude API call analyzing a thesis nothing
+    // can execute on. MODULE 2.5 (regime) and MODULE 2 (exit monitoring)
+    // above already ran unconditionally (gated only on autoTrading, unchanged
+    // by this task); this is the only other gate reducedCycle controls. A
+    // manual sync never reaches the `if` branch (reducedCycle is always false
+    // for trigger !== "scheduled"), so this whole wrapper is a no-op for the
+    // manual path -- the `else` block below is the original, unmodified body.
+    // gmailAttempted/youtubeAttempted distinguish "this source was never
+    // tried" (e.g. Gmail with no OAuth token -- always true for a scheduled
+    // cycle, which never carries a browser session's Authorization header)
+    // from "this source was tried and errored". Guardrail 7's "every
+    // ingestion source errored" only makes sense over sources that were
+    // actually attempted -- a scheduled cycle's Gmail is structurally never
+    // attempted, so it must never count against that source-attempted set
+    // (an AND over Gmail+YouTube unconditionally would make a scheduled
+    // cycle's ingestion-failure detection permanently unreachable, since
+    // gmailErrored can never become true when Gmail is never attempted).
+    let gmailAttempted = false;
+    let gmailErrored = false;
+    let youtubeAttempted = false;
+    let youtubeErrored = false;
+    let buyOrdersThisCycle = 0;
+    const parsedAnalyses: StockAnalysis[] = [];
+    if (reducedCycle) {
+      addLog("sync", "Market closed: skipping Gmail ingestion, YouTube sentiment scan, and Claude thesis analysis this cycle (reduced cycle).");
+    } else {
     // Variable to store Gmail messages
     let emailsToScan: EmailScanTarget[] = [];
     // Phase 2 Task 1, Item B (docs/GO_LIVE_PLAN.md "Phase 1 completion report"
@@ -1496,6 +1604,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     let emptyEmailReason = "No Gmail authorization token detected.";
 
   if (authHeader) {
+    gmailAttempted = true;
     addLog("sync", "Attempting to retrieve messages with active Gmail OAuth token...");
     try {
       // Query messages from charlie-from-ziptrader@ghost.io
@@ -1539,10 +1648,12 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         const errTxt = await gmailRes.text();
         addLog("error", "Gmail API failed. No email signals this sync.", errTxt);
         emptyEmailReason = `Gmail API request failed (non-OK response): ${errTxt.substring(0, 200)}`;
+        gmailErrored = true;
       }
     } catch (err: any) {
       addLog("error", "Gmail sync connection error.", err.message);
       emptyEmailReason = `Gmail sync connection error: ${err.message}`;
+      gmailErrored = true;
     }
   } else {
     addLog("sync", "No Gmail authorization token detected. Contributing zero email scan-targets this sync.");
@@ -1603,6 +1714,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
   // 2. Fetch YouTube News & Sentiment using Claude web search
   let youtubeResult: YoutubeSentimentResult;
+  youtubeAttempted = true;
   try {
     addLog("sync", "Querying Claude web search for recent ZipTrader YouTube video sentiment...");
     const anthropic = getClaudeClient();
@@ -1635,6 +1747,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     // an error string into analysis as if it were real sentiment.
     youtubeResult = { ok: false, reason: err.message || "Claude web search failed." };
     addLog("error", "YouTube sentiment scan failed; contributing zero YouTube scan-targets this sync.", err.message);
+    youtubeErrored = true;
   }
 
   // 3. Process each scanned thesis with Claude
@@ -1642,8 +1755,6 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
   // sentiment is the output of a web search that just completed above, not an
   // ingested document with its own real send time to recover.
   const scanTargets = assembleScanTargets(emailsToScan, youtubeResult);
-
-  const parsedAnalyses: StockAnalysis[] = [];
 
   for (const target of scanTargets) {
     try {
@@ -1853,7 +1964,23 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
 
             if (sized.qty < 1) {
               addLog("error", `Order skipped for ${item.symbol}. Sizing produced no executable quantity (${sized.sizingReason}; caps: ${sized.capsApplied.join(", ")}).`);
+            } else if (buyOrdersThisCycle >= MAX_BUYS_PER_CYCLE) {
+              // Guardrail 8 (docs/GO_LIVE_PLAN.md Phase 2.1): per-cycle BUY cap.
+              // This 3rd+ BUY-decision this cycle is skipped BEFORE executeTradeIntent
+              // is ever called -- no broker call, no risk review, just an honest,
+              // audited skip. SELLs/exits are never capped (see the SELL branch below
+              // and MODULE 2's liquidations above -- neither touches this counter).
+              addLog("error", `Order skipped for ${item.symbol}. Per-cycle BUY cap (${MAX_BUYS_PER_CYCLE}) already reached this cycle.`);
+              appendAuditEvents(db, [{
+                id: `ae-buycap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                type: "risk",
+                actor: trigger === "scheduled" ? "scheduler" : "manual_api",
+                message: `BUY order for ${item.symbol} skipped: per-cycle BUY cap (${MAX_BUYS_PER_CYCLE}) reached.`,
+                details: { symbol: item.symbol, cap: MAX_BUYS_PER_CYCLE, trigger },
+              }]);
             } else {
+              buyOrdersThisCycle++;
               const qty = sized.qty;
               addLog("sync", `Submitting buy intent for ${qty} shares of ${item.symbol} at approx $${price} through safety pipeline...`);
               const newTrade = await executeTradeIntent({
@@ -1868,6 +1995,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
                   reasoning: `ZipTrader thesis validated. Whipsaw check: ${item.whipsawCheck}. Fundamentals: ${item.reasoning}`,
                 },
                 maxNotional: maxPositionValue,
+                marketKnownClosed,
               });
 
               // Notify channels
@@ -1927,6 +2055,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
                 side: "sell",
                 reasoning: `Trend reversal warning assessed or stop loss margin hit. Closing positions.`,
               },
+              marketKnownClosed,
             });
 
             const tgMsg = `🚨 <b>ZipTrader Automation: SELL INTENT ${newTrade.status}</b>\n<b>Ticker:</b> ${newTrade.symbol}\n<b>Quantity:</b> ${newTrade.qty}\n<b>Price:</b> $${newTrade.price}\n<b>Reasoning:</b> ${newTrade.reasoning}`;
@@ -1952,15 +2081,43 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
       addLog("error", `Failed checking thesis for target: "${target.title}"`, err.message);
     }
   }
+  }
 
   addLog("sync", "ZipTrader portfolio optimization cycle completed.");
   writeDB(db);
-  res.json({ success: true, analyses: parsedAnalyses, logs });
+  // Guardrail 7 (docs/GO_LIVE_PLAN.md Phase 2.1): a cycle counts as FAILED if
+  // every ATTEMPTED ingestion source errored -- not merely zero emails/no
+  // YouTube content, both of which are expected, non-error outcomes (see
+  // gmailErrored/youtubeErrored above, only ever set true in an actual
+  // fetch-failure/non-OK-response/exception branch), and not a source that
+  // was never attempted at all (e.g. Gmail on a scheduled cycle, which never
+  // carries an OAuth token). Only meaningful when ingestion actually ran
+  // (!reducedCycle) -- a reduced cycle that skipped ingestion entirely never
+  // counts as failed on this basis, only a thrown exception (the outer catch
+  // below) can fail a reduced cycle.
+  const anySourceAttempted = gmailAttempted || youtubeAttempted;
+  const allAttemptedSourcesErrored = (!gmailAttempted || gmailErrored) && (!youtubeAttempted || youtubeErrored);
+  const failed = !reducedCycle && anySourceAttempted && allAttemptedSourcesErrored;
+  return { ok: true, trigger, analyses: parsedAnalyses, logs, failed };
   } catch (err: any) {
     console.error("Critical error in /api/sync:", err);
-    res.status(500).json({ error: "Sync failed", details: err.message });
+    return { ok: false, trigger, error: err.message };
   } finally {
     release();
+  }
+}
+
+app.post("/api/sync", requireAdminCommand, async (req, res) => {
+  const result = await runSyncCycle("manual", req.headers.authorization || null);
+  // Explicit `=== true`/`=== false` (not a truthy `if (result.ok)`): this
+  // tsconfig doesn't enable strictNullChecks, and without it TS's
+  // discriminated-union narrowing only fires on an explicit literal
+  // comparison, not a truthiness check -- same reason numericSafety.ts's
+  // ParsedFiniteNumber callers below use `parsed.ok === false` throughout.
+  if (result.ok === true) {
+    res.json({ success: true, analyses: result.analyses, logs: result.logs });
+  } else {
+    res.status(500).json({ error: "Sync failed", details: result.error });
   }
 });
 
@@ -2210,6 +2367,85 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
 });
 
 
+// Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): the autonomous sync
+// scheduler. Wired here (module scope, not inside run()) so it exists
+// regardless of NODE_ENV -- only `.start()` (called from run() below) is
+// gated off in tests; the instance itself, and the test-visible manual tick
+// trigger exported at the bottom of this file, are always available so
+// integration tests can drive scheduled cycles without waiting on a real
+// setTimeout chain.
+const SCHEDULER_FAILURE_COUNT_STATE_KEY = "scheduler_consecutive_failure_count";
+
+const scheduler = createScheduler({
+  now: () => Date.now(),
+  setTimer: (callback, delayMs) => {
+    const handle = setTimeout(callback, delayMs);
+    handle.unref?.();
+    return handle;
+  },
+  clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+  getIntervalMinutesRaw: () => readDB().config?.system?.runIntervalMins,
+  isAutoTradingOn: () => Boolean(readDB().config?.system?.autoTrading),
+  runScheduledCycle: async () => {
+    const result = await runSyncCycle("scheduled", null);
+    return { failed: result.ok ? result.failed : true };
+  },
+  getConsecutiveFailureCount: () => {
+    try {
+      const raw = productionStore.getAppState(SCHEDULER_FAILURE_COUNT_STATE_KEY);
+      const parsed = raw === undefined ? NaN : Number(raw);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    } catch (err) {
+      console.error("[scheduler] Failed to read the persisted consecutive-failure count; defaulting to 0.", err);
+      return 0;
+    }
+  },
+  setConsecutiveFailureCount: (count) => {
+    try {
+      productionStore.setAppState(SCHEDULER_FAILURE_COUNT_STATE_KEY, String(count));
+    } catch (err) {
+      console.error("[scheduler] Failed to persist the consecutive-failure count.", err);
+    }
+  },
+  onAutoPause: async () => {
+    // Guardrail 7: 3 consecutive failed SCHEDULED sync cycles ->
+    // autoTrading=false (persisted), an audit event, and an UNTHROTTLED
+    // Telegram alert (unlike the empty-sync alert, this fires once per
+    // actual pause -- a state change, not a repeating warning).
+    const release = await dbMutex.acquire();
+    let telegramConfig: AppConfig["telegram"] | undefined;
+    try {
+      const db = readDB();
+      db.config.system.autoTrading = false;
+      telegramConfig = db.config.telegram;
+      appendAuditEvents(db, [{
+        id: `ae-autopause-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        type: "config",
+        actor: "scheduler",
+        message: `Auto-pause: ${MAX_CONSECUTIVE_FAILURES} consecutive scheduled sync cycle failures; autoTrading set to false. Stays paused until a human resumes.`,
+        details: { consecutiveFailures: MAX_CONSECUTIVE_FAILURES },
+      }]);
+      writeDB(db);
+    } finally {
+      release();
+    }
+    await sendTelegramAlert(
+      telegramConfig,
+      `🛑 <b>Auto-trading paused.</b> ${MAX_CONSECUTIVE_FAILURES} consecutive scheduled sync cycles failed. Trading stays paused until a human resumes (POST /api/config or the Telegram /resume command).`,
+    );
+  },
+  log: (message) => console.log(message),
+});
+
+// Test-visible manual trigger (Phase 2 Task 2 testing requirement): runs
+// exactly one scheduled tick's logic directly, without waiting for a real
+// timer. NODE_ENV=test never calls scheduler.start() (see the bottom of this
+// file), so this is the only way a test drives a scheduled cycle.
+async function runScheduledSyncTickForTests(): Promise<void> {
+  await scheduler.runTickNow();
+}
+
 // Dev support or vite mounting
 async function run() {
   const startupIssues = validateStartupEnv(process.env);
@@ -2240,16 +2476,18 @@ async function run() {
   const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server starting on port ${PORT}`);
     startTelegramRuntime();
+    scheduler.start();
   });
 
   installProcessGuards({
     log: (message, error) => (error === undefined ? console.error(message) : console.error(message, error)),
     exit: (code) => process.exit(code),
     closeServer: (onClosed) => httpServer.close(onClosed),
+    stopScheduler: () => scheduler.stop(),
   });
 }
 
-export { app, dbMutex, handleTelegramCommand, readDB };
+export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests };
 
 if (process.env.NODE_ENV !== "test") {
   run();

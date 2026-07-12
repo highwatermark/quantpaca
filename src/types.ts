@@ -76,6 +76,11 @@ export interface SyncLog {
   type: 'sync' | 'trade' | 'error' | 'override' | 'sentiment';
   message: string;
   details?: string;
+  // Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): which caller ran this
+  // cycle -- a human-initiated POST /api/sync, or the autonomous scheduler.
+  // Optional: log rows persisted before this field existed (or written by
+  // any other code path) simply won't have it.
+  trigger?: 'manual' | 'scheduled';
 }
 
 export interface AlpacaPosition {
