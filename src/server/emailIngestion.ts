@@ -22,6 +22,7 @@ export type GmailMessagePart = {
 };
 
 export type GmailMessage = {
+  id?: string;
   internalDate?: string;
   snippet?: string;
   payload?: GmailMessagePart & { headers?: GmailHeader[] };
@@ -32,6 +33,13 @@ export type EmailScanTarget = {
   title: string;
   content: string;
   sourceTimestamp: string;
+  // Gmail's message id, when the caller supplied one on the input resource --
+  // stable across re-syncs of the exact same email, unlike `title` (two distinct
+  // emails can share an identical subject line). Used downstream to build a
+  // deterministic dedup sourceId (Finding I1) instead of discarding it. Optional
+  // because it's only ever present for Gmail-sourced messages, and defensively in
+  // case a caller ever constructs a target without one.
+  messageId?: string;
 };
 
 export type EmailExtractionResult =
@@ -75,6 +83,7 @@ export function extractEmailScanTarget(message: GmailMessage): EmailExtractionRe
       title,
       content: cappedBody,
       sourceTimestamp,
+      messageId: message.id,
     },
   };
 }

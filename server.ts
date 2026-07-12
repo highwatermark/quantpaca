@@ -127,6 +127,20 @@ const BROKER_REACHED_TRADE_STATUSES = new Set([
   "UnknownBrokerState",
 ]);
 
+// Trade states that mean the order was actually SUCCESSFULLY placed with the broker --
+// the strict subset of BROKER_REACHED_TRADE_STATUSES above that excludes broker-side
+// failures/rejections. submitTradeThroughPipeline attaches an exitPlan to the trade on
+// every return path -- including RiskRejected and BrokerFailed, which never produced a
+// live position -- so exit-plan persistence must be gated on this set, not merely on
+// "trade.exitPlan is present". Otherwise a rejected retry/duplicate signal's freshly
+// built (and never-executed) plan can overwrite latestBuySideExitPlanForSymbol's answer
+// for a real, still-open position, silently changing its stop-loss/take-profit/HWM.
+const BROKER_SUCCESS_TRADE_STATUSES = new Set([
+  "Accepted",
+  "PartiallyFilled",
+  "Filled",
+]);
+
 const getBrokerConfig = () => buildBrokerConfigFromEnv(process.env);
 
 function appendAuditEvents(db: any, events: AuditEvent[]) {
@@ -344,7 +358,14 @@ async function executeTradeIntent(input: {
   appendAuditEvents(input.db, result.auditEvents);
   productionStore.saveTradeIntent(result.trade);
   if (result.trade.riskDecision) productionStore.saveRiskDecision(result.trade.id, result.trade.riskDecision);
-  if (result.trade.exitPlan) productionStore.saveExitPlan(result.trade.id, result.trade.exitPlan);
+  // Only persist the exit plan when the order actually reached the broker
+  // successfully (see BROKER_SUCCESS_TRADE_STATUSES above) -- a RiskRejected or
+  // BrokerFailed trade's exitPlan describes an order that was never placed and
+  // must never become the plan latestBuySideExitPlanForSymbol hands back for a
+  // real open position (Finding C1).
+  if (result.trade.exitPlan && BROKER_SUCCESS_TRADE_STATUSES.has(result.trade.status)) {
+    productionStore.saveExitPlan(result.trade.id, result.trade.exitPlan);
+  }
   // Cooldown is recorded once the order reaches the broker in any capacity — a clean
   // accept/fill, or a broker-side rejection/failure — but NOT for a RiskRejected trade
   // that never left this process (e.g. insufficient buying power, an already-active
@@ -1620,10 +1641,28 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
 
         const rawSignal = createRawSignal({
           source: target.source === "youtube" ? "youtube" : "email",
-          sourceId: `${target.source}:${target.title}`,
+          // Finding I1: identify an email by Gmail's message id, not its subject
+          // line -- two distinct emails (e.g. a recurring weekly newsletter) can
+          // share an identical title, which would otherwise collapse them into one
+          // dedup identity. Falls back to the title-based id defensively if a
+          // message id was never captured. YouTube has no per-message resource
+          // (it's a fresh web-search summary each run) so it keeps the title-based
+          // sourceId, unchanged.
+          sourceId: target.source === "email" && target.messageId
+            ? `email:${target.messageId}`
+            : `${target.source}:${target.title}`,
           sourceTimestamp: item.timestamp,
           symbol: item.symbol,
           thesis: `${item.reasoning} ${item.whipsawCheck}`,
+          // Finding I1: hash the raw ingested email body for dedup instead of
+          // `thesis` above. `thesis` is Claude's free-text re-analysis of that
+          // body, and its wording drifts between separate analyses of the exact
+          // same email -- hashing it made the dedup key non-deterministic in
+          // production (masked in testing only by the 24h symbol cooldown).
+          // `target.content` is stable across re-syncs of the same message.
+          // YouTube has no such stable content handle (the "content" IS a fresh
+          // search summary each run) so it keeps hashing `thesis`, unchanged.
+          dedupContent: target.source === "email" ? target.content : undefined,
           url: target.source === "youtube" ? "youtube://ziptrader" : "gmail://ziptrader",
           // Confidence already carries the whipsaw haircut (or is unchanged for
           // whipsaw/HOLD/NONE) -- this is what flows into sizing's confidenceMultiplier.

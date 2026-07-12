@@ -312,6 +312,52 @@ test("per-position fail-closed: a corrupt plan is skipped and covered by the leg
   );
 });
 
+test("C1: a rejected trade's exit plan must not replace the live position's persisted plan", async (t) => {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  await setAutoTrading(port, true);
+
+  // First BUY reaches the broker (Accepted) and gets its own exit plan persisted
+  // by executeTradeIntent -- entryPrice 100, so stop 95 / take-profit 115 (5%/15%
+  // config set by setAutoTrading above).
+  const buy1 = await placeOrder(port, { symbol: "GUARDX", qty: 1, side: "buy", price: 100 });
+  assert.equal(buy1.body.trade.status, "Accepted");
+
+  const storeAfterBuy1 = createProductionStore(sqlitePath);
+  const planAfterBuy1 = storeAfterBuy1.latestBuySideExitPlanForSymbol("GUARDX");
+  storeAfterBuy1.close();
+  assert.equal(planAfterBuy1?.exitPlan.entryPrice, 100, "sanity: first plan was seeded from the first buy's price");
+  assert.equal(planAfterBuy1?.exitPlan.takeProfitPrice, 115);
+
+  // Second BUY for the same symbol is blocked by the (default 24h) per-symbol
+  // cooldown -- RiskRejected, never reaches the broker. submitTradeThroughPipeline
+  // still attaches a freshly-built exit plan to this rejected trade (entryPrice
+  // 200 -- stop 190 / take-profit 230) even though the order was never placed.
+  const buy2 = await placeOrder(port, { symbol: "GUARDX", qty: 1, side: "buy", price: 200 });
+  assert.equal(buy2.body.trade.status, "RiskRejected");
+  assert.match(buy2.body.trade.riskDecision.reason, /cooldown/i);
+
+  // The persisted plan for GUARDX must still be the ORIGINAL (entryPrice 100)
+  // plan -- the rejected trade's bogus plan must never have been saved.
+  const storeAfterBuy2 = createProductionStore(sqlitePath);
+  const planAfterBuy2 = storeAfterBuy2.latestBuySideExitPlanForSymbol("GUARDX");
+  storeAfterBuy2.close();
+  assert.equal(planAfterBuy2?.exitPlan.entryPrice, 100, "the rejected trade's plan must not overwrite the live position's plan");
+  assert.equal(planAfterBuy2?.exitPlan.takeProfitPrice, 115);
+
+  // Behavioral confirmation: a price of 116 is above the ORIGINAL plan's
+  // take-profit (115) but below the bogus rejected-trade plan's take-profit
+  // (230). If the bogus plan had leaked in, no exit would fire here.
+  setSimulatedMarketState("GUARDX", 116, 16);
+  const sync = await runSync(port);
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const exitTrade = trades.find((tr) => tr.symbol === "GUARDX" && tr.side === "sell");
+  assert.ok(exitTrade, `expected the ORIGINAL plan's take-profit to fire at 116, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
+  assert.match(exitTrade.reasoning, /take_profit/);
+});
+
 test("trailing stop: price rises then retraces across two sync cycles -- the HWM persists between cycles and the second cycle's sell carries trailing reasoning", async (t) => {
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;
