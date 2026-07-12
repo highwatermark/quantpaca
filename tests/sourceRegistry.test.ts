@@ -45,7 +45,7 @@ test("first boot: an absent registry file is created with the default ZipTrader 
   // in-memory, so the next process boot / cycle reads the same config back.
   assert.equal(fs.existsSync(filePath), true);
   const onDisk = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-  assert.equal(onDisk.length, 2);
+  assert.equal(onDisk.length, 3);
   assert.equal(onDisk[0].id, "ziptrader");
   const foolOnDisk = onDisk.find((s: any) => s.id === "motley-fool");
   assert.ok(foolOnDisk, "expected the default file to ship a motley-fool entry");
@@ -57,6 +57,20 @@ test("first boot: an absent registry file is created with the default ZipTrader 
   assert.equal(typeof foolOnDisk.promptHint, "string");
   assert.match(foolOnDisk.promptHint, /Hidden Gems/);
   assert.match(foolOnDisk.promptHint, /PRIMARY recommendation/);
+
+  // Phase 2 Task 10 (Priority 2 -- Michael Burry Substack): shipped disabled,
+  // same review-before-enable pattern as motley-fool.
+  const burryOnDisk = onDisk.find((s: any) => s.id === "michael-burry");
+  assert.ok(burryOnDisk, "expected the default file to ship a michael-burry entry");
+  assert.equal(burryOnDisk.enabled, false, "michael-burry ships disabled by default");
+  assert.equal(burryOnDisk.gmailQuery, "from:michaeljburry@substack.com");
+  assert.deepEqual(burryOnDisk.senderAllowlist, ["michaeljburry@substack.com"]);
+  assert.equal(burryOnDisk.trustTier, "medium");
+  assert.equal(burryOnDisk.maxAgeHours, 96);
+  assert.equal(typeof burryOnDisk.promptHint, "string");
+  assert.match(burryOnDisk.promptHint, /Trading Post/);
+  assert.match(burryOnDisk.promptHint, /Short Thoughts/);
+  assert.match(burryOnDisk.promptHint, /never opens shorts/);
 });
 
 test("a second load against an already-created default file does not recreate it or report createdDefaultFile", () => {
@@ -272,16 +286,19 @@ test("registry migration: an existing file without motley-fool gets it appended,
 
   const result = loadSourceRegistry(filePath);
 
-  assert.deepEqual(result.migratedIds, ["motley-fool"]);
-  assert.equal(result.sources.length, 1, "the migrated entry is appended DISABLED, so it does not join this cycle's sources");
+  assert.deepEqual(result.migratedIds, ["motley-fool", "michael-burry"]);
+  assert.equal(result.sources.length, 1, "both migrated entries are appended DISABLED, so neither joins this cycle's sources");
   assert.equal(result.sources[0].id, "ziptrader");
   assert.equal(result.issues.length, 0, "a migration is not a malformed-config issue");
 
   const onDisk = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-  assert.equal(onDisk.length, 2);
+  assert.equal(onDisk.length, 3);
   const foolOnDisk = onDisk.find((s: any) => s.id === "motley-fool");
   assert.ok(foolOnDisk, "expected motley-fool to have been appended to the file on disk");
   assert.equal(foolOnDisk.enabled, false);
+  const burryOnDisk = onDisk.find((s: any) => s.id === "michael-burry");
+  assert.ok(burryOnDisk, "expected michael-burry to have been appended to the file on disk");
+  assert.equal(burryOnDisk.enabled, false);
 });
 
 test("registry migration: a second load after the migration writes the file does not re-migrate or rewrite it", () => {
@@ -294,7 +311,7 @@ test("registry migration: a second load after the migration writes the file does
     ]),
   );
   const first = loadSourceRegistry(filePath);
-  assert.deepEqual(first.migratedIds, ["motley-fool"]);
+  assert.deepEqual(first.migratedIds, ["motley-fool", "michael-burry"]);
   const mtimeAfterMigration = fs.statSync(filePath).mtimeMs;
 
   const second = loadSourceRegistry(filePath);
@@ -303,12 +320,32 @@ test("registry migration: a second load after the migration writes the file does
   assert.equal(fs.statSync(filePath).mtimeMs, mtimeAfterMigration);
 });
 
-test("registry migration: an existing file that already has a user-modified motley-fool entry is left completely untouched", () => {
+test("registry migration: an existing file that already has a user-modified motley-fool entry is left completely untouched (michael-burry still migrates in, disabled)", () => {
   const filePath = tmpRegistryPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const customEntries = [
     { id: "ziptrader", gmailQuery: "from:charlie-from-ziptrader@ghost.io", senderAllowlist: ["charlie-from-ziptrader@ghost.io"], trustTier: "high", maxAgeHours: 72, enabled: true },
     { id: "motley-fool", gmailQuery: "from:fool@motley.fool.com", senderAllowlist: ["fool@motley.fool.com"], trustTier: "high", maxAgeHours: 48, enabled: true },
+  ];
+  fs.writeFileSync(filePath, JSON.stringify(customEntries));
+
+  const result = loadSourceRegistry(filePath);
+
+  assert.deepEqual(result.migratedIds, ["michael-burry"], "michael-burry is still missing from this file and gets migrated in");
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf-8")).slice(0, 2), customEntries, "the user's own pre-existing entries must be left byte-for-byte untouched");
+  assert.equal(result.sources.length, 2, "michael-burry migrates in disabled, so it does not join this cycle's sources");
+  const fool = result.sources.find((s) => s.id === "motley-fool");
+  assert.ok(fool);
+  assert.equal(fool!.maxAgeHours, 48, "the user's own override must be preserved, not overwritten by the shipped default (96)");
+});
+
+test("registry migration: a file that already has ALL known defaults (ziptrader, motley-fool, michael-burry) is left completely untouched", () => {
+  const filePath = tmpRegistryPath();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const customEntries = [
+    { id: "ziptrader", gmailQuery: "from:charlie-from-ziptrader@ghost.io", senderAllowlist: ["charlie-from-ziptrader@ghost.io"], trustTier: "high", maxAgeHours: 72, enabled: true },
+    { id: "motley-fool", gmailQuery: "from:fool@motley.fool.com", senderAllowlist: ["fool@motley.fool.com"], trustTier: "high", maxAgeHours: 48, enabled: true },
+    { id: "michael-burry", gmailQuery: "from:michaeljburry@substack.com", senderAllowlist: ["michaeljburry@substack.com"], trustTier: "medium", maxAgeHours: 96, enabled: true },
   ];
   fs.writeFileSync(filePath, JSON.stringify(customEntries));
   const mtimeBefore = fs.statSync(filePath).mtimeMs;
@@ -318,10 +355,7 @@ test("registry migration: an existing file that already has a user-modified motl
   assert.deepEqual(result.migratedIds, []);
   assert.equal(fs.statSync(filePath).mtimeMs, mtimeBefore, "an already-present id must never trigger a rewrite");
   assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf-8")), customEntries);
-  assert.equal(result.sources.length, 2);
-  const fool = result.sources.find((s) => s.id === "motley-fool");
-  assert.ok(fool);
-  assert.equal(fool!.maxAgeHours, 48, "the user's own override must be preserved, not overwritten by the shipped default (96)");
+  assert.equal(result.sources.length, 3);
 });
 
 test("registry migration: a malformed file never triggers migration -- it stays a file-level failure", () => {

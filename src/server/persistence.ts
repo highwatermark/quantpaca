@@ -99,6 +99,24 @@ export type ProductionStore = {
   latestBreakerState<T = unknown>(): T | undefined;
   saveCooldown(entry: { symbol: string; expiresAt: string; reason: string }): void;
   listActiveCooldownSymbols(nowIso: string): string[];
+  // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 -- Michael
+  // Burry Substack, long-only bearish mapping): a bearish/short thesis on a
+  // HELD symbol marks that symbol's thesis invalidated -- this is what feeds
+  // exitMonitor.ts's `thesisInvalidatedSymbols` input (evaluateOpenPositionExits),
+  // which in turn feeds evaluateExitPlan's `thesisInvalidated` dimension
+  // (exitEngine.ts), live for the first time since it was introduced in
+  // Phase 1. Same single-row-per-symbol, filter-on-read + delete-expired-on-
+  // write pattern as saveCooldown/listActiveCooldownSymbols above.
+  saveThesisInvalidation(entry: { symbol: string; sourceId: string; reason: string; expiresAt: string }): void;
+  listActiveThesisInvalidatedSymbols(nowIso: string): string[];
+  // A bearish/short thesis on an UNHELD symbol adds it to this do-not-buy
+  // list instead (no trade intent created) -- enforced in the BUY decision
+  // path (server.ts, before sizing). Unlike the cooldown/thesis-invalidation
+  // lists above, callers need the full record (not just the symbol) to
+  // produce an audited rejection reason naming the source and expiry, and to
+  // power the admin-visibility read endpoint (GET /api/do-not-buy).
+  saveDoNotBuy(entry: { symbol: string; sourceId: string; reason: string; expiresAt: string }): void;
+  listActiveDoNotBuy(nowIso: string): Array<{ symbol: string; sourceId: string; reason: string; expiresAt: string }>;
   // Tiny generic key-value store (Phase 2 Task 1, Item B: docs/GO_LIVE_PLAN.md
   // "Phase 1 completion report" -> "Deferred to Phase 2") for small pieces of
   // cross-restart state that don't warrant a dedicated table -- e.g. the
@@ -180,6 +198,20 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     CREATE TABLE IF NOT EXISTS app_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS thesis_invalidations (
+      symbol TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS do_not_buy (
+      symbol TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
   `);
@@ -377,6 +409,33 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     listActiveCooldownSymbols(nowIso) {
       const rows = db.prepare("SELECT symbol FROM symbol_cooldowns WHERE expires_at > ?").all(nowIso);
       return rows.map((row) => String(row.symbol));
+    },
+    saveThesisInvalidation(entry) {
+      const now = new Date().toISOString();
+      // Opportunistic cleanup, same pattern as saveCooldown above.
+      db.prepare("DELETE FROM thesis_invalidations WHERE expires_at <= ?").run(now);
+      db.prepare("INSERT OR REPLACE INTO thesis_invalidations (symbol, source_id, reason, expires_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        .run(entry.symbol, entry.sourceId, entry.reason, entry.expiresAt, now);
+    },
+    listActiveThesisInvalidatedSymbols(nowIso) {
+      const rows = db.prepare("SELECT symbol FROM thesis_invalidations WHERE expires_at > ?").all(nowIso);
+      return rows.map((row) => String(row.symbol));
+    },
+    saveDoNotBuy(entry) {
+      const now = new Date().toISOString();
+      // Opportunistic cleanup, same pattern as saveCooldown above.
+      db.prepare("DELETE FROM do_not_buy WHERE expires_at <= ?").run(now);
+      db.prepare("INSERT OR REPLACE INTO do_not_buy (symbol, source_id, reason, expires_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        .run(entry.symbol, entry.sourceId, entry.reason, entry.expiresAt, now);
+    },
+    listActiveDoNotBuy(nowIso) {
+      const rows = db.prepare("SELECT symbol, source_id, reason, expires_at FROM do_not_buy WHERE expires_at > ?").all(nowIso);
+      return rows.map((row) => ({
+        symbol: String(row.symbol),
+        sourceId: String(row.source_id),
+        reason: String(row.reason),
+        expiresAt: String(row.expires_at),
+      }));
     },
     getAppState(key) {
       const row = db.prepare("SELECT value FROM app_state WHERE key = ?").get(key);

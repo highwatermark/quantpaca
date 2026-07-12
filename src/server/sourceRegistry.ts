@@ -56,6 +56,12 @@ export const MAX_ENABLED_SOURCES_PER_CYCLE = 8;
 export const MOTLEY_FOOL_PROMPT_HINT =
   "This is a Motley Fool premium recommendation newsletter. Extract the PRIMARY recommendation: the specific ticker being recommended as a new BUY, or an explicit SELL instruction. Service names (Epic Portfolio, Hidden Gems, Rule Breakers) indicate recommendation letters; ignore performance recaps and marketing copy. Multiple tickers: choose the headline recommendation only.";
 
+// Phase 2 Task 10's Michael Burry prompt hint, verbatim from the go-live
+// plan's task brief. Exported so callers/tests can reference the exact text
+// instead of duplicating it.
+export const MICHAEL_BURRY_PROMPT_HINT =
+  "This is Michael Burry's investment newsletter. Trading Post issues contain explicit position buys/adds; Short Thoughts issues contain bearish/short theses. Extract the primary ticker and stance. A bearish or short thesis is decision SELL with direction 'bearish' — this system never opens shorts; bearish means exit or avoid. A buy/add is decision BUY.";
+
 // The default registry, shipped so a fresh deploy (or an upgrade from the
 // pre-Task-8 hardcoded single source) keeps working with zero operator
 // action. `_comment` is not part of SourceConfig -- it's tolerated by
@@ -87,6 +93,26 @@ const DEFAULT_SOURCES: (SourceConfig & { _comment?: string })[] = [
     promptHint: MOTLEY_FOOL_PROMPT_HINT,
     _comment:
       "Disabled by default. Motley Fool is a paid membership -- review a few recommendation emails against promptHint, then set \"enabled\": true to activate. No code change needed. See docs/GO_LIVE_PLAN.md Phase 2.4.",
+  },
+  {
+    // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 -- Michael
+    // Burry Substack): shipped DISABLED, same review-before-enable pattern as
+    // motley-fool above. This source's bearish/short theses map to the
+    // long-only bearish-mapping layer (src/server/bearishMapping.ts) via the
+    // analysis schema's `stance` field -- a bearish stance on a held symbol
+    // marks the thesis invalidated (forces an exit); on an unheld symbol it
+    // adds the symbol to the do-not-buy list. This system never opens shorts.
+    id: "michael-burry",
+    gmailQuery: "from:michaeljburry@substack.com",
+    senderAllowlist: ["michaeljburry@substack.com"],
+    trustTier: "medium",
+    // Substack issues are irregular-cadence; 96h matches motley-fool's
+    // weekend-gap allowance.
+    maxAgeHours: 96,
+    enabled: false,
+    promptHint: MICHAEL_BURRY_PROMPT_HINT,
+    _comment:
+      "Disabled by default. Review a few Trading Post / Short Thoughts emails against promptHint, then set \"enabled\": true to activate. No code change needed. See docs/GO_LIVE_PLAN.md Phase 2.4.",
   },
 ];
 

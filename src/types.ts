@@ -52,6 +52,14 @@ export interface StockAnalysis {
   // existed won't have it -- any code reading it back must treat a missing value as
   // "unclear" (the same fail-closed default normalizeWhipsawVerdict applies).
   whipsawVerdict?: 'whipsaw' | 'reversal' | 'unclear';
+  // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 -- Michael
+  // Burry Substack): the source's directional call, generalized across every
+  // source (not Burry-specific) -- see src/server/bearishMapping.ts, which
+  // gates thesis-invalidation and do-not-buy purely on this field plus
+  // decision/held-state. Optional: rows persisted before this field existed
+  // won't have it -- any code reading it back must treat a missing value as
+  // "neutral" (see normalizeStance's fail-closed default).
+  stance?: 'bullish' | 'bearish' | 'neutral';
   decision: 'BUY' | 'SELL' | 'HOLD' | 'NONE';
   timestamp: string;
 }

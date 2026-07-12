@@ -29,6 +29,7 @@ import { createProductionStore } from "./src/server/persistence";
 import { buildBracketLegs, BRACKET_TIME_IN_FORCE, PLAIN_TIME_IN_FORCE } from "./src/server/bracketOrders";
 import { createRawSignal } from "./src/server/signalEngine";
 import { applyWhipsawGate, normalizeWhipsawVerdict } from "./src/server/whipsawGate";
+import { BearishMappingResult, evaluateBearishMapping, normalizeStance } from "./src/server/bearishMapping";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
 import { extractEmailScanTarget, extractFromHeader } from "./src/server/emailIngestion";
 import { assembleScanTargets, EmailScanTarget, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
@@ -1658,6 +1659,22 @@ app.get("/api/exit-plans", (req, res) => {
   })));
 });
 
+// Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 -- Michael
+// Burry Substack): admin visibility into the do-not-buy list (item 4 of the
+// task brief). Unauthenticated read, same pattern as the other GET list
+// endpoints above (/api/exit-plans, /api/risk-decisions, /api/audit) -- a
+// read-only view of internal risk state, no admin token required. Expired
+// entries are already filtered by the store's listActiveDoNotBuy (fail-
+// closed to an empty list on a store read error, matching every other
+// fallible store read in this file).
+app.get("/api/do-not-buy", (req, res) => {
+  try {
+    res.json(productionStore.listActiveDoNotBuy(new Date().toISOString()));
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to read the do-not-buy list", details: err?.message || String(err) });
+  }
+});
+
 app.get("/api/reconciliation/latest", (req, res) => {
   const latest = productionStore.latestReconciliationReport();
   if (latest) {
@@ -2276,6 +2293,24 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
         const positions = portfolio.positions || [];
         const positionBySymbol = new Map(positions.map((pos: any) => [pos.symbol, pos]));
 
+        // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 --
+        // Michael Burry Substack): symbols with an active, persisted
+        // thesis_invalidations record -- this is what makes evaluateExitPlan's
+        // thesisInvalidated dimension (exitEngine.ts) live for the first time
+        // since Phase 1. A store read failure fails closed to an empty set
+        // (never force-close a position on unknown/corrupt data), same
+        // asymmetry as the regime-assessment read failure above.
+        let thesisInvalidatedSymbols = new Set<string>();
+        try {
+          thesisInvalidatedSymbols = new Set(productionStore.listActiveThesisInvalidatedSymbols(new Date().toISOString()));
+        } catch (thesisStoreErr: any) {
+          addLog(
+            "error",
+            "Thesis invalidation store read failed; degrading to no invalidations this cycle (fail closed toward NOT force-closing positions).",
+            thesisStoreErr?.message || String(thesisStoreErr),
+          );
+        }
+
         const exitEvaluation = evaluateOpenPositionExits({
           positions: positions.map((pos: any) => ({
             symbol: pos.symbol,
@@ -2292,6 +2327,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           // allow/block_new_buys all fail closed here.
           regimePermission: regimeAssessment.tradePermission,
           regimeMode: regimeAssessment.marketMode,
+          thesisInvalidatedSymbols,
           lookupPlan: (symbol) => productionStore.latestBuySideExitPlanForSymbol(symbol),
           onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => {
             try {
@@ -2722,7 +2758,8 @@ Crucially, when the stock goes down for any reason, assess whether it is a suppo
 Set a decision: 'BUY' (if sentiment is very bullish & whipsaw check passes), 'SELL' (if trend reversal is verified or target stop loss hit), 'HOLD', or 'NONE' (if no clear ticker discussed).
 
 For "reasoning", write a concise human sentence explaining the fundamental thesis validation. For "whipsawCheck", give a definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal.
-For "whipsawVerdict", classify that same judgment into exactly one of three structured values: 'whipsaw' (a temporary shakeout -- the dip is likely to recover), 'reversal' (a verified genuine trend reversal), or 'unclear' (you cannot determine which). This structured value is what the trading system gates SELL decisions and BUY confidence on, so it must reflect your actual judgment, not just be copied from the decision field. If no clear ticker is discussed, set "symbol" to "UNKNOWN".`,
+For "whipsawVerdict", classify that same judgment into exactly one of three structured values: 'whipsaw' (a temporary shakeout -- the dip is likely to recover), 'reversal' (a verified genuine trend reversal), or 'unclear' (you cannot determine which). This structured value is what the trading system gates SELL decisions and BUY confidence on, so it must reflect your actual judgment, not just be copied from the decision field. If no clear ticker is discussed, set "symbol" to "UNKNOWN".
+For "stance", classify the source's own directional call on the ticker into exactly one of three structured values: 'bullish' (a buy/add/positive recommendation), 'bearish' (an explicit sell instruction, a short thesis, or another clearly bearish call -- this trading system is long-only and never opens shorts, so a bearish stance means exit an existing position or avoid a new one, never short), or 'neutral' (a hold, a mixed/unclear call, or insufficient information to judge direction). This must reflect the source's actual directional judgment, not be mechanically copied from "decision".`,
           },
         ],
         output_config: {
@@ -2738,9 +2775,10 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
                 reasoning: { type: "string" },
                 whipsawCheck: { type: "string" },
                 whipsawVerdict: { type: "string", enum: ["whipsaw", "reversal", "unclear"] },
+                stance: { type: "string", enum: ["bullish", "bearish", "neutral"] },
                 decision: { type: "string", enum: ["BUY", "SELL", "HOLD", "NONE"] },
               },
-              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "whipsawVerdict", "decision"],
+              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "whipsawVerdict", "stance", "decision"],
               additionalProperties: false,
             },
           },
@@ -2764,6 +2802,28 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
           addLog("sentiment", `Whipsaw gate for ${parsed.symbol}: ${gated.note}`);
         }
 
+        // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 --
+        // Michael Burry Substack, long-only bearish mapping). normalizeStance
+        // is the same defensive parse-site validation whipsawVerdict already
+        // gets: any value other than the three allowed strings fails closed
+        // to "neutral" -- neutral never trades and never invalidates a thesis
+        // (src/server/bearishMapping.ts).
+        const stance = normalizeStance(parsed.stance);
+        // decision BUY + stance bearish is a contradiction the schema
+        // shouldn't produce (this system never opens shorts, so a bearish
+        // call can never be a BUY) -- defensive, logged loudly, forced to
+        // NONE. Computed from `parsed.decision` (pre-whipsaw-gate) since the
+        // gate has no awareness of stance and would otherwise let a
+        // confidence-haircut BUY straight through.
+        const bearishBuyContradiction = parsed.decision === "BUY" && stance === "bearish";
+        if (bearishBuyContradiction) {
+          addLog(
+            "error",
+            `Contradiction: ${parsed.symbol} was analyzed with decision "BUY" but stance "bearish" -- this system is long-only and never opens shorts, so a bearish stance can never be a BUY. Forcing decision to NONE.`,
+          );
+        }
+        const effectiveDecision = bearishBuyContradiction ? "NONE" : gated.decision;
+
         const item: StockAnalysis = {
           id: "an-" + Math.random().toString(36).substr(2, 9),
           symbol: parsed.symbol.toUpperCase(),
@@ -2780,12 +2840,19 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
           growthScore: parsed.growthScore,
           sentimentScore: parsed.sentimentScore,
           riskProfile: parsed.riskProfile as any,
-          // Honest audit trail: when the gate downgrades a SELL to HOLD, that fact is
-          // recorded directly in the persisted reasoning, not just the sync log.
-          reasoning: gated.downgraded ? `${parsed.reasoning} [Whipsaw gate: ${gated.note}]` : parsed.reasoning,
+          // Honest audit trail: when the gate downgrades a SELL to HOLD, or a
+          // bearish/BUY contradiction is forced to NONE, that fact is
+          // recorded directly in the persisted reasoning, not just the sync
+          // log.
+          reasoning: bearishBuyContradiction
+            ? `${parsed.reasoning} [Bearish/BUY contradiction: source flagged stance "bearish" with decision "BUY"; forced to NONE -- this system never opens shorts.]`
+            : gated.downgraded
+            ? `${parsed.reasoning} [Whipsaw gate: ${gated.note}]`
+            : parsed.reasoning,
           whipsawCheck: parsed.whipsawCheck,
           whipsawVerdict,
-          decision: gated.decision as any,
+          stance,
+          decision: effectiveDecision as any,
           // Real source timestamp (Gmail internalDate/Date header for email, or
           // "now" for the just-completed YouTube web search) -- not "now" for
           // every thesis regardless of actual age. This is what lets the signal
@@ -2847,13 +2914,98 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
 
         addLog("sentiment", `Analyzed ${item.symbol}: Growth ${item.growthScore}, Sentiment ${item.sentimentScore}%. Decision: ${item.decision}`);
 
+        // Phase 2 Task 10: a bearish SELL signal must be evaluated for its
+        // do-not-buy consequence even when the whipsaw gate downgraded it to
+        // HOLD (see bearishMapping.ts's precedence doc comment) -- so the
+        // portfolio fetch below is also entered on that case, not just an
+        // undowngraded BUY/SELL.
+        const bearishSellCandidate = stance === "bearish" && parsed.decision === "SELL";
+
         // 4. Automated orders placing based on Decision and Risk checks
-        if (currentConfig.system.autoTrading && (item.decision === "BUY" || item.decision === "SELL")) {
-          addLog("sync", `Risk Engine Evaluation for ticker ${item.symbol}...`);
-          
+        if (currentConfig.system.autoTrading && (item.decision === "BUY" || item.decision === "SELL" || bearishSellCandidate)) {
           // Verify current position size limit
           const portfolio = await getAlpacaPortfolio();
           const currentShares = portfolio.positions.find((p: any) => p.symbol === item.symbol);
+
+          // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 --
+          // Michael Burry Substack): the long-only bearish-mapping layer.
+          // Evaluated here (before any `continue` below might skip the rest
+          // of this iteration) so a do-not-buy/thesis-invalidation write is
+          // never silently dropped by a later portfolio-value or price-lookup
+          // failure. `parsed.decision` (pre-whipsaw-gate) is deliberately
+          // used as `originalDecision` -- see evaluateBearishMapping's doc
+          // comment for why a downgraded SELL must still be evaluated here.
+          let bearishMappingResult: BearishMappingResult | undefined;
+          if (bearishSellCandidate) {
+            const symbolHeld = !!currentShares && parseInt(currentShares.qty) > 0;
+            bearishMappingResult = evaluateBearishMapping({
+              symbol: item.symbol,
+              sourceId: target.source,
+              originalDecision: parsed.decision,
+              stance: parsed.stance,
+              symbolHeld,
+              whipsawDowngraded: gated.downgraded,
+            });
+
+            if (bearishMappingResult.kind === "thesis_invalidation") {
+              try {
+                productionStore.saveThesisInvalidation({
+                  symbol: bearishMappingResult.symbol,
+                  sourceId: bearishMappingResult.sourceId,
+                  reason: bearishMappingResult.reason,
+                  expiresAt: bearishMappingResult.expiresAt,
+                });
+                addLog(
+                  "trade",
+                  `Thesis invalidated for ${item.symbol} by source "${bearishMappingResult.sourceId}" (bearish stance, whipsaw-verified reversal). The exit executes via the SELL decision path this cycle; MODULE 2 re-evaluates this dimension on subsequent cycles until ${bearishMappingResult.expiresAt}.`,
+                );
+                appendAuditEvents(db, [{
+                  id: `ae-thesisinv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                  timestamp: new Date().toISOString(),
+                  type: "risk",
+                  actor: "bearish_mapping",
+                  entityId: item.symbol,
+                  message: `Thesis invalidated for ${item.symbol}: ${bearishMappingResult.reason}`,
+                  details: { symbol: item.symbol, sourceId: bearishMappingResult.sourceId, expiresAt: bearishMappingResult.expiresAt },
+                }]);
+              } catch (err: any) {
+                addLog("error", `Failed to persist thesis invalidation for ${item.symbol}; this cycle's SELL still executes via the normal decision path if applicable.`, err?.message || String(err));
+              }
+            } else if (bearishMappingResult.kind === "do_not_buy") {
+              try {
+                productionStore.saveDoNotBuy({
+                  symbol: bearishMappingResult.symbol,
+                  sourceId: bearishMappingResult.sourceId,
+                  reason: bearishMappingResult.reason,
+                  expiresAt: bearishMappingResult.expiresAt,
+                });
+                addLog(
+                  "trade",
+                  `${item.symbol} added to the do-not-buy list by source "${bearishMappingResult.sourceId}" (bearish stance on an unheld symbol) until ${bearishMappingResult.expiresAt}.`,
+                );
+                appendAuditEvents(db, [{
+                  id: `ae-donotbuy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                  timestamp: new Date().toISOString(),
+                  type: "risk",
+                  actor: "bearish_mapping",
+                  entityId: item.symbol,
+                  message: `${item.symbol} added to do-not-buy: ${bearishMappingResult.reason}`,
+                  details: { symbol: item.symbol, sourceId: bearishMappingResult.sourceId, expiresAt: bearishMappingResult.expiresAt },
+                }]);
+              } catch (err: any) {
+                addLog("error", `Failed to persist do-not-buy entry for ${item.symbol}.`, err?.message || String(err));
+              }
+            }
+          }
+
+          if (item.decision !== "BUY" && item.decision !== "SELL") {
+            // A whipsaw-downgraded bearish SELL (decision is HOLD post-gate)
+            // has nothing left to do this cycle beyond the bearish-mapping
+            // write above -- no risk engine evaluation, no price lookup.
+          } else {
+          addLog("sync", `Risk Engine Evaluation for ticker ${item.symbol}...`);
+
+          // Verify current position size limit
           const parsedPortfolioValue = Number(portfolio.portfolio_value);
           if (!Number.isFinite(parsedPortfolioValue) || parsedPortfolioValue <= 0) {
             addLog("error", `Order skipped for ${item.symbol}. Portfolio value is not a finite number; failing closed.`);
@@ -2892,6 +3044,43 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
           }
 
           if (item.decision === "BUY") {
+            // Phase 2 Task 10: do-not-buy enforcement, checked before sizing.
+            // A store read failure fails closed -- the BUY is rejected rather
+            // than proceeding as if no do-not-buy entries exist (same
+            // precedent as the symbol-cooldown read failure in
+            // executeTradeIntent above).
+            let doNotBuyEntry: { symbol: string; sourceId: string; reason: string; expiresAt: string } | undefined;
+            let doNotBuyLoadFailed = false;
+            try {
+              doNotBuyEntry = productionStore.listActiveDoNotBuy(new Date().toISOString()).find((e) => e.symbol === item.symbol);
+            } catch (err: any) {
+              doNotBuyLoadFailed = true;
+              addLog("error", `Do-not-buy store read failed for ${item.symbol}; failing closed and rejecting this BUY.`, err?.message || String(err));
+            }
+            if (doNotBuyLoadFailed) {
+              appendAuditEvents(db, [{
+                id: `ae-donotbuy-readfail-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                type: "risk",
+                actor: "bearish_mapping",
+                entityId: item.symbol,
+                message: `BUY for ${item.symbol} rejected: do-not-buy store read failed (fail closed).`,
+              }]);
+            } else if (doNotBuyEntry) {
+              addLog(
+                "error",
+                `Order skipped for ${item.symbol}. On the do-not-buy list until ${doNotBuyEntry.expiresAt} (source "${doNotBuyEntry.sourceId}": ${doNotBuyEntry.reason}).`,
+              );
+              appendAuditEvents(db, [{
+                id: `ae-donotbuy-blocked-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                type: "risk",
+                actor: "bearish_mapping",
+                entityId: item.symbol,
+                message: `BUY for ${item.symbol} rejected: on do-not-buy list (source "${doNotBuyEntry.sourceId}", expires ${doNotBuyEntry.expiresAt}).`,
+                details: { symbol: item.symbol, sourceId: doNotBuyEntry.sourceId, expiresAt: doNotBuyEntry.expiresAt, reason: doNotBuyEntry.reason },
+              }]);
+            } else {
             const portfolioAssessment = assessPortfolio({
               account: portfolio,
               positions: portfolio.positions || [],
@@ -3003,6 +3192,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
 
               addLog("trade", `Submitted BUY ${qty} shares of ${item.symbol}. State: ${newTrade.status}. Telegram: ${newTrade.notifiedTelegram ? 'Sent' : 'Disabled'}, Sheets: ${newTrade.exportedSheets ? 'Appended' : 'Disabled'}, Notion: ${newTrade.loggedNotion ? 'Saved' : 'Disabled'}`);
             }
+            }
           } else if (item.decision === "SELL" && currentShares && parseInt(currentShares.qty) > 0) {
             const qty = parseInt(currentShares.qty);
             addLog("sync", `Submitting sell recommendation intent to close position of ${qty} shares for ${item.symbol}...`);
@@ -3026,6 +3216,17 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
               addLog("trade", `Canceled ${legCancel.canceledCount} bracket leg(s) for ${item.symbol} before the automation sell.`);
             }
 
+            // Phase 2 Task 10: when the bearish-mapping layer classified this
+            // SELL as a thesis invalidation (held symbol, bearish stance,
+            // whipsaw-verified reversal -- see above), the executed trade's
+            // reasoning says so explicitly, exercising exitEngine.ts's
+            // thesis_invalidation dimension text/wording for a consistent
+            // audit trail with MODULE 2's own plan exits (exitMonitor.ts's
+            // buildPlanReasoning).
+            const sellReasoning = bearishMappingResult?.kind === "thesis_invalidation"
+              ? `thesis_invalidation triggered: ${bearishMappingResult.reason}`
+              : `Trend reversal warning assessed or stop loss margin hit. Closing positions.`;
+
             const newTrade = await executeTradeIntent({
               db,
               config: currentConfig,
@@ -3035,7 +3236,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
                 qty,
                 estimatedPrice: price,
                 side: "sell",
-                reasoning: `Trend reversal warning assessed or stop loss margin hit. Closing positions.`,
+                reasoning: sellReasoning,
               },
               marketKnownClosed,
             });
@@ -3055,6 +3256,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
             }
 
             addLog("trade", `Submitted SELL ${qty} shares of ${item.symbol}. State: ${newTrade.status}. Telegram: ${newTrade.notifiedTelegram ? 'Sent' : 'Disabled'}`);
+          }
           }
         }
       }

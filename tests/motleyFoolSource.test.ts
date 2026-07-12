@@ -337,10 +337,15 @@ test("registry migration end-to-end: an existing registry file missing motley-fo
   const body = await runSync(port);
 
   const onDisk = JSON.parse(fs.readFileSync(registryPath, "utf-8"));
-  assert.equal(onDisk.length, 2);
+  // Phase 2 Task 10 added a second default source (michael-burry), also
+  // missing from this file -- both migrate in, disabled, alongside ziptrader.
+  assert.equal(onDisk.length, 3);
   const fool = onDisk.find((s: any) => s.id === "motley-fool");
   assert.ok(fool, "expected motley-fool to have been migrated into the existing file");
   assert.equal(fool.enabled, false);
+  const burry = onDisk.find((s: any) => s.id === "michael-burry");
+  assert.ok(burry, "expected michael-burry to have also been migrated into the existing file");
+  assert.equal(burry.enabled, false);
 
   const logMessages: string[] = body.logs.map((l: any) => l.message);
   assert.ok(
@@ -348,7 +353,7 @@ test("registry migration end-to-end: an existing registry file missing motley-fo
     `expected a migration log line naming motley-fool, got: ${JSON.stringify(logMessages)}`,
   );
 
-  assert.equal(gmailListCalls.length, 1, "the freshly migrated (disabled) motley-fool source must not be queried this same cycle");
+  assert.equal(gmailListCalls.length, 1, "the freshly migrated (disabled) motley-fool and michael-burry sources must not be queried this same cycle");
   assert.ok(gmailListCalls.every((u) => decodeURIComponent(u).includes("from:charlie-from-ziptrader@ghost.io")));
 });
 
