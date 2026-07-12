@@ -24,6 +24,24 @@ const ADMIN_TOKEN = "test-admin-token-0123456789";
 // "open" -> is_open:true, "closed" -> is_open:false, "fail" -> HTTP 500.
 let clockMode: "open" | "closed" | "fail" = "open";
 let anthropicCallCount = 0;
+// Broker positions returned by GET /positions -- mutable per test so the
+// protective-exit tests below can seed an open position that MODULE 2's
+// legacy stop-loss will trigger on (unrealized loss beyond stopLossPercent).
+let openPositions: any[] = [];
+
+function losingPosition(symbol: string) {
+  // cost_basis 1000, unrealized_pl -100 -> unrealized_plpc -0.10 -> -10% loss,
+  // beyond the 5% stopLossPercent -> MODULE 2's legacy stop-loss fires.
+  return {
+    symbol,
+    qty: "10",
+    market_value: "900",
+    cost_basis: "1000",
+    unrealized_pl: "-100",
+    current_price: "90",
+    avg_entry_price: "100",
+  };
+}
 
 function buildBar(daysAgo: number, close: number) {
   const t = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString();
@@ -104,13 +122,13 @@ globalThis.fetch = (async (input: any, init?: any) => {
       );
     }
     if (url.includes("/positions")) {
-      return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify(openPositions), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.includes("/orders") && (!init?.method || init.method === "GET")) {
       return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.includes("/orders") && init?.method === "POST") {
-      return new Response(JSON.stringify({ id: "bro-1", status: "accepted", filled_qty: "0" }), {
+      return new Response(JSON.stringify({ id: `bro-${Math.random().toString(36).slice(2, 8)}`, status: "accepted", filled_qty: "0" }), {
         status: 200, headers: { "content-type": "application/json" },
       });
     }
@@ -206,6 +224,70 @@ test("clock fetch failure is treated as closed (fail closed): same reduced-cycle
     messages.some((m) => /market closed/i.test(m) && /skip/i.test(m)),
     `expected the reduced-cycle skip to be logged, got: ${JSON.stringify(messages)}`,
   );
+});
+
+// Shared body for the two protective-exit-while-closed cases below. The
+// standing principle (cooldown, breaker, and the per-cycle BUY cap all
+// already encode it): de-risking always stays available. A closed/unknown
+// market must fail closed for BUYs (risk-increasing) but must NEVER suppress
+// an already-triggered protective liquidation (risk-reducing) -- when the
+// market is genuinely closed, Alpaca queues the day market order for the
+// open; when the clock merely failed transiently, protection proceeds
+// immediately. BUY suppression in a scheduled closed cycle happens upstream
+// (the reduced cycle skips ingestion/analysis entirely -- zero Claude calls,
+// so no BUY decision can even form); the chokepoint's buy-only block is
+// defense-in-depth behind that.
+async function assertProtectiveSellProceedsWhileClosed(t: any, symbol: string) {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => {
+    listener.close();
+    openPositions = [];
+  });
+
+  await setAutoTrading(port);
+  openPositions = [losingPosition(symbol)];
+  anthropicCallCount = 0;
+
+  const tradesBefore = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const buysBefore = tradesBefore.filter((tr) => tr.side === "buy").length;
+
+  await runScheduledSyncTickForTests();
+
+  assert.equal(anthropicCallCount, 0, "the reduced cycle must still make zero Claude calls -- no BUY decision can form");
+
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const protectiveSell = trades.find((tr) => tr.symbol === symbol && tr.side === "sell");
+  assert.ok(protectiveSell, `expected a protective stop-loss SELL for ${symbol} despite the closed/unknown market, got: ${JSON.stringify(trades)}`);
+  assert.equal(
+    protectiveSell.status,
+    "Accepted",
+    `the protective SELL must reach the broker (risk-reducing orders are never blocked by the market-hours gate), got: ${JSON.stringify(protectiveSell)}`,
+  );
+
+  const buysAfter = trades.filter((tr) => tr.side === "buy").length;
+  assert.equal(buysAfter, buysBefore, "no new BUY order may be placed during a closed/unknown-market scheduled cycle");
+
+  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const messages: string[] = logs.map((l) => l.message);
+  assert.ok(
+    messages.some((m) => /market closed/i.test(m) && /skip/i.test(m)),
+    `expected the reduced-cycle skip (the clock reason for why no BUY can happen) to be logged, got: ${JSON.stringify(messages)}`,
+  );
+  assert.ok(
+    messages.some((m) => new RegExp(symbol).test(m) && /stop loss|liquidated/i.test(m)),
+    `expected the protective liquidation to be logged for ${symbol}, got: ${JSON.stringify(messages)}`,
+  );
+}
+
+test("clock fetch FAILURE (treated closed): an already-triggered protective stop-loss SELL still executes; no BUY is placed", async (t) => {
+  clockMode = "fail";
+  await assertProtectiveSellProceedsWhileClosed(t, "PROTA");
+});
+
+test("market genuinely closed (is_open:false): an already-triggered protective stop-loss SELL still executes (broker queues it for the open); no BUY is placed", async (t) => {
+  clockMode = "closed";
+  await assertProtectiveSellProceedsWhileClosed(t, "PROTB");
 });
 
 test("market open (is_open:true): a scheduled cycle runs full scope -- Claude is called and a BUY order is placed", async (t) => {

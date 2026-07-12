@@ -233,9 +233,18 @@ async function executeTradeIntent(input: {
   // Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): the order chokepoint for
   // the market-hours gate. Set true only by a SCHEDULED cycle that found the
   // clock closed (or unreachable -- fail closed); manual syncs never set
-  // this (human's call). When true, the order is rejected below with an
-  // honest reason before any broker call is made -- same RiskRejected path
-  // every other rejection already uses, so it is audited automatically.
+  // this (human's call). When true, a BUY is rejected below with an honest
+  // reason before any broker call is made -- same RiskRejected path every
+  // other rejection already uses, so it is audited automatically. SELLs are
+  // EXEMPT, per the plan's standing principle that de-risking always stays
+  // available (the cooldown just below, the breaker's block_new_buys, and
+  // the per-cycle BUY cap all already encode the same asymmetry):
+  // risk-increasing orders fail closed on a closed/UNKNOWN market state, but
+  // a risk-reducing order (stop-loss/exit-plan liquidation, automation SELL,
+  // close-all) always proceeds. When the market is genuinely closed, Alpaca
+  // queues the day market order for the open -- acceptable; when the clock
+  // fetch merely failed transiently, protection proceeds immediately instead
+  // of being suppressed by a broken clock.
   marketKnownClosed?: boolean;
 }) {
   const brokerConfig = getBrokerConfig();
@@ -290,8 +299,8 @@ async function executeTradeIntent(input: {
       cooldownLoadFailed = true;
     }
   }
-  const riskDecision: RiskDecision = input.marketKnownClosed
-    ? { status: "rejected", reason: "Market is closed; order blocked at the per-cycle market-hours chokepoint." }
+  const riskDecision: RiskDecision = input.marketKnownClosed && input.request.side === "buy"
+    ? { status: "rejected", reason: "Market is closed (or clock state unknown); BUY blocked at the market-hours chokepoint. Risk-reducing sells are exempt." }
     : cooldownLoadFailed
     ? { status: "rejected", reason: "Failed to load symbol cooldown state; failing closed on this buy order." }
     : reviewRisk({
