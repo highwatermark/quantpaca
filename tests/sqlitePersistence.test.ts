@@ -69,3 +69,24 @@ test("symbol cooldowns persist, filter expired entries, and survive reopen", () 
   reopened.close();
   fs.unlinkSync(dbPath);
 });
+
+test("app_state key-value store: absent key reads undefined, a written key round-trips, and state survives reopen", () => {
+  const dbPath = path.join(process.cwd(), "data", "test-app-state.sqlite");
+  if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+
+  const store = createProductionStore(dbPath);
+  assert.equal(store.getAppState("never_written"), undefined);
+
+  store.setAppState("empty_sync_alert_last_sent_at", "2026-07-12T12:00:00.000Z");
+  assert.equal(store.getAppState("empty_sync_alert_last_sent_at"), "2026-07-12T12:00:00.000Z");
+
+  // A later write for the same key replaces the value (no accumulation of rows).
+  store.setAppState("empty_sync_alert_last_sent_at", "2026-07-12T18:00:00.000Z");
+  assert.equal(store.getAppState("empty_sync_alert_last_sent_at"), "2026-07-12T18:00:00.000Z");
+  store.close();
+
+  const reopened = createProductionStore(dbPath);
+  assert.equal(reopened.getAppState("empty_sync_alert_last_sent_at"), "2026-07-12T18:00:00.000Z");
+  reopened.close();
+  fs.unlinkSync(dbPath);
+});

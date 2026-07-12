@@ -39,6 +39,7 @@ import { sizeTradeIntent, computeCapRoom, capRoomToQty } from "./src/server/sizi
 import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marketDataFetcher";
 import { RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
+import { EMPTY_SYNC_ALERT_STATE_KEY, shouldSendThrottledAlert } from "./src/server/alertThrottle";
 
 dotenv.config();
 
@@ -1259,12 +1260,23 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
       );
     }
     if (currentConfig.system && currentConfig.system.autoTrading) {
-      const cachedAsOf = regimeAssessment.asOf;
-      const cachedAsOfMs = cachedAsOf ? Date.parse(cachedAsOf) : NaN;
-      const cachedIsFresh = Number.isFinite(cachedAsOfMs) && Date.now() - cachedAsOfMs < REGIME_STALENESS_MS;
+      // Phase 2 Task 1, Item A (docs/GO_LIVE_PLAN.md "Phase 1 completion
+      // report" -> "Deferred to Phase 2"): the 30-minute reuse decision keys
+      // on WHEN THE FETCH HAPPENED (`fetchedAt`), not on `asOf` (the newest
+      // market-data bar timestamp -- honest about data freshness, but usually
+      // days old on weekends and always minutes-to-hours old during the
+      // trading day, which made the cache dead code on the happy path before
+      // this change). A legacy persisted row, or a row from a failed fetch
+      // (see the catch branch below, which deliberately never sets
+      // fetchedAt), has no `fetchedAt` at all, which parses to NaN here and
+      // is therefore always treated as stale -- migration-safe and fail-closed
+      // toward refetching rather than suppressing a retry.
+      const cachedFetchedAt = regimeAssessment.fetchedAt;
+      const cachedFetchedAtMs = cachedFetchedAt ? Date.parse(cachedFetchedAt) : NaN;
+      const cachedIsFresh = Number.isFinite(cachedFetchedAtMs) && Date.now() - cachedFetchedAtMs < REGIME_STALENESS_MS;
 
       if (cachedIsFresh) {
-        addLog("sync", `Regime assessment reused (asOf ${cachedAsOf}; younger than ${REGIME_STALENESS_MS / 60000} min).`);
+        addLog("sync", `Regime assessment reused (fetched ${cachedFetchedAt}; younger than ${REGIME_STALENESS_MS / 60000} min).`);
       } else {
         try {
           const fetched = await fetchMarketRegimeInputs({
@@ -1273,7 +1285,27 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
             fetchImpl: fetch,
           });
           const assessed = detectRegime(fetched.inputs);
-          regimeAssessment = { ...assessed, asOf: fetched.asOf, inputs: fetched.inputs };
+          // fetchMarketRegimeInputs never throws (see its module comment) --
+          // even a total outage across all three symbols resolves here with
+          // empty `inputs`, which detectRegime turns into its own conservative
+          // "unclear" default (its only path to marketMode "unclear"). That is
+          // functionally a failure for caching purposes: no usable market data
+          // was obtained this cycle, so -- same as the genuine-exception catch
+          // branch below -- fetchedAt must NOT be written, or a transient
+          // total outage would suppress retries for REGIME_STALENESS_MS just
+          // like the original bug this task fixes. Only a fetch that produced
+          // at least one usable input is cache-worthy.
+          const fetchProducedUsableData = assessed.marketMode !== "unclear";
+          // fetchedAt = now (drives the 30-min reuse decision above) --
+          // conditional per the comment just above. asOf stays the newest-bar
+          // timestamp reported by the fetch (drives nothing but honesty/audit
+          // -- see the domainTypes.ts field comment) regardless.
+          regimeAssessment = {
+            ...assessed,
+            asOf: fetched.asOf,
+            inputs: fetched.inputs,
+            ...(fetchProducedUsableData ? { fetchedAt: new Date().toISOString() } : {}),
+          };
           if (fetched.unavailableReasons.length) {
             addLog(
               "sync",
@@ -1286,10 +1318,17 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
           );
         } catch (regimeErr: any) {
           const conservative = detectRegime({});
+          // Deliberately no `fetchedAt` here (Item A): a failed fetch must
+          // never write a cache-suppressing timestamp. `asOf = now` still
+          // gives this degraded row an honest audit timestamp, but only a
+          // SUCCESSFUL fetch above ever writes `fetchedAt`, so next cycle's
+          // freshness check above always treats this row as stale and
+          // retries -- a transient outage no longer poisons the regime for
+          // REGIME_STALENESS_MS.
           regimeAssessment = { ...conservative, asOf: new Date().toISOString(), inputs: {} };
           addLog(
             "error",
-            "Regime market-data refetch failed; falling back to the conservative default (unclear / reduce_size / 0.5x).",
+            "Regime market-data refetch failed; falling back to the conservative default (unclear / reduce_size / 0.5x). Next sync will retry (no cache suppression).",
             regimeErr?.message || String(regimeErr),
           );
         }
@@ -1447,6 +1486,14 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
     // Variable to store Gmail messages
     let emailsToScan: EmailScanTarget[] = [];
+    // Phase 2 Task 1, Item B (docs/GO_LIVE_PLAN.md "Phase 1 completion report"
+    // -> "Deferred to Phase 2"): the latest reason this sync contributed zero
+    // email scan-targets, threaded into the throttled Telegram alert text
+    // below. All three causes (no OAuth token, non-OK Gmail response, zero
+    // usable messages) share the one throttled alert class -- this makes the
+    // alert text reflect whichever is CURRENT this sync, not whichever
+    // happened to fire first after the last alert.
+    let emptyEmailReason = "No Gmail authorization token detected.";
 
   if (authHeader) {
     addLog("sync", "Attempting to retrieve messages with active Gmail OAuth token...");
@@ -1462,6 +1509,10 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         const gmailData = await gmailRes.json();
         const messages = gmailData.messages || [];
         addLog("sync", `Successfully listed ${messages.length} messages from ZipTrader of ghost.io.`);
+        emptyEmailReason =
+          messages.length === 0
+            ? "Gmail returned zero messages matching the tracked sender this sync."
+            : "Every message returned this sync failed extraction (see per-message log entries).";
 
         for (const msg of messages) {
           const detailRes = await fetch(
@@ -1487,9 +1538,11 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
       } else {
         const errTxt = await gmailRes.text();
         addLog("error", "Gmail API failed. No email signals this sync.", errTxt);
+        emptyEmailReason = `Gmail API request failed (non-OK response): ${errTxt.substring(0, 200)}`;
       }
     } catch (err: any) {
       addLog("error", "Gmail sync connection error.", err.message);
+      emptyEmailReason = `Gmail sync connection error: ${err.message}`;
     }
   } else {
     addLog("sync", "No Gmail authorization token detected. Contributing zero email scan-targets this sync.");
@@ -1501,10 +1554,41 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
   // never substitute simulated/demo content for a real ingested message.
   if (emailsToScan.length === 0) {
     addLog("sync", "Gmail ingestion produced zero usable email scan-targets this sync.");
-    await sendTelegramAlert(
-      currentConfig.telegram,
-      "⚠️ <b>Gmail ingestion produced zero usable emails this sync.</b> No email-derived signals will be generated.",
-    );
+    // Phase 2 Task 1, Item B: the LOG line above still fires every sync (logs
+    // are cheap and honest); only the Telegram ALERT is throttled, to at most
+    // one per EMPTY_SYNC_ALERT_WINDOW_MS (see alertThrottle.ts) -- trailing,
+    // so the first occurrence after a quiet period alerts immediately. State
+    // survives restarts via the app_state key-value table (persistence.ts).
+    // Fail closed toward "alert": a throttle-state read/write failure is
+    // treated as never-alerted rather than silently suppressing the alert --
+    // see alertThrottle.ts's module comment for why this control's
+    // fail-closed direction is the opposite of the regime cache's.
+    let lastAlertedAt: string | undefined;
+    try {
+      lastAlertedAt = productionStore.getAppState(EMPTY_SYNC_ALERT_STATE_KEY);
+    } catch (throttleReadErr: any) {
+      lastAlertedAt = undefined;
+      addLog(
+        "error",
+        "Empty-sync alert throttle state could not be read; treating as never-alerted (will alert this sync).",
+        throttleReadErr?.message || String(throttleReadErr),
+      );
+    }
+    if (shouldSendThrottledAlert(lastAlertedAt, Date.now())) {
+      await sendTelegramAlert(
+        currentConfig.telegram,
+        `⚠️ <b>Gmail ingestion produced zero usable emails this sync.</b> ${emptyEmailReason} No email-derived signals will be generated.`,
+      );
+      try {
+        productionStore.setAppState(EMPTY_SYNC_ALERT_STATE_KEY, new Date().toISOString());
+      } catch (throttleWriteErr: any) {
+        addLog(
+          "error",
+          "Empty-sync alert throttle state could not be persisted; the next sync may alert again even within the throttle window.",
+          throttleWriteErr?.message || String(throttleWriteErr),
+        );
+      }
+    }
   }
 
   // 2. Fetch YouTube News & Sentiment using Claude web search

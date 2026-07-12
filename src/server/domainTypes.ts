@@ -52,6 +52,20 @@ export type RegimeAssessment = {
   // accept criterion and letting a fresh-enough row be reused without a refetch.
   asOf?: string;
   inputs?: MarketRegimeInputs;
+  // Phase 2 Task 1, Item A (docs/GO_LIVE_PLAN.md "Phase 1 completion report" ->
+  // "Deferred to Phase 2"): WHEN the market-data fetch that produced this
+  // assessment actually happened -- this, not `asOf`, is what the sync wiring
+  // in server.ts compares against REGIME_STALENESS_MS to decide whether to
+  // reuse a persisted assessment. `asOf` (newest bar timestamp) is honest about
+  // data freshness but is usually days old on weekends and always minutes
+  // behind during the trading day, so keying reuse off it made the cache
+  // effectively dead code on the happy path. Only a SUCCESSFUL fetch sets this
+  // field -- a failed refetch persists its conservative-default assessment
+  // (for audit) without `fetchedAt`, so the next sync always treats it as
+  // stale and retries rather than suppressing retry for REGIME_STALENESS_MS.
+  // Undefined on legacy rows persisted before this field existed, which parses
+  // to NaN below and is therefore also always treated as stale -- migration-safe.
+  fetchedAt?: string;
 };
 
 export type OpenOrder = {

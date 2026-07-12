@@ -59,6 +59,16 @@ export type ProductionStore = {
   latestBreakerState<T = unknown>(): T | undefined;
   saveCooldown(entry: { symbol: string; expiresAt: string; reason: string }): void;
   listActiveCooldownSymbols(nowIso: string): string[];
+  // Tiny generic key-value store (Phase 2 Task 1, Item B: docs/GO_LIVE_PLAN.md
+  // "Phase 1 completion report" -> "Deferred to Phase 2") for small pieces of
+  // cross-restart state that don't warrant a dedicated table -- e.g. the
+  // empty-sync Telegram alert throttle's last-alerted-at timestamp (see
+  // src/server/alertThrottle.ts). `getAppState` returns undefined for a key
+  // that was never written; callers are expected to treat that (and any read
+  // failure) as the conservative default for whatever they're tracking, same
+  // as every other fallible store read in this file.
+  getAppState(key: string): string | undefined;
+  setAppState(key: string, value: string): void;
   close(): void;
 };
 
@@ -125,6 +135,11 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       symbol TEXT PRIMARY KEY,
       expires_at TEXT NOT NULL,
       reason TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS app_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
   `);
@@ -301,6 +316,14 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     listActiveCooldownSymbols(nowIso) {
       const rows = db.prepare("SELECT symbol FROM symbol_cooldowns WHERE expires_at > ?").all(nowIso);
       return rows.map((row) => String(row.symbol));
+    },
+    getAppState(key) {
+      const row = db.prepare("SELECT value FROM app_state WHERE key = ?").get(key);
+      return row ? String(row.value) : undefined;
+    },
+    setAppState(key, value) {
+      db.prepare("INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)")
+        .run(key, value, new Date().toISOString());
     },
     close() {
       db.close();

@@ -219,17 +219,20 @@ async function runSync(port: number) {
   return body as any;
 }
 
-// Backdates the persisted regime assessment's asOf beyond REGIME_STALENESS_MS
-// so the next sync refetches instead of reusing the previous test's cached
-// assessment (pattern: regimeStaleness.test.ts). Needed because both tests in
-// this file share one server/store within the same process.
+// Backdates the persisted regime assessment's fetchedAt beyond
+// REGIME_STALENESS_MS so the next sync refetches instead of reusing the
+// previous test's cached assessment (pattern: regimeStaleness.test.ts).
+// Needed because both tests in this file share one server/store within the
+// same process. Phase 2 Task 1, Item A: the reuse decision keys on
+// `fetchedAt` (when the fetch happened), not `asOf` (the newest-bar
+// timestamp) -- see domainTypes.ts's RegimeAssessment.fetchedAt comment.
 function forceRegimeRefetchNextSync() {
   const rawStore = createProductionStore(sqlitePath);
   const latest = rawStore.latestRegimeAssessment();
   if (latest) {
     rawStore.saveRegimeAssessment({
       ...latest,
-      asOf: new Date(Date.now() - (REGIME_STALENESS_MS + 5 * 60 * 1000)).toISOString(),
+      fetchedAt: new Date(Date.now() - (REGIME_STALENESS_MS + 5 * 60 * 1000)).toISOString(),
     });
   }
   rawStore.close();
