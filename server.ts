@@ -16,7 +16,8 @@ import {
   TradeRequest,
 } from "./src/server/tradingSafety";
 import { createProductionStore } from "./src/server/persistence";
-import { createRawSignal, reviewSignal } from "./src/server/signalEngine";
+import { createRawSignal } from "./src/server/signalEngine";
+import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
 import { detectRegime } from "./src/server/regimeEngine";
 import { assessPortfolio } from "./src/server/portfolioEngine";
 import { reconcileBrokerState } from "./src/server/reconciliationEngine";
@@ -1141,8 +1142,7 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
           url: target.source === "youtube" ? "youtube://ziptrader" : "gmail://ziptrader",
           aiConfidence: Math.max(0, Math.min(100, Math.round((item.growthScore + Math.max(item.sentimentScore, 0)) / 2))),
         });
-        const reviewedSignal = reviewSignal(rawSignal);
-        productionStore.saveReviewedSignal(reviewedSignal);
+        const reviewedSignal = reviewAndPersistSignal(productionStore, rawSignal);
         if (reviewedSignal.status === "rejected") {
           addLog("error", `Signal rejected for ${item.symbol}: ${reviewedSignal.rejectionReason}`);
           continue;

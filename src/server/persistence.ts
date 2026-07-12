@@ -17,8 +17,9 @@ type DatabaseSync = {
 export type ProductionStore = {
   appendAuditEvents(events: AuditEvent[]): void;
   listAuditEvents(limit?: number): AuditEvent[];
-  saveReviewedSignal(signal: ReviewedSignal): void;
+  saveReviewedSignal(signal: ReviewedSignal, duplicateKey?: string): void;
   listReviewedSignals(limit?: number): ReviewedSignal[];
+  loadRecentDuplicateKeys(limit?: number): Set<string>;
   saveRegimeAssessment(regime: RegimeAssessment): void;
   latestRegimeAssessment(): RegimeAssessment | undefined;
   saveTradeIntent(trade: PipelineTrade): void;
@@ -53,6 +54,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     CREATE TABLE IF NOT EXISTS reviewed_signals (
       id TEXT PRIMARY KEY,
       timestamp TEXT NOT NULL,
+      duplicate_key TEXT,
       payload_json TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS regime_assessments (
@@ -93,6 +95,14 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     );
   `);
 
+  // Backfill-safe migration: databases created before this column existed won't
+  // have it, and CREATE TABLE IF NOT EXISTS above is a no-op against them.
+  const reviewedSignalsColumns = db.prepare("PRAGMA table_info(reviewed_signals)").all();
+  const hasDuplicateKeyColumn = reviewedSignalsColumns.some((col) => col.name === "duplicate_key");
+  if (!hasDuplicateKeyColumn) {
+    db.exec("ALTER TABLE reviewed_signals ADD COLUMN duplicate_key TEXT");
+  }
+
   return {
     appendAuditEvents(events) {
       const stmt = db.prepare(`
@@ -127,12 +137,18 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         details: row.details_json ? JSON.parse(String(row.details_json)) : undefined,
       }));
     },
-    saveReviewedSignal(signal) {
-      db.prepare("INSERT OR REPLACE INTO reviewed_signals (id, timestamp, payload_json) VALUES (?, ?, ?)")
-        .run(signal.id, signal.sourceTimestamp, JSON.stringify(signal));
+    saveReviewedSignal(signal, duplicateKey) {
+      db.prepare("INSERT OR REPLACE INTO reviewed_signals (id, timestamp, duplicate_key, payload_json) VALUES (?, ?, ?, ?)")
+        .run(signal.id, signal.sourceTimestamp, duplicateKey || null, JSON.stringify(signal));
     },
     listReviewedSignals(limit = 250) {
       return rowsToPayloads<ReviewedSignal>(db.prepare("SELECT payload_json FROM reviewed_signals ORDER BY timestamp DESC LIMIT ?").all(limit));
+    },
+    loadRecentDuplicateKeys(limit = 1000) {
+      const rows = db.prepare(
+        "SELECT duplicate_key FROM reviewed_signals WHERE duplicate_key IS NOT NULL ORDER BY timestamp DESC LIMIT ?",
+      ).all(limit);
+      return new Set(rows.map((row) => String(row.duplicate_key)));
     },
     saveRegimeAssessment(regime) {
       db.prepare("INSERT OR REPLACE INTO regime_assessments (id, timestamp, payload_json) VALUES (?, ?, ?)")

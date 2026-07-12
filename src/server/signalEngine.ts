@@ -38,11 +38,26 @@ export function reviewSignals(rawSignals: RawSignal[], options: ReviewOptions = 
   return rawSignals.map((signal) => reviewSignal(signal, { ...options, seenKeys }));
 }
 
+/**
+ * The dedup key used to detect a previously-seen signal. Deliberately excludes
+ * sourceTimestamp -- it is volatile (re-stamped per sync run) and must not defeat
+ * dedup. Exported so callers that persist reviewed signals (e.g. signalReviewStep)
+ * can compute and store the same key rather than duplicating this derivation.
+ */
+export function computeDuplicateKey(rawSignal: RawSignal): string {
+  const symbolValidation = validateSymbol(rawSignal.symbol);
+  return buildDuplicateKey(rawSignal, symbolValidation.normalized || rawSignal.symbol);
+}
+
+function buildDuplicateKey(rawSignal: RawSignal, normalizedSymbol: string): string {
+  return [rawSignal.source, rawSignal.sourceId, normalizedSymbol, rawSignal.normalizedThesisHash].join("|");
+}
+
 export function reviewSignal(rawSignal: RawSignal, options: ReviewOptions = {}): ReviewedSignal {
   const now = options.now || new Date();
   const maxAgeHours = options.maxAgeHours || 72;
   const symbolValidation = validateSymbol(rawSignal.symbol);
-  const duplicateKey = [rawSignal.source, rawSignal.sourceId, symbolValidation.normalized || rawSignal.symbol, rawSignal.normalizedThesisHash].join("|");
+  const duplicateKey = buildDuplicateKey(rawSignal, symbolValidation.normalized || rawSignal.symbol);
   const sourceTime = Date.parse(rawSignal.sourceTimestamp);
   const ageHours = Number.isFinite(sourceTime) ? (now.getTime() - sourceTime) / 36e5 : Infinity;
   const confidenceScore = normalizeConfidence(rawSignal);
