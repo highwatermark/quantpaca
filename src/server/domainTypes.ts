@@ -1,4 +1,5 @@
 import { AlpacaAccount, AlpacaPosition } from "../types";
+import { MarketRegimeInputs } from "./marketDataFetcher";
 
 export type SignalSource = "email" | "youtube" | "gemini" | "manual" | "telegram";
 
@@ -39,6 +40,18 @@ export type RegimeAssessment = {
   sizeMultiplier: number;
   reason: string;
   sectorRelevance?: string;
+  // Task 8 (docs/GO_LIVE_PLAN.md Phase 1.3): populated by the sync wiring in
+  // server.ts (src/server/marketDataFetcher.ts), not by detectRegime itself --
+  // regimeEngine.ts's decision logic is unaware of either field. `asOf` is the
+  // newest market-data bar timestamp (or fetch time on total failure) that
+  // produced this assessment -- used to decide whether a persisted assessment
+  // is still fresh enough to reuse (see REGIME_STALENESS_MS in
+  // marketDataFetcher.ts), as opposed to `timestamp` above, which is just when
+  // this DB row was written. `inputs` records the raw computed inputs alongside
+  // the assessment they produced, satisfying the plan's "real inputs recorded"
+  // accept criterion and letting a fresh-enough row be reused without a refetch.
+  asOf?: string;
+  inputs?: MarketRegimeInputs;
 };
 
 export type OpenOrder = {

@@ -11,23 +11,34 @@ import {
   BrokerConfig,
   buildBrokerConfigFromEnv,
   redactConfigForClient,
+  RiskDecision,
   stripPersistedSecrets,
   submitTradeThroughPipeline,
   TradeRequest,
 } from "./src/server/tradingSafety";
 import { createProductionStore } from "./src/server/persistence";
-import { createRawSignal, reviewSignal } from "./src/server/signalEngine";
+import { createRawSignal } from "./src/server/signalEngine";
+import { applyWhipsawGate, normalizeWhipsawVerdict } from "./src/server/whipsawGate";
+import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
+import { extractEmailScanTarget, EmailScanTarget } from "./src/server/emailIngestion";
+import { assembleScanTargets, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
 import { detectRegime } from "./src/server/regimeEngine";
 import { assessPortfolio } from "./src/server/portfolioEngine";
 import { reconcileBrokerState } from "./src/server/reconciliationEngine";
 import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, createConfirmationToken, parseTelegramAdminRoles } from "./src/server/telegramEngine";
 import { createExitPlan } from "./src/server/exitEngine";
+import { evaluateOpenPositionExits } from "./src/server/exitMonitor";
 import { reviewRisk } from "./src/server/riskEngine";
-import { evaluateBreaker } from "./src/server/breakerEngine";
+import { evaluateBreaker, BreakerState } from "./src/server/breakerEngine";
+import { applyBreakerLatch, LatchEvent } from "./src/server/breakerLatch";
 import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
-import { sizeTradeIntent } from "./src/server/sizingEngine";
+import { loadCooldownConfig } from "./src/server/cooldownConfig";
+import { sizeTradeIntent, computeCapRoom, capRoomToQty } from "./src/server/sizingEngine";
+import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marketDataFetcher";
+import { RegimeAssessment } from "./src/server/domainTypes";
+import { parseFiniteNumber } from "./src/server/numericSafety";
 
 dotenv.config();
 
@@ -85,6 +96,51 @@ let riskLimits: RiskLimits;
   riskLimits = loaded.limits;
 }
 
+// Same startup pattern as risk limits above: parsed once, fatal on unparsable input,
+// immutable for the process lifetime. 0 is an explicit, documented escape hatch that
+// disables the per-symbol cooldown (see docs/GO_LIVE_PLAN.md Phase 1.1).
+let symbolCooldownHours: number;
+{
+  const loaded = loadCooldownConfig(process.env);
+  if (loaded.ok === false) {
+    for (const error of loaded.errors) console.error(`[startup:fatal] ${error}`);
+    console.error("[startup] Invalid symbol cooldown configuration. Refusing to start.");
+    process.exit(1);
+  }
+  symbolCooldownHours = loaded.config.symbolCooldownHours;
+}
+
+// Trade states that mean the order actually reached the broker — either it was
+// submitted/accepted/filled, or the broker itself rejected it or the submission call
+// failed/returned an unrecognized status. These are the outcomes that put a symbol in
+// cooldown. RiskRejected (blocked before ever reaching the broker, e.g. insufficient
+// buying power or an already-active cooldown) intentionally does NOT extend or restart
+// a cooldown — those rejections are cheap and often transient.
+const BROKER_REACHED_TRADE_STATUSES = new Set([
+  "Accepted",
+  "PartiallyFilled",
+  "Filled",
+  "Rejected",
+  "Canceled",
+  "Expired",
+  "BrokerFailed",
+  "UnknownBrokerState",
+]);
+
+// Trade states that mean the order was actually SUCCESSFULLY placed with the broker --
+// the strict subset of BROKER_REACHED_TRADE_STATUSES above that excludes broker-side
+// failures/rejections. submitTradeThroughPipeline attaches an exitPlan to the trade on
+// every return path -- including RiskRejected and BrokerFailed, which never produced a
+// live position -- so exit-plan persistence must be gated on this set, not merely on
+// "trade.exitPlan is present". Otherwise a rejected retry/duplicate signal's freshly
+// built (and never-executed) plan can overwrite latestBuySideExitPlanForSymbol's answer
+// for a real, still-open position, silently changing its stop-loss/take-profit/HWM.
+const BROKER_SUCCESS_TRADE_STATUSES = new Set([
+  "Accepted",
+  "PartiallyFilled",
+  "Filled",
+]);
+
 const getBrokerConfig = () => buildBrokerConfigFromEnv(process.env);
 
 function appendAuditEvents(db: any, events: AuditEvent[]) {
@@ -115,6 +171,58 @@ function requireAdminCommand(req: express.Request, res: express.Response, next: 
   next();
 }
 
+// Task 10 ("Latch the breaker", docs/GO_LIVE_PLAN.md Phase 1.4): evaluateBreaker's
+// threshold math is untouched -- this only computes the same fresh evaluation the
+// pre-latch code always did. Split out so both the normal trade-intent path and the
+// admin reset path (which must force a fresh evaluation independent of the current
+// latch) share one definition of "what does the broker say right now".
+type PreviousBreakerRecord = { peakEquity: number | null; latch?: unknown };
+
+function evaluateFreshBreaker(portfolio: any, brokerConfig: BrokerConfig, previousPeakEquity: number | null): BreakerState {
+  return evaluateBreaker({
+    equity: portfolio.equity,
+    // Simulated portfolios have no prior-close equity; treating equity as last_equity
+    // zeroes the daily-loss check offline. A REAL broker account must supply last_equity —
+    // no fallback when brokerConfig.configured is true.
+    lastEquity: brokerConfig.configured ? portfolio.last_equity : (portfolio.last_equity ?? portfolio.equity),
+    previousPeakEquity,
+    baselineEquity: riskLimits.baselineEquity,
+    limits: {
+      maxDailyLossPercent: riskLimits.maxDailyLossPercent,
+      maxDrawdownFromPeakPercent: riskLimits.maxDrawdownFromPeakPercent,
+      maxDrawdownFromBaselinePercent: riskLimits.maxDrawdownFromBaselinePercent,
+    },
+  });
+}
+
+function breakerLatchAuditEvent(input: {
+  event: Exclude<LatchEvent, "none">;
+  corrupt: boolean;
+  latchedStatus: BreakerState["status"];
+  fresh: BreakerState;
+  actor: string;
+}): AuditEvent {
+  const label = input.event === "trip" ? "tripped" : "escalated";
+  return {
+    id: `ae-breaker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    type: "breaker",
+    actor: input.actor,
+    message: input.corrupt
+      ? `Breaker latch state was corrupt/unparsable; failing closed to block_new_buys.`
+      : `Breaker ${label} to ${input.latchedStatus}.`,
+    details: {
+      status: input.latchedStatus,
+      corrupt: input.corrupt,
+      equity: input.fresh.metrics.equity,
+      dailyLossPercent: input.fresh.metrics.dailyLossPercent,
+      drawdownFromPeakPercent: input.fresh.metrics.drawdownFromPeakPercent,
+      drawdownFromBaselinePercent: input.fresh.metrics.drawdownFromBaselinePercent,
+      reasons: input.fresh.reasons,
+    },
+  };
+}
+
 async function executeTradeIntent(input: {
   db: any;
   config: AppConfig;
@@ -129,22 +237,28 @@ async function executeTradeIntent(input: {
     openOrders: await getAlpacaOpenOrders(brokerConfig),
     source: brokerConfig.configured ? "alpaca" : "local_simulated_snapshot",
   });
-  const previousBreaker = productionStore.latestBreakerState<{ peakEquity: number | null }>();
-  const breakerState = evaluateBreaker({
-    equity: portfolio.equity,
-    // Simulated portfolios have no prior-close equity; treating equity as last_equity
-    // zeroes the daily-loss check offline. A REAL broker account must supply last_equity —
-    // no fallback when brokerConfig.configured is true.
-    lastEquity: brokerConfig.configured ? portfolio.last_equity : (portfolio.last_equity ?? portfolio.equity),
-    previousPeakEquity: previousBreaker?.peakEquity ?? null,
-    baselineEquity: riskLimits.baselineEquity,
-    limits: {
-      maxDailyLossPercent: riskLimits.maxDailyLossPercent,
-      maxDrawdownFromPeakPercent: riskLimits.maxDrawdownFromPeakPercent,
-      maxDrawdownFromBaselinePercent: riskLimits.maxDrawdownFromBaselinePercent,
-    },
-  });
-  productionStore.saveBreakerState(breakerState);
+  const previousBreaker = productionStore.latestBreakerState<PreviousBreakerRecord>();
+  const freshBreaker = evaluateFreshBreaker(portfolio, brokerConfig, previousBreaker?.peakEquity ?? null);
+  // Latch wraps the fresh evaluation (breakerEngine.ts's threshold semantics are
+  // never touched here): once tripped, block_new_buys/close_only persists across
+  // subsequent evaluations -- even ones a fresh computation would call "ok" -- until
+  // an explicit admin reset (POST /api/breaker/reset or the Telegram /breaker_reset
+  // command, both below).
+  const latchResult = applyBreakerLatch(freshBreaker, previousBreaker?.latch);
+  const breakerState = latchResult.effective;
+  const toPersist = { ...breakerState, latch: latchResult.latchState };
+  productionStore.saveBreakerState(toPersist);
+  if (latchResult.event !== "none") {
+    appendAuditEvents(input.db, [
+      breakerLatchAuditEvent({
+        event: latchResult.event,
+        corrupt: latchResult.corrupt,
+        latchedStatus: latchResult.latchState.latchedStatus,
+        fresh: freshBreaker,
+        actor: "breaker_engine",
+      }),
+    ]);
+  }
   const exitPlan = createExitPlan({
     symbol: input.request.symbol,
     side: input.request.side,
@@ -152,55 +266,171 @@ async function executeTradeIntent(input: {
     stopLossPercent: input.config.system?.stopLossPercent,
     takeProfitPercent: input.config.system?.targetProfitPercent,
   });
-  const riskDecision = reviewRisk({
-    intent: {
-      id: `intent-${Date.now()}`,
-      symbol: input.request.symbol,
-      side: input.request.side,
-      qty: input.request.qty,
-      notional: input.request.qty * input.request.estimatedPrice,
-      estimatedPrice: input.request.estimatedPrice,
-      sizingReason: "Server order path intent.",
-      capsApplied: input.maxNotional ? ["max_notional_route_limit"] : [],
-    },
-    brokerConfig,
-    portfolio: portfolioAssessment,
-    exitPlan,
-    breaker: { status: breakerState.status },
-    metrics: {
-      dailyLoss: (() => {
-        // Same fallback rule as the breaker input above: a REAL broker must supply
-        // last_equity (missing -> NaN -> reviewRisk fails closed); the simulated
-        // portfolio treats equity as prior close (daily loss 0).
-        const lastEquityForDaily = brokerConfig.configured
-          ? Number(portfolio.last_equity)
-          : Number(portfolio.last_equity ?? portfolio.equity);
-        return breakerState.metrics.equity !== null
-          ? breakerState.metrics.equity - lastEquityForDaily
-          : Number.NaN;
-      })(),
-      dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
-      openPositionCount: portfolioAssessment.positions.length,
-    },
-    limits: {
-      maxDailyLoss: riskLimits.maxDailyLoss,
-      maxDailyTradeCount: riskLimits.maxDailyTradeCount,
-      maxOpenPositions: riskLimits.maxOpenPositions,
-      minBuyingPower: riskLimits.minBuyingPower,
-    },
-  });
+  // Per-symbol cooldown only ever blocks BUYs — de-risking (a SELL) must always stay
+  // available, so the cooldown set is only ever populated for buy-side intents here;
+  // reviewRisk's cooldown check is never given anything to match against for a sell.
+  // On a store read failure we fail closed: a buy whose cooldown state is unknown is
+  // rejected outright instead of proceeding as if no cooldowns exist.
+  let cooldownSymbols: string[] = [];
+  let cooldownLoadFailed = false;
+  if (input.request.side === "buy" && symbolCooldownHours > 0) {
+    try {
+      cooldownSymbols = productionStore.listActiveCooldownSymbols(new Date().toISOString());
+    } catch (err) {
+      console.error("[cooldown] Failed to load active cooldown symbols; failing closed on buy order.", err);
+      cooldownLoadFailed = true;
+    }
+  }
+  const riskDecision: RiskDecision = cooldownLoadFailed
+    ? { status: "rejected", reason: "Failed to load symbol cooldown state; failing closed on this buy order." }
+    : reviewRisk({
+        intent: {
+          id: `intent-${Date.now()}`,
+          symbol: input.request.symbol,
+          side: input.request.side,
+          qty: input.request.qty,
+          notional: input.request.qty * input.request.estimatedPrice,
+          estimatedPrice: input.request.estimatedPrice,
+          sizingReason: "Server order path intent.",
+          capsApplied: input.maxNotional ? ["max_notional_route_limit"] : [],
+        },
+        brokerConfig,
+        portfolio: portfolioAssessment,
+        exitPlan,
+        breaker: { status: breakerState.status },
+        metrics: {
+          dailyLoss: (() => {
+            // Same fallback rule as the breaker input above: a REAL broker must supply
+            // last_equity (missing -> NaN -> reviewRisk fails closed); the simulated
+            // portfolio treats equity as prior close (daily loss 0).
+            const lastEquityForDaily = brokerConfig.configured
+              ? Number(portfolio.last_equity)
+              : Number(portfolio.last_equity ?? portfolio.equity);
+            return breakerState.metrics.equity !== null
+              ? breakerState.metrics.equity - lastEquityForDaily
+              : Number.NaN;
+          })(),
+          dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
+          openPositionCount: portfolioAssessment.positions.length,
+        },
+        limits: {
+          maxDailyLoss: riskLimits.maxDailyLoss,
+          maxDailyTradeCount: riskLimits.maxDailyTradeCount,
+          maxOpenPositions: riskLimits.maxOpenPositions,
+          minBuyingPower: riskLimits.minBuyingPower,
+          cooldownSymbols,
+        },
+      });
   const result = await submitTradeThroughPipeline({
     request: input.request,
     brokerConfig,
     riskDecision,
     exitPlan,
-    brokerSubmit: () => placeAlpacaOrder(brokerConfig, input.request.symbol, riskDecision.adjustedQty || input.request.qty, input.request.side),
+    brokerSubmit: (clientOrderId) =>
+      placeAlpacaOrder(brokerConfig, input.request.symbol, riskDecision.adjustedQty || input.request.qty, input.request.side, clientOrderId),
   });
+
+  // Task 13 (idempotent orders): if this exact intent (by client_order_id) was
+  // already recorded locally -- e.g. a retry/double-submit that Alpaca's own
+  // client_order_id dedup collapsed into the SAME broker order -- reuse that
+  // earlier local trade's id so saveTradeIntent below overwrites it in place
+  // instead of inserting a second local record for one broker order.
+  if (result.trade.clientOrderId) {
+    try {
+      const existing = productionStore.findTradeIntentByClientOrderId(result.trade.clientOrderId);
+      if (existing && existing.id !== result.trade.id) {
+        // The pipeline already built this attempt's audit events against the
+        // fresh (about-to-be-discarded) trade id -- re-point them at the
+        // deduped id BEFORE appendAuditEvents persists them, or every
+        // resubmission would leave orphaned audit_events rows whose entity_id
+        // joins to no trade_intents row.
+        const staleId = result.trade.id;
+        result.trade.id = existing.id;
+        for (const event of result.auditEvents) {
+          if (event.entityId === staleId) event.entityId = existing.id;
+        }
+      }
+    } catch (err) {
+      console.error("[client_order_id] Failed to look up an existing trade intent for dedup; recording this as a new local trade.", err);
+    }
+  }
+
   appendAuditEvents(input.db, result.auditEvents);
   productionStore.saveTradeIntent(result.trade);
   if (result.trade.riskDecision) productionStore.saveRiskDecision(result.trade.id, result.trade.riskDecision);
-  if (result.trade.exitPlan) productionStore.saveExitPlan(result.trade.id, result.trade.exitPlan);
+  // Only persist the exit plan when the order actually reached the broker
+  // successfully (see BROKER_SUCCESS_TRADE_STATUSES above) -- a RiskRejected or
+  // BrokerFailed trade's exitPlan describes an order that was never placed and
+  // must never become the plan latestBuySideExitPlanForSymbol hands back for a
+  // real open position (Finding C1).
+  if (result.trade.exitPlan && BROKER_SUCCESS_TRADE_STATUSES.has(result.trade.status)) {
+    productionStore.saveExitPlan(result.trade.id, result.trade.exitPlan);
+  }
+  // Cooldown is recorded once the order reaches the broker in any capacity — a clean
+  // accept/fill, or a broker-side rejection/failure — but NOT for a RiskRejected trade
+  // that never left this process (e.g. insufficient buying power, an already-active
+  // cooldown, missing exit plan). Those are cheap, often-transient rejections and
+  // re-triggering them must not re-arm or extend an existing cooldown window.
+  if (symbolCooldownHours > 0 && BROKER_REACHED_TRADE_STATUSES.has(result.trade.status)) {
+    try {
+      productionStore.saveCooldown({
+        symbol: result.trade.symbol,
+        expiresAt: new Date(Date.now() + symbolCooldownHours * 60 * 60 * 1000).toISOString(),
+        reason: `Trade ${result.trade.id} for ${result.trade.symbol} reached the broker with status ${result.trade.status}.`,
+      });
+    } catch (err) {
+      console.error("[cooldown] Failed to persist cooldown entry.", err);
+    }
+  }
   return result.trade;
+}
+
+// The two admin-gated reset paths required by Task 10 (POST /api/breaker/reset and
+// the Telegram /breaker_reset command, both below) share this: clear the latch
+// unconditionally, then re-evaluate fresh. Reset is not an override of reality --
+// applyBreakerLatch(fresh, null) starts from "no latch" exactly like a first-ever
+// evaluation, so if thresholds are STILL breached right now, it re-trips (and
+// re-latches) immediately. Caller supplies `actor` for the audit trail (e.g.
+// "admin_api" or "telegram:<userId>") and is responsible for NOT holding dbMutex
+// already -- this acquires it itself (broker calls must not happen while already
+// holding the lock; see handleTelegramCommand's read-only-reply comment below).
+async function performBreakerReset(actor: string): Promise<{ status: BreakerState["status"]; reTripped: boolean }> {
+  const release = await dbMutex.acquire();
+  try {
+    const db = readDB();
+    const brokerConfig = getBrokerConfig();
+    const portfolio = await getAlpacaPortfolio(brokerConfig);
+    const previousBreaker = productionStore.latestBreakerState<PreviousBreakerRecord>();
+    const freshBreaker = evaluateFreshBreaker(portfolio, brokerConfig, previousBreaker?.peakEquity ?? null);
+    const latchResult = applyBreakerLatch(freshBreaker, null);
+    const toPersist = { ...latchResult.effective, latch: latchResult.latchState };
+    productionStore.saveBreakerState(toPersist);
+
+    const reTripped = latchResult.latchState.latched;
+    const auditEvent: AuditEvent = {
+      id: `ae-breaker-reset-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "breaker",
+      actor,
+      message: reTripped
+        ? `Breaker reset by ${actor}; thresholds still breached, re-latched to ${latchResult.latchState.latchedStatus}.`
+        : `Breaker reset by ${actor}; latch cleared, status ok.`,
+      details: {
+        status: latchResult.effective.status,
+        reTripped,
+        equity: freshBreaker.metrics.equity,
+        dailyLossPercent: freshBreaker.metrics.dailyLossPercent,
+        drawdownFromPeakPercent: freshBreaker.metrics.drawdownFromPeakPercent,
+        drawdownFromBaselinePercent: freshBreaker.metrics.drawdownFromBaselinePercent,
+        reasons: freshBreaker.reasons,
+      },
+    };
+    appendAuditEvents(db, [auditEvent]);
+    writeDB(db);
+    return { status: latchResult.effective.status, reTripped };
+  } finally {
+    release();
+  }
 }
 
 function defaultDB() {
@@ -269,8 +499,10 @@ function writeDB(data: any) {
   }
 }
 
-// Global Claude client. Constructing without a key throws; both call sites
-// run inside try/catch blocks that fall back to simulated analysis.
+// Global Claude client. Both call sites in /api/sync run inside try/catch
+// blocks; a missing ANTHROPIC_API_KEY or a failed call is treated as a hard
+// failure of that source -- it contributes zero scan-targets/signals rather
+// than falling back to simulated analysis (see scanTargetAssembly.ts).
 const getClaudeClient = () => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -357,9 +589,48 @@ async function getAlpacaOpenOrders(brokerConfig: BrokerConfig = getBrokerConfig(
   }));
 }
 
-async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty: number, side: "buy" | "sell") {
+// Task 13: does an Alpaca error response indicate the order was rejected
+// specifically because client_order_id already exists (a duplicate/retry),
+// as opposed to some other rejection (insufficient buying power, bad symbol,
+// market closed, etc.)? Alpaca's documented duplicate response is a 422 (or
+// 409) whose body names client_order_id and says it must be unique/already
+// exists. Matched narrowly on both the status AND the wording so we don't
+// misclassify an unrelated 422 as "safe to resolve via the existing order."
+function isDuplicateClientOrderIdError(status: number, bodyText: string): boolean {
+  if (status !== 422 && status !== 409) return false;
+  const lower = bodyText.toLowerCase();
+  return (
+    lower.includes("client_order_id") &&
+    (lower.includes("unique") || lower.includes("already") || lower.includes("duplicate") || lower.includes("exists"))
+  );
+}
+
+// Task 13: resolve a duplicate client_order_id rejection to the order Alpaca
+// already created for it, via Alpaca's GET /orders:by_client_order_id. Returns
+// null (never throws) on any failure -- the caller falls back to failing the
+// submission closed (BrokerFailed) rather than fabricating a mapping.
+async function fetchExistingAlpacaOrderByClientOrderId(brokerConfig: BrokerConfig, clientOrderId: string) {
+  const headers = {
+    "APCA-API-KEY-ID": brokerConfig.apiKey || "",
+    "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
+    "Content-Type": "application/json",
+  };
+  try {
+    const res = await fetch(`${brokerConfig.baseUrl}/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`, { headers });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error("[client_order_id] Failed to fetch the existing order after a duplicate client_order_id rejection.", err);
+    return null;
+  }
+}
+
+async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty: number, side: "buy" | "sell", clientOrderId: string) {
   if (!brokerConfig.configured) {
-    return { id: "dry-run-" + Date.now(), qty: String(qty), status: "accepted" };
+    // Task 13: the dry-run path also carries the id, for consistency with the
+    // live path's response shape (and so tests/callers can assert on it
+    // uniformly regardless of whether a broker is configured).
+    return { id: "dry-run-" + Date.now(), qty: String(qty), status: "accepted", client_order_id: clientOrderId };
   }
 
   if (brokerConfig.tradingMode === "live" && !brokerConfig.liveTradingEnabled) {
@@ -381,10 +652,21 @@ async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty:
       side,
       type: "market",
       time_in_force: "day",
+      client_order_id: clientOrderId,
     }),
   });
   if (!orderRes.ok) {
     const errTxt = await orderRes.text();
+    // Task 13: Alpaca's behavior on a duplicate client_order_id is to return
+    // the EXISTING order, or a 422/409 depending on state. On the error path,
+    // resolve it to that existing order instead of surfacing a spurious
+    // BrokerFailed for an order that actually exists -- without this, an
+    // operator/automation seeing "failed" could retry with a fresh id and
+    // create a real second order, exactly what client_order_id exists to prevent.
+    if (isDuplicateClientOrderIdError(orderRes.status, errTxt)) {
+      const existing = await fetchExistingAlpacaOrderByClientOrderId(brokerConfig, clientOrderId);
+      if (existing) return existing;
+    }
     throw new Error(`Alpaca order rejected: ${errTxt}`);
   }
   return await orderRes.json();
@@ -441,6 +723,13 @@ async function handleTelegramCommand(update: any) {
 
   const outbound: string[] = [];
   let needsReadOnlyReply = false;
+  // Set when /confirm just consumed a valid "breaker_reset" token -- the actual
+  // reset (performBreakerReset) calls the broker, so it must run after the db lock
+  // below is released, same reason /positions defers its broker read (see
+  // needsReadOnlyReply below). Unlike /close_all's confirm reply (a placeholder
+  // pointing at the admin API), /breaker_reset's Telegram confirmation is the
+  // second of the task's two required reset paths and must actually execute.
+  let confirmedBreakerReset = false;
 
   const release = await dbMutex.acquire();
   try {
@@ -468,13 +757,23 @@ async function handleTelegramCommand(update: any) {
           outbound.push(`Confirmation rejected: ${consumed.reason}.`);
         } else {
           pendingTelegramConfirmations.delete(tokenValue);
-          outbound.push(`Confirmed action: ${token.action}. Submit through the admin API to execute.`);
+          if (token.action === "breaker_reset") {
+            confirmedBreakerReset = true;
+          } else {
+            outbound.push(`Confirmed action: ${token.action}. Submit through the admin API to execute.`);
+          }
         }
       }
     } else if (command === "/close_all") {
       const token = createConfirmationToken({ userId, action: "close_all" });
       pendingTelegramConfirmations.set(token.token, token);
       outbound.push(`Close-all requires confirmation. Reply: /confirm ${token.token}`);
+    } else if (command === "/breaker_reset") {
+      // Strictest existing confirmation flow (mirrors /close_all exactly): admin
+      // role required (telegramEngine.ts commandRoles) plus a second /confirm step.
+      const token = createConfirmationToken({ userId, action: "breaker_reset" });
+      pendingTelegramConfirmations.set(token.token, token);
+      outbound.push(`Breaker reset requires confirmation. Reply: /confirm ${token.token}`);
     } else if (command === "/pause" || command === "/block_buys") {
       db.config.system.autoTrading = false;
       outbound.push("Auto trading paused. New buys are blocked.");
@@ -488,6 +787,13 @@ async function handleTelegramCommand(update: any) {
     writeDB(db);
   } finally {
     release();
+  }
+
+  if (confirmedBreakerReset) {
+    // Admin reset path 2 of 2 (Task 10). Runs after the lock above is released;
+    // performBreakerReset re-acquires dbMutex itself around the actual state change.
+    const result = await performBreakerReset(`telegram:${userId}`);
+    outbound.push(`Breaker reset executed. Status: ${result.status}${result.reTripped ? " (still breached — re-latched)" : ""}.`);
   }
 
   if (needsReadOnlyReply) {
@@ -662,6 +968,19 @@ app.get("/api/breaker/latest", (req, res) => {
   res.json(productionStore.latestBreakerState() || { status: "ok", reasons: ["no_evaluation_yet"], asOf: null });
 });
 
+// Admin reset path 1 of 2 (Task 10, docs/GO_LIVE_PLAN.md Phase 1.4). See
+// performBreakerReset above: clears the latch, then re-evaluates fresh -- if still
+// breached, it re-trips immediately rather than overriding reality.
+app.post("/api/breaker/reset", requireAdminCommand, async (req, res) => {
+  try {
+    const result = await performBreakerReset("admin_api");
+    res.json({ success: true, status: result.status, reTripped: result.reTripped });
+  } catch (err: any) {
+    console.error("Critical error in /api/breaker/reset:", err);
+    res.status(500).json({ error: "Breaker reset failed", details: err.message });
+  }
+});
+
 app.get("/api/portfolio/assessment", async (req, res) => {
   try {
     const portfolio = await getAlpacaPortfolio();
@@ -785,7 +1104,7 @@ app.get("/api/telegram/status", (req, res) => {
     configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
     adminsConfigured: Object.keys(roles).length,
     mode: process.env.TELEGRAM_RUNTIME || "long_polling_ready",
-    commands: ["/status", "/health", "/positions", "/orders", "/trades", "/sync", "/dry_run", "/pause", "/resume", "/block_buys", "/close_all", "/risk", "/regime"],
+    commands: ["/status", "/health", "/positions", "/orders", "/trades", "/sync", "/dry_run", "/pause", "/resume", "/block_buys", "/close_all", "/breaker_reset", "/risk", "/regime"],
   });
 });
 
@@ -906,72 +1225,220 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     }
 
     // ==========================================================
-    // MODULE 2: ACTIVE PORTFOLIO RISK CONTROLLER (AUTOMATED STOP LOSS)
+    // MODULE 2.5: MARKET REGIME ASSESSMENT
+    // Feeds real SPY/QQQ trend, broad-market drawdown, and a realized-vol proxy
+    // (src/server/marketDataFetcher.ts) into detectRegime (regimeEngine.ts)
+    // instead of the permanent conservative default a bare `detectRegime({})`
+    // call produces. A persisted assessment younger than REGIME_STALENESS_MS is
+    // reused without a refetch; otherwise this fetches fresh bars and persists
+    // a new assessment. A fetch that comes back with nothing usable (or throws)
+    // degrades to detectRegime({})'s own conservative default -- fail closed,
+    // per docs/GO_LIVE_PLAN.md Phase 1.3. Gated on autoTrading (like MODULE 2
+    // below): this keeps sync hermetic (no Alpaca calls) when trading is off,
+    // matching every other Alpaca call in this file. Runs BEFORE MODULE 2 (Task
+    // 9, docs/GO_LIVE_PLAN.md Phase 1.3) so this cycle's own regime assessment
+    // -- not a stale one from a prior cycle -- feeds both MODULE 2's
+    // regime-change exit dimension immediately below and the buy path further
+    // down this sync.
+    // ==========================================================
+    // The store read is fallible (persistence calls can throw -- same reason
+    // exitMonitor.ts documents lookupPlan as throw-capable) and, since the
+    // Task 9 reorder, it now runs BEFORE MODULE 2's protective exits. It must
+    // therefore never abort the sync: a broken regime store degrades to
+    // detectRegime({})'s conservative default (reduce_size -- which can never
+    // fire regime-change exits) so exit evaluation still runs this cycle.
+    let regimeAssessment: RegimeAssessment;
+    try {
+      regimeAssessment = productionStore.latestRegimeAssessment() || detectRegime({});
+    } catch (regimeStoreErr: any) {
+      regimeAssessment = detectRegime({});
+      addLog(
+        "error",
+        "Regime assessment store read failed; degrading to the conservative default (unclear / reduce_size / 0.5x) so exit evaluation still runs this cycle.",
+        regimeStoreErr?.message || String(regimeStoreErr),
+      );
+    }
+    if (currentConfig.system && currentConfig.system.autoTrading) {
+      const cachedAsOf = regimeAssessment.asOf;
+      const cachedAsOfMs = cachedAsOf ? Date.parse(cachedAsOf) : NaN;
+      const cachedIsFresh = Number.isFinite(cachedAsOfMs) && Date.now() - cachedAsOfMs < REGIME_STALENESS_MS;
+
+      if (cachedIsFresh) {
+        addLog("sync", `Regime assessment reused (asOf ${cachedAsOf}; younger than ${REGIME_STALENESS_MS / 60000} min).`);
+      } else {
+        try {
+          const fetched = await fetchMarketRegimeInputs({
+            brokerConfig: getBrokerConfig(),
+            dataBaseUrl: process.env.ALPACA_DATA_URL || "https://data.alpaca.markets",
+            fetchImpl: fetch,
+          });
+          const assessed = detectRegime(fetched.inputs);
+          regimeAssessment = { ...assessed, asOf: fetched.asOf, inputs: fetched.inputs };
+          if (fetched.unavailableReasons.length) {
+            addLog(
+              "sync",
+              `Regime market-data unavailable for some inputs (falling back to conservative defaults for those fields): ${fetched.unavailableReasons.join("; ")}`,
+            );
+          }
+          addLog(
+            "sync",
+            `Regime assessment refreshed: marketMode=${regimeAssessment.marketMode}, tradePermission=${regimeAssessment.tradePermission}, sizeMultiplier=${regimeAssessment.sizeMultiplier}.`,
+          );
+        } catch (regimeErr: any) {
+          const conservative = detectRegime({});
+          regimeAssessment = { ...conservative, asOf: new Date().toISOString(), inputs: {} };
+          addLog(
+            "error",
+            "Regime market-data refetch failed; falling back to the conservative default (unclear / reduce_size / 0.5x).",
+            regimeErr?.message || String(regimeErr),
+          );
+        }
+        // Persisting is best-effort for the same reason as the read above:
+        // a broken store must not abort the sync before MODULE 2's protective
+        // exits run. The in-memory regimeAssessment still feeds this cycle.
+        try {
+          productionStore.saveRegimeAssessment(regimeAssessment);
+        } catch (regimeSaveErr: any) {
+          addLog(
+            "error",
+            "Regime assessment could not be persisted; continuing with the in-memory assessment for this cycle.",
+            regimeSaveErr?.message || String(regimeSaveErr),
+          );
+        }
+      }
+    }
+
+    // ==========================================================
+    // MODULE 2: ACTIVE PORTFOLIO RISK CONTROLLER
+    // Evaluates each open position's persisted exit plan (stop-loss,
+    // take-profit, time-exit, thesis-invalidation, regime-change -- see
+    // exitEngine.ts) via evaluateOpenPositionExits (src/server/exitMonitor.ts).
+    // A position with no plan, or a plan that fails numeric validation, falls
+    // back to the legacy hardcoded 5% unrealized_plpc stop-loss so it is never
+    // left unprotected. The regime-change dimension is fed this cycle's
+    // tradePermission/marketMode from MODULE 2.5 above (Task 9,
+    // docs/GO_LIVE_PLAN.md Phase 1.3): a plan whose regimeChangeAction is
+    // "close" liquidates only when tradePermission is affirmatively
+    // "close_only" this cycle. detectRegime({})'s conservative default
+    // (reduce_size) can never be "close_only", so a missing/degraded
+    // market-data feed can never liquidate a position through this dimension --
+    // exits fail closed in the protective direction.
+    // See docs/GO_LIVE_PLAN.md Phase 1.2.
     // ==========================================================
     if (currentConfig.system && currentConfig.system.autoTrading) {
-      addLog("sync", "Active risk evaluator: Checking portfolio stop-loss limits...");
+      addLog("sync", "Active risk evaluator: Checking portfolio exit plans and stop-loss limits...");
       try {
         const portfolio = await getAlpacaPortfolio();
         const stopPercent = currentConfig.system.stopLossPercent || 5.0; // percentage trigger
-        
-        for (const pos of (portfolio.positions || [])) {
-          const unrealizedLossPercent = parseFloat(pos.unrealized_plpc) * 100;
-          
-          if (unrealizedLossPercent <= -stopPercent) {
-            addLog("trade", `PROTECTIVE BOUND REACHED: Position in ${pos.symbol} is at ${unrealizedLossPercent.toFixed(2)}% loss (Limit: -${stopPercent}%). Exercising Stop Loss sell execution!`);
-            
-            const sellQty = Math.floor(parseFloat(pos.qty));
-            if (sellQty > 0) {
-              const liquidationTrade = await executeTradeIntent({
-                db,
-                config: currentConfig,
-                request: {
-                  source: "stop_loss",
-                  symbol: pos.symbol,
-                  qty: sellQty,
-                  estimatedPrice: parseFloat(pos.current_price) || 0,
-                  side: "sell",
-                  reasoning: `Automatic stop-loss protection executed. Loss of ${unrealizedLossPercent.toFixed(2)}% reached the threshold of -${stopPercent}%. Position was automatically liquidated.`,
-                },
-              });
-              Object.assign(liquidationTrade, {
-                symbol: pos.symbol,
-                qty: sellQty,
-                price: parseFloat(pos.current_price) || 50,
-                side: "sell",
-              });
-              
-              const tgAlertMsg = `🚨 <b>STOP LOSS EXECUTION WARNING</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Trigger Loss:</b> ${unrealizedLossPercent.toFixed(2)}%\n<b>Limit Threshold:</b> -${stopPercent}%\nAutomatically liquidated ${sellQty} shares to shield capital assets from further dropdowns.`;
-              liquidationTrade.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgAlertMsg);
-              liquidationTrade.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, liquidationTrade);
-              liquidationTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, {
-                id: "an-" + Math.random().toString(36).substr(2, 9),
-                symbol: pos.symbol,
-                source: "email",
-                sourceTitle: "Protective Capital Liquidation",
-                sourceContent: "Loss threshold exceeded",
-                growthScore: 0,
-                sentimentScore: -100,
-                riskProfile: "High",
-                reasoning: liquidationTrade.reasoning,
-                whipsawCheck: "Stop Limit breach verified, trend reversal detected.",
-                decision: "SELL",
-                timestamp: liquidationTrade.timestamp
-              });
-              
-              db.trades.unshift(liquidationTrade);
-              
-              // Clean local simulated portfolio if offline mode
-              if (!getBrokerConfig().configured && liquidationTrade.status !== "BrokerFailed" && liquidationTrade.status !== "RiskRejected") {
-                db.simulatedPortfolio.positions = (db.simulatedPortfolio.positions || []).filter((p: any) => p.symbol !== pos.symbol);
-                const fundBack = sellQty * (parseFloat(pos.current_price) || 50);
-                db.simulatedPortfolio.cash = String(parseFloat(db.simulatedPortfolio.cash) + fundBack);
-                db.simulatedPortfolio.long_market_value = String(parseFloat(db.simulatedPortfolio.long_market_value) - fundBack);
-              }
-              
-              addLog("trade", `Liquidated ${sellQty} shares of ${pos.symbol} due to stop loss limit hit.`);
+        const positions = portfolio.positions || [];
+        const positionBySymbol = new Map(positions.map((pos: any) => [pos.symbol, pos]));
+
+        const exitEvaluation = evaluateOpenPositionExits({
+          positions: positions.map((pos: any) => ({
+            symbol: pos.symbol,
+            qty: pos.qty,
+            currentPrice: pos.current_price,
+            unrealizedPlPercent: parseFloat(pos.unrealized_plpc) * 100,
+          })),
+          now: new Date(),
+          legacyStopLossPercent: stopPercent,
+          // This cycle's regime assessment (MODULE 2.5 above) -- undefined
+          // permission (e.g. autoTrading was off last time regimeAssessment was
+          // computed) is passed through as-is; evaluateExitPlan only ever
+          // triggers on an exact "close_only" match, so undefined/reduce_size/
+          // allow/block_new_buys all fail closed here.
+          regimePermission: regimeAssessment.tradePermission,
+          regimeMode: regimeAssessment.marketMode,
+          lookupPlan: (symbol) => productionStore.latestBuySideExitPlanForSymbol(symbol),
+          onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => {
+            try {
+              productionStore.updateHighWaterMark(tradeId, highWaterMark);
+            } catch (err: any) {
+              console.error(`[trailing-stop] Failed to persist ratcheted high-water mark for ${symbol}:`, err?.message || err);
             }
+          },
+        });
+
+        for (const skipped of exitEvaluation.skippedPlans) {
+          addLog("error", `Exit plan evaluation skipped for ${skipped.symbol}`, skipped.message);
+        }
+
+        const exitDecisions: Array<
+          | { kind: "plan_exit"; symbol: string; qty: number; reasoning: string; logMessage: string }
+          | { kind: "legacy_stop_loss"; symbol: string; qty: number; reasoning: string; logMessage: string }
+        > = [
+          ...exitEvaluation.planExits.map((exit) => ({
+            kind: exit.kind,
+            symbol: exit.symbol,
+            qty: exit.qty,
+            reasoning: exit.reasoning,
+            logMessage: `PLAN EXIT TRIGGERED: Position in ${exit.symbol} closed by exit plan (${exit.reasoning}).`,
+          })),
+          ...exitEvaluation.legacyExits.map((exit) => ({
+            kind: exit.kind,
+            symbol: exit.symbol,
+            qty: exit.qty,
+            reasoning: exit.reasoning,
+            logMessage: `PROTECTIVE BOUND REACHED: Position in ${exit.symbol} is at ${exit.unrealizedLossPercent.toFixed(2)}% loss (Limit: -${stopPercent}%). Exercising Stop Loss sell execution!`,
+          })),
+        ];
+
+        for (const decision of exitDecisions) {
+          const pos: any = positionBySymbol.get(decision.symbol);
+          if (!pos) continue;
+          addLog("trade", decision.logMessage);
+
+          const sellQty = Math.min(decision.qty, Math.floor(parseFloat(pos.qty)) || 0);
+          if (sellQty <= 0) continue;
+
+          const liquidationTrade = await executeTradeIntent({
+            db,
+            config: currentConfig,
+            request: {
+              source: "stop_loss",
+              symbol: pos.symbol,
+              qty: sellQty,
+              estimatedPrice: parseFloat(pos.current_price) || 0,
+              side: "sell",
+              reasoning: decision.reasoning,
+            },
+          });
+          Object.assign(liquidationTrade, {
+            symbol: pos.symbol,
+            qty: sellQty,
+            price: parseFloat(pos.current_price) || 50,
+            side: "sell",
+          });
+
+          const tgAlertMsg = `🚨 <b>${decision.kind === "plan_exit" ? "EXIT PLAN TRIGGERED" : "STOP LOSS EXECUTION WARNING"}</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Reason:</b> ${decision.reasoning}\nAutomatically liquidated ${sellQty} shares to shield capital assets from further dropdowns.`;
+          liquidationTrade.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgAlertMsg);
+          liquidationTrade.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, liquidationTrade);
+          liquidationTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, {
+            id: "an-" + Math.random().toString(36).substr(2, 9),
+            symbol: pos.symbol,
+            source: "email",
+            sourceTitle: "Protective Capital Liquidation",
+            sourceContent: decision.kind === "plan_exit" ? "Exit plan threshold triggered" : "Loss threshold exceeded",
+            growthScore: 0,
+            sentimentScore: -100,
+            riskProfile: "High",
+            reasoning: liquidationTrade.reasoning,
+            whipsawCheck: "Stop Limit breach verified, trend reversal detected.",
+            decision: "SELL",
+            timestamp: liquidationTrade.timestamp
+          });
+
+          db.trades.unshift(liquidationTrade);
+
+          // Clean local simulated portfolio if offline mode
+          if (!getBrokerConfig().configured && liquidationTrade.status !== "BrokerFailed" && liquidationTrade.status !== "RiskRejected") {
+            db.simulatedPortfolio.positions = (db.simulatedPortfolio.positions || []).filter((p: any) => p.symbol !== pos.symbol);
+            const fundBack = sellQty * (parseFloat(pos.current_price) || 50);
+            db.simulatedPortfolio.cash = String(parseFloat(db.simulatedPortfolio.cash) + fundBack);
+            db.simulatedPortfolio.long_market_value = String(parseFloat(db.simulatedPortfolio.long_market_value) - fundBack);
           }
+
+          addLog("trade", `Liquidated ${sellQty} shares of ${pos.symbol} (${decision.kind === "plan_exit" ? "exit plan" : "legacy stop loss"} trigger).`);
         }
       } catch (riskManagerErr: any) {
         addLog("error", "Portfolio risk evaluator hit error", riskManagerErr.message);
@@ -979,7 +1446,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     }
 
     // Variable to store Gmail messages
-    let emailsToScan: any[] = [];
+    let emailsToScan: EmailScanTarget[] = [];
 
   if (authHeader) {
     addLog("sync", "Attempting to retrieve messages with active Gmail OAuth token...");
@@ -998,42 +1465,50 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
         for (const msg of messages) {
           const detailRes = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`,
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
             { headers: { Authorization: authHeader } }
           );
           if (detailRes.ok) {
             const detailData = await detailRes.json();
-            const subjectHeader = detailData.payload.headers.find((h: any) => h.name === "Subject");
-            const snippet = detailData.snippet || "";
-            emailsToScan.push({
-              source: "email",
-              title: subjectHeader ? subjectHeader.value : "ZipTrader Thesis",
-              content: snippet,
-            });
+            const extraction = extractEmailScanTarget(detailData);
+            if (extraction.ok === false) {
+              // Fail-closed: no real send time could be recovered for this message.
+              // Never fabricate "now" -- skip it rather than let an undated thesis
+              // sail through the freshness check.
+              addLog("error", `Skipping Gmail message ${msg.id}: ${extraction.reason}`);
+              continue;
+            }
+            if (extraction.bodyDegraded) {
+              addLog("sync", `Body extraction degraded for Gmail message ${msg.id}; using snippet fallback.`);
+            }
+            emailsToScan.push(extraction.target);
           }
         }
       } else {
         const errTxt = await gmailRes.text();
-        addLog("error", "Gmail API failed. Operating with offline simulation database.", errTxt);
+        addLog("error", "Gmail API failed. No email signals this sync.", errTxt);
       }
     } catch (err: any) {
       addLog("error", "Gmail sync connection error.", err.message);
     }
   } else {
-    addLog("sync", "No authorization token detected. Simulating recent Gmail Inbox scan for @ghost.io...");
+    addLog("sync", "No Gmail authorization token detected. Contributing zero email scan-targets this sync.");
   }
 
-  // If no live emails scanned, add high quality simulated one for demonstration
+  // Fail closed: a fabricated thesis must never reach the trade pipeline. If Gmail
+  // was unavailable (no OAuth token above) or returned zero usable emails, log it,
+  // alert via Telegram if configured, and contribute zero email scan-targets --
+  // never substitute simulated/demo content for a real ingested message.
   if (emailsToScan.length === 0) {
-    emailsToScan.push({
-      source: "email",
-      title: "ZipTrader: Why MARA and Clean Energy are pulling back — Pullback Accumulation",
-      content: "MARA shares slid 10% on market Bitcoin volatility. Fundamentals remain stellar. Is it a trend reversal or simple whipsaw volatility? Our analysis points to macro liquidation. Fundamentals validated by steady hash rates.",
-    });
+    addLog("sync", "Gmail ingestion produced zero usable email scan-targets this sync.");
+    await sendTelegramAlert(
+      currentConfig.telegram,
+      "⚠️ <b>Gmail ingestion produced zero usable emails this sync.</b> No email-derived signals will be generated.",
+    );
   }
 
   // 2. Fetch YouTube News & Sentiment using Claude web search
-  let youtubeSentiment = "No recent video found in search.";
+  let youtubeResult: YoutubeSentimentResult;
   try {
     addLog("sync", "Querying Claude web search for recent ZipTrader YouTube video sentiment...");
     const anthropic = getClaudeClient();
@@ -1050,19 +1525,29 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         },
       ],
     });
-    youtubeSentiment = claudeText(queryRes) || "ZipTrader channel continues to emphasize accumulation patterns for PLTR and TSLA following volatility.";
-    addLog("sentiment", "ZipTrader YouTube Sentinel scan completed successfully.", youtubeSentiment.substring(0, 300) + "...");
+    const sentiment = claudeText(queryRes);
+    if (sentiment) {
+      youtubeResult = { ok: true, sentiment };
+      addLog("sentiment", "ZipTrader YouTube Sentinel scan completed successfully.", sentiment.substring(0, 300) + "...");
+    } else {
+      // Fail closed: an empty web-search result is not simulated content to fall
+      // back on -- it contributes zero YouTube scan-targets, same as a hard failure.
+      youtubeResult = { ok: false, reason: "Claude web search returned no content." };
+      addLog("sentiment", "YouTube sentiment scan returned no content; contributing zero YouTube scan-targets this sync.");
+    }
   } catch (err: any) {
     console.error("Claude web search error:", err);
-    youtubeSentiment = "ZipTrader channel sentiment: Bullish on growth tech pullbacks, emphasizing MARA and PLTR accumulation.";
-    addLog("sentiment", "YouTube sentiment simulated using default quantitative engine.");
+    // Fail closed: no ANTHROPIC_API_KEY or a failed web-search call must never pass
+    // an error string into analysis as if it were real sentiment.
+    youtubeResult = { ok: false, reason: err.message || "Claude web search failed." };
+    addLog("error", "YouTube sentiment scan failed; contributing zero YouTube scan-targets this sync.", err.message);
   }
 
   // 3. Process each scanned thesis with Claude
-  const scanTargets = [
-    ...emailsToScan,
-    { source: "youtube", title: "ZipTrader Channel Feed Analyzed", content: youtubeSentiment }
-  ];
+  // The YouTube target (when present) keeps a "now" timestamp deliberately: the
+  // sentiment is the output of a web search that just completed above, not an
+  // ingested document with its own real send time to recover.
+  const scanTargets = assembleScanTargets(emailsToScan, youtubeResult);
 
   const parsedAnalyses: StockAnalysis[] = [];
 
@@ -1089,7 +1574,8 @@ You must extract the stock ticker symbol mentioned (like PLTR, MARA, TSLA, NVDA)
 Crucially, when the stock goes down for any reason, assess whether it is a support level 'whipsaw' because of the overall market volatility OR a genuine 'trend reversal' before deciding to act. Validate the fundamentals and the core thesis.
 Set a decision: 'BUY' (if sentiment is very bullish & whipsaw check passes), 'SELL' (if trend reversal is verified or target stop loss hit), 'HOLD', or 'NONE' (if no clear ticker discussed).
 
-For "reasoning", write a concise human sentence explaining the fundamental thesis validation. For "whipsawCheck", give a definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal. If no clear ticker is discussed, set "symbol" to "UNKNOWN".`,
+For "reasoning", write a concise human sentence explaining the fundamental thesis validation. For "whipsawCheck", give a definitive explanation of whether the current pull-back is a whipsaw or genuine trend reversal.
+For "whipsawVerdict", classify that same judgment into exactly one of three structured values: 'whipsaw' (a temporary shakeout -- the dip is likely to recover), 'reversal' (a verified genuine trend reversal), or 'unclear' (you cannot determine which). This structured value is what the trading system gates SELL decisions and BUY confidence on, so it must reflect your actual judgment, not just be copied from the decision field. If no clear ticker is discussed, set "symbol" to "UNKNOWN".`,
           },
         ],
         output_config: {
@@ -1104,9 +1590,10 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
                 riskProfile: { type: "string", enum: ["Low", "Medium", "High"] },
                 reasoning: { type: "string" },
                 whipsawCheck: { type: "string" },
+                whipsawVerdict: { type: "string", enum: ["whipsaw", "reversal", "unclear"] },
                 decision: { type: "string", enum: ["BUY", "SELL", "HOLD", "NONE"] },
               },
-              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "decision"],
+              required: ["symbol", "growthScore", "sentimentScore", "riskProfile", "reasoning", "whipsawCheck", "whipsawVerdict", "decision"],
               additionalProperties: false,
             },
           },
@@ -1117,6 +1604,19 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
       const parsed = JSON.parse(text);
 
       if (parsed.symbol && parsed.symbol !== "UNKNOWN" && parsed.symbol !== "THE_STOCK_TICKER") {
+        // Gate on the whipsaw verdict (docs/GO_LIVE_PLAN.md Phase 1.1): a SELL only
+        // proceeds if the reversal is verified; a BUY's confidence is haircut based
+        // on the verdict. normalizeWhipsawVerdict is defensive parse-site validation
+        // on top of the API-enforced schema -- any value other than the three allowed
+        // strings fails closed to "unclear" before it ever reaches the gate.
+        const whipsawVerdict = normalizeWhipsawVerdict(parsed.whipsawVerdict);
+        const rawAiConfidence = Math.max(0, Math.min(100, Math.round((parsed.growthScore + Math.max(parsed.sentimentScore, 0)) / 2)));
+        const gated = applyWhipsawGate(parsed.decision, whipsawVerdict, rawAiConfidence);
+
+        if (gated.downgraded) {
+          addLog("sentiment", `Whipsaw gate for ${parsed.symbol}: ${gated.note}`);
+        }
+
         const item: StockAnalysis = {
           id: "an-" + Math.random().toString(36).substr(2, 9),
           symbol: parsed.symbol.toUpperCase(),
@@ -1126,23 +1626,49 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
           growthScore: parsed.growthScore,
           sentimentScore: parsed.sentimentScore,
           riskProfile: parsed.riskProfile as any,
-          reasoning: parsed.reasoning,
+          // Honest audit trail: when the gate downgrades a SELL to HOLD, that fact is
+          // recorded directly in the persisted reasoning, not just the sync log.
+          reasoning: gated.downgraded ? `${parsed.reasoning} [Whipsaw gate: ${gated.note}]` : parsed.reasoning,
           whipsawCheck: parsed.whipsawCheck,
-          decision: parsed.decision as any,
-          timestamp: new Date().toISOString(),
+          whipsawVerdict,
+          decision: gated.decision as any,
+          // Real source timestamp (Gmail internalDate/Date header for email, or
+          // "now" for the just-completed YouTube web search) -- not "now" for
+          // every thesis regardless of actual age. This is what lets the signal
+          // engine's freshness check (maxAgeHours) do anything at all.
+          timestamp: target.sourceTimestamp,
         };
 
         const rawSignal = createRawSignal({
           source: target.source === "youtube" ? "youtube" : "email",
-          sourceId: `${target.source}:${target.title}`,
+          // Finding I1: identify an email by Gmail's message id, not its subject
+          // line -- two distinct emails (e.g. a recurring weekly newsletter) can
+          // share an identical title, which would otherwise collapse them into one
+          // dedup identity. Falls back to the title-based id defensively if a
+          // message id was never captured. YouTube has no per-message resource
+          // (it's a fresh web-search summary each run) so it keeps the title-based
+          // sourceId, unchanged.
+          sourceId: target.source === "email" && target.messageId
+            ? `email:${target.messageId}`
+            : `${target.source}:${target.title}`,
           sourceTimestamp: item.timestamp,
           symbol: item.symbol,
           thesis: `${item.reasoning} ${item.whipsawCheck}`,
+          // Finding I1: hash the raw ingested email body for dedup instead of
+          // `thesis` above. `thesis` is Claude's free-text re-analysis of that
+          // body, and its wording drifts between separate analyses of the exact
+          // same email -- hashing it made the dedup key non-deterministic in
+          // production (masked in testing only by the 24h symbol cooldown).
+          // `target.content` is stable across re-syncs of the same message.
+          // YouTube has no such stable content handle (the "content" IS a fresh
+          // search summary each run) so it keeps hashing `thesis`, unchanged.
+          dedupContent: target.source === "email" ? target.content : undefined,
           url: target.source === "youtube" ? "youtube://ziptrader" : "gmail://ziptrader",
-          aiConfidence: Math.max(0, Math.min(100, Math.round((item.growthScore + Math.max(item.sentimentScore, 0)) / 2))),
+          // Confidence already carries the whipsaw haircut (or is unchanged for
+          // whipsaw/HOLD/NONE) -- this is what flows into sizing's confidenceMultiplier.
+          aiConfidence: gated.aiConfidence,
         });
-        const reviewedSignal = reviewSignal(rawSignal);
-        productionStore.saveReviewedSignal(reviewedSignal);
+        const reviewedSignal = reviewAndPersistSignal(productionStore, rawSignal);
         if (reviewedSignal.status === "rejected") {
           addLog("error", `Signal rejected for ${item.symbol}: ${reviewedSignal.rejectionReason}`);
           continue;
@@ -1205,7 +1731,12 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
               openOrders: await getAlpacaOpenOrders(),
               source: getBrokerConfig().configured ? "alpaca" : "local_simulated_snapshot",
             });
-            const regime = productionStore.latestRegimeAssessment() || detectRegime({});
+            // Reuse this sync's already-fetched/persisted assessment (MODULE 2.5)
+            // rather than re-querying the store or recomputing per item; recompute
+            // with this item's symbol only to pick up the BTC-linked reason text
+            // for crypto-linked equities (see regimeEngine.ts) -- marketMode/
+            // tradePermission/sizeMultiplier are unaffected by symbol.
+            const regime = detectRegime({ ...regimeAssessment.inputs, symbol: item.symbol });
             const stopLossPercent = Number(currentConfig.system.stopLossPercent);
             if (!Number.isFinite(stopLossPercent) || stopLossPercent <= 0) {
               addLog("error", `Order skipped for ${item.symbol}. stopLossPercent is not a positive finite number.`);
@@ -1220,7 +1751,7 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
               stopLossPrice: price * (1 - stopLossPercent / 100),
               limits: {
                 maxSinglePositionPercent: currentConfig.system.maxPositionSizePercent,
-                maxPortfolioExposurePercent: 100,
+                maxPortfolioExposurePercent: riskLimits.maxPortfolioExposurePercent,
                 maxNotionalPerTrade: maxPositionValue,
                 minBuyingPowerAfterTrade: riskLimits.minBuyingPower,
               },
@@ -1343,7 +1874,7 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
 app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
   const release = await dbMutex.acquire();
   try {
-    const { symbol, qty, side, price } = req.body;
+    const { symbol, side } = req.body;
     const db = readDB();
     const authHeader = req.headers.authorization || null;
 
@@ -1354,6 +1885,92 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
       db.syncLogs.unshift({ id: "l-" + Math.random().toString(36).substr(2, 9), timestamp, type, message: msg, details });
     };
 
+    // Fail closed on unparsable request numerics (docs/GO_LIVE_PLAN.md Phase 1.4):
+    // a non-finite/non-positive qty or price is rejected outright rather than
+    // coerced to NaN/0 and passed through to the safety pipeline.
+    const qtyParsed = parseFiniteNumber(req.body.qty, "qty");
+    if (!qtyParsed.ok || qtyParsed.value <= 0) {
+      res.status(400).json({ error: "Manual trade override rejected", details: `Request field "qty" must be a positive finite number.` });
+      return;
+    }
+    const priceParsed = parseFiniteNumber(req.body.price, "price");
+    if (!priceParsed.ok || priceParsed.value <= 0) {
+      res.status(400).json({ error: "Manual trade override rejected", details: `Request field "price" must be a positive finite number.` });
+      return;
+    }
+    const requestedQty: number = qtyParsed.value;
+    const price: number = priceParsed.value;
+
+    let qty: number = requestedQty;
+    let clamp: { requestedQty: number; approvedQty: number; capsApplied: string[] } | undefined;
+
+    // Task 12 (docs/GO_LIVE_PLAN.md Phase 1.4, "Route every buy path through
+    // sizing"): a manual BUY is clamped to the same per-position/exposure/
+    // buying-power/max-notional caps the automation path (/api/sync) uses, via
+    // the computeCapRoom helper shared with sizingEngine.ts's sizeTradeIntent --
+    // no forked math. Deliberately skips sizeTradeIntent's confidence/stop-
+    // distance/regime multipliers: those scale down for automated *signal
+    // quality*, which has no meaning for a human's explicit order. SELLs are
+    // de-risking and stay unrestricted by these caps (unchanged).
+    if (side === "buy") {
+      const brokerConfig = getBrokerConfig();
+      const portfolio = await getAlpacaPortfolio(brokerConfig);
+      const portfolioAssessment = assessPortfolio({
+        account: portfolio,
+        positions: portfolio.positions || [],
+        openOrders: await getAlpacaOpenOrders(brokerConfig),
+        source: brokerConfig.configured ? "alpaca" : "local_simulated_snapshot",
+      });
+      const parsedPortfolioValue = Number(portfolio.portfolio_value);
+      if (!Number.isFinite(parsedPortfolioValue) || parsedPortfolioValue <= 0) {
+        addLog("error", `Manual override BUY rejected for ${symbol}. Portfolio value is not a finite number; failing closed.`);
+        writeDB(db);
+        res.status(422).json({ error: "Manual trade override rejected", details: "Portfolio value is not a finite number; failing closed." });
+        return;
+      }
+      // Same wiring as the automation buy path in /api/sync: max-notional-per-trade
+      // is maxPositionSizePercent of total portfolio value, not equity.
+      const maxNotionalPerTrade = parsedPortfolioValue * (currentConfig.system.maxPositionSizePercent / 100);
+
+      const capRoom = computeCapRoom({
+        portfolio: portfolioAssessment,
+        symbol,
+        limits: {
+          maxSinglePositionPercent: currentConfig.system.maxPositionSizePercent,
+          maxPortfolioExposurePercent: riskLimits.maxPortfolioExposurePercent,
+          maxNotionalPerTrade,
+          minBuyingPowerAfterTrade: riskLimits.minBuyingPower,
+        },
+      });
+      const capQty = capRoomToQty(capRoom.allowedNotional, price);
+
+      if (capQty <= 0) {
+        const capNames = capRoom.capsApplied.join(", ") || "no room remaining";
+        addLog("error", `Manual override BUY rejected for ${symbol}. No executable quantity remains under cap(s): ${capNames}.`);
+        writeDB(db);
+        res.status(422).json({
+          error: "Manual trade override rejected",
+          details: `No executable quantity remains under cap(s): ${capNames}.`,
+          capsApplied: capRoom.capsApplied,
+        });
+        return;
+      }
+
+      if (capQty < requestedQty) {
+        qty = capQty;
+        clamp = { requestedQty, approvedQty: capQty, capsApplied: capRoom.capsApplied };
+        addLog("override", `Manual override BUY for ${symbol} clamped from ${requestedQty} to ${capQty} shares (cap: ${capRoom.capsApplied.join(", ")}).`);
+        appendAuditEvents(db, [{
+          id: `ae-override-clamp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          type: "risk",
+          actor: "ui",
+          message: `Manual override BUY for ${symbol} clamped from ${requestedQty} to ${capQty} shares by cap(s): ${capRoom.capsApplied.join(", ")}.`,
+          details: { symbol, requestedQty, approvedQty: capQty, capsApplied: capRoom.capsApplied },
+        }]);
+      }
+    }
+
     addLog("override", `Manual Override Triggered: Place market order: ${side.toUpperCase()} ${qty} ${symbol}`);
 
     const tradeVal = await executeTradeIntent({
@@ -1362,10 +1979,12 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
       request: {
         source: "manual",
         symbol,
-        qty: Number(qty),
-        estimatedPrice: Number(price),
+        qty,
+        estimatedPrice: price,
         side,
-        reasoning: "Manual trader override dispatched from dashboard control deck.",
+        reasoning: clamp
+          ? `Manual trader override dispatched from dashboard control deck. Requested ${clamp.requestedQty}, clamped to ${clamp.approvedQty} by cap(s): ${clamp.capsApplied.join(", ")}.`
+          : "Manual trader override dispatched from dashboard control deck.",
         actor: "ui",
       },
     });
@@ -1375,12 +1994,15 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     tradeVal.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgMsg);
     tradeVal.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, tradeVal);
 
+    // Intentionally NOT deduped by client_order_id: this legacy JSON trades log is an
+    // append-only per-attempt record (UI history, daily trade counting); the SQLite
+    // trade_intents store is the deduped source of truth for reconciliation (Task 13).
     db.trades.unshift(tradeVal);
 
     if (!getBrokerConfig().configured && tradeVal.status !== "BrokerFailed" && tradeVal.status !== "RiskRejected") {
       const currentSim = db.simulatedPortfolio;
       const existingPos = currentSim.positions.find((p: any) => p.symbol === symbol);
-      const sharesCost = parseFloat(String(qty)) * parseFloat(String(price));
+      const sharesCost = qty * price;
 
       if (side === "buy") {
         if (existingPos) {
@@ -1420,7 +2042,7 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     }
 
     writeDB(db);
-    res.json({ success: true, trade: tradeVal });
+    res.json({ success: true, trade: tradeVal, ...(clamp ? { clamp } : {}) });
   } catch (err: any) {
     console.error("Critical error in /api/override/trade:", err);
     res.status(500).json({ error: "Manual trade override failed", details: err.message });

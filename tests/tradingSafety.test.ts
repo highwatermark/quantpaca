@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildBrokerConfigFromEnv,
+  deriveClientOrderId,
   redactConfigForClient,
   submitTradeThroughPipeline,
   validateSymbol,
@@ -163,6 +164,127 @@ test("unknown or missing risk status never reaches the broker", async () => {
     assert.equal(brokerCalled, false, `broker was called for status ${String(status)}`);
     assert.equal(result.trade.status, "RiskRejected");
   }
+});
+
+test("Task 13: client_order_id derivation is deterministic, distinct per intent, and Alpaca-safe", () => {
+  const base = { symbol: "AAPL", side: "buy", qty: 10, source: "manual", date: "2026-07-12" };
+  const id1 = deriveClientOrderId(base);
+  const id2 = deriveClientOrderId({ ...base });
+  assert.equal(id1, id2, "same intent content must derive the same client_order_id");
+
+  assert.match(id1, /^qp-[0-9a-f]{64}$/, "expected a qp- prefixed 64-char hex digest");
+  assert.ok(id1.length <= 128, "client_order_id must fit Alpaca's 128-char limit");
+
+  const variants = [
+    { ...base, qty: 11 },
+    { ...base, side: "sell" },
+    { ...base, symbol: "MSFT" },
+    { ...base, source: "automation" },
+    { ...base, date: "2026-07-13" },
+  ];
+  for (const variant of variants) {
+    assert.notEqual(deriveClientOrderId(variant), id1, `expected a different id for ${JSON.stringify(variant)}`);
+  }
+});
+
+test("Task 13: submitTradeThroughPipeline derives a client_order_id, attaches it to the trade, and passes the SAME id to brokerSubmit", async () => {
+  let receivedClientOrderId: string | undefined;
+  const result = await submitTradeThroughPipeline({
+    request: {
+      source: "manual",
+      symbol: "PLTR",
+      side: "buy",
+      qty: 5,
+      estimatedPrice: 20,
+      reasoning: "test",
+    },
+    brokerConfig: buildBrokerConfigFromEnv({ TRADING_MODE: "paper" }),
+    riskDecision: { status: "approved", reason: "test approval" },
+    exitPlan: {
+      initialStopLossPrice: 18,
+      takeProfitPrice: 24,
+      timeExitAt: "2026-06-30T20:00:00.000Z",
+      thesisInvalidation: "invalidated",
+      regimeChangeAction: "close",
+      emergencyAction: "market_sell",
+    },
+    brokerSubmit: async (clientOrderId: string) => {
+      receivedClientOrderId = clientOrderId;
+      return { id: "broker-1", status: "accepted" };
+    },
+    now: () => new Date("2026-07-12T10:00:00.000Z"),
+  });
+
+  assert.ok(result.trade.clientOrderId, "expected the trade to carry a clientOrderId");
+  assert.match(result.trade.clientOrderId!, /^qp-[0-9a-f]{64}$/);
+  assert.equal(receivedClientOrderId, result.trade.clientOrderId, "brokerSubmit must receive the same id recorded on the trade");
+
+  const expected = deriveClientOrderId({ symbol: "PLTR", side: "buy", qty: 5, source: "manual", date: "2026-07-12" });
+  assert.equal(result.trade.clientOrderId, expected);
+});
+
+test("Task 13: resubmitting the same intent on the same day derives the identical client_order_id", async () => {
+  const submit = () =>
+    submitTradeThroughPipeline({
+      request: {
+        source: "manual",
+        symbol: "PLTR",
+        side: "buy",
+        qty: 5,
+        estimatedPrice: 20,
+        reasoning: "retry",
+      },
+      brokerConfig: buildBrokerConfigFromEnv({ TRADING_MODE: "paper" }),
+      riskDecision: { status: "approved", reason: "test approval" },
+      exitPlan: {
+        initialStopLossPrice: 18,
+        takeProfitPrice: 24,
+        timeExitAt: "2026-06-30T20:00:00.000Z",
+        thesisInvalidation: "invalidated",
+        regimeChangeAction: "close",
+        emergencyAction: "market_sell",
+      },
+      brokerSubmit: async () => ({ id: "broker-1", status: "accepted" }),
+      now: () => new Date("2026-07-12T10:00:00.000Z"),
+    });
+
+  const first = await submit();
+  const second = await submit();
+  assert.equal(
+    first.trade.clientOrderId,
+    second.trade.clientOrderId,
+    "a same-day resubmission of the same intent must derive the same client_order_id",
+  );
+});
+
+test("Task 13: dry-run (unconfigured broker) still carries a client_order_id on the trade", async () => {
+  const result = await submitTradeThroughPipeline({
+    request: {
+      source: "manual",
+      symbol: "PLTR",
+      side: "buy",
+      qty: 1,
+      estimatedPrice: 20,
+      reasoning: "dry run",
+    },
+    brokerConfig: buildBrokerConfigFromEnv({ TRADING_MODE: "paper" }), // unconfigured: no ALPACA_API_KEY/SECRET
+    riskDecision: { status: "approved", reason: "test approval" },
+    exitPlan: {
+      initialStopLossPrice: 18,
+      takeProfitPrice: 24,
+      timeExitAt: "2026-06-30T20:00:00.000Z",
+      thesisInvalidation: "invalidated",
+      regimeChangeAction: "close",
+      emergencyAction: "market_sell",
+    },
+    brokerSubmit: async (clientOrderId: string) => ({
+      id: "dry-run-1",
+      status: "accepted",
+      client_order_id: clientOrderId,
+    }),
+  });
+
+  assert.ok(result.trade.clientOrderId, "expected the dry-run trade to carry a clientOrderId for consistency with the live path");
 });
 
 test("config responses do not expose broker secrets", () => {

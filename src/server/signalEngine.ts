@@ -8,6 +8,17 @@ type RawSignalInput = {
   sourceTimestamp: string;
   symbol: string;
   thesis: string;
+  // Fingerprinted for the dedup key (via normalizedThesisHash) INSTEAD of `thesis`
+  // when supplied. Exists because `thesis` can be an LLM's free-text re-analysis
+  // of a source, and that wording can drift between separate analyses of the
+  // exact same underlying source (Finding I1: re-syncing the same email produces
+  // new wording each time, which hashed a different value and defeated dedup).
+  // Callers with a genuinely stable piece of content to hash (e.g. the raw
+  // ingested email body, unchanged across re-syncs of the same message) should
+  // pass it here; `thesis` itself keeps describing the signal for display/
+  // classification. Defaults to `thesis` when omitted, so existing callers are
+  // unaffected.
+  dedupContent?: string;
   url?: string;
   aiConfidence?: number;
 };
@@ -20,6 +31,7 @@ type ReviewOptions = {
 
 export function createRawSignal(input: RawSignalInput): RawSignal {
   const thesis = String(input.thesis || "").trim();
+  const dedupContent = String((input.dedupContent ?? input.thesis) || "").trim();
   return {
     id: `raw-${hash([input.source, input.sourceId, input.symbol, input.sourceTimestamp, thesis].join("|")).slice(0, 12)}`,
     source: input.source,
@@ -27,7 +39,7 @@ export function createRawSignal(input: RawSignalInput): RawSignal {
     sourceTimestamp: input.sourceTimestamp,
     symbol: String(input.symbol || "").trim().toUpperCase(),
     thesis,
-    normalizedThesisHash: hash(normalizeThesis(thesis)),
+    normalizedThesisHash: hash(normalizeThesis(dedupContent)),
     url: input.url,
     aiConfidence: input.aiConfidence,
   };
@@ -38,11 +50,26 @@ export function reviewSignals(rawSignals: RawSignal[], options: ReviewOptions = 
   return rawSignals.map((signal) => reviewSignal(signal, { ...options, seenKeys }));
 }
 
+/**
+ * The dedup key used to detect a previously-seen signal. Deliberately excludes
+ * sourceTimestamp -- it is volatile (re-stamped per sync run) and must not defeat
+ * dedup. Exported so callers that persist reviewed signals (e.g. signalReviewStep)
+ * can compute and store the same key rather than duplicating this derivation.
+ */
+export function computeDuplicateKey(rawSignal: RawSignal): string {
+  const symbolValidation = validateSymbol(rawSignal.symbol);
+  return buildDuplicateKey(rawSignal, symbolValidation.normalized || rawSignal.symbol);
+}
+
+function buildDuplicateKey(rawSignal: RawSignal, normalizedSymbol: string): string {
+  return [rawSignal.source, rawSignal.sourceId, normalizedSymbol, rawSignal.normalizedThesisHash].join("|");
+}
+
 export function reviewSignal(rawSignal: RawSignal, options: ReviewOptions = {}): ReviewedSignal {
   const now = options.now || new Date();
   const maxAgeHours = options.maxAgeHours || 72;
   const symbolValidation = validateSymbol(rawSignal.symbol);
-  const duplicateKey = [rawSignal.source, rawSignal.sourceId, symbolValidation.normalized || rawSignal.symbol, rawSignal.normalizedThesisHash].join("|");
+  const duplicateKey = buildDuplicateKey(rawSignal, symbolValidation.normalized || rawSignal.symbol);
   const sourceTime = Date.parse(rawSignal.sourceTimestamp);
   const ageHours = Number.isFinite(sourceTime) ? (now.getTime() - sourceTime) / 36e5 : Infinity;
   const confidenceScore = normalizeConfidence(rawSignal);

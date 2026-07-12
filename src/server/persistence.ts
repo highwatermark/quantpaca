@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync as NodeDatabaseSync } from "node:sqlite";
-import { AuditEvent, PipelineTrade } from "./tradingSafety";
+import { AuditEvent, ExitPlan, PipelineTrade } from "./tradingSafety";
 import { ReconciliationReport, RegimeAssessment, ReviewedSignal, SizedTradeIntent } from "./domainTypes";
 
 type DatabaseSync = {
@@ -17,20 +17,48 @@ type DatabaseSync = {
 export type ProductionStore = {
   appendAuditEvents(events: AuditEvent[]): void;
   listAuditEvents(limit?: number): AuditEvent[];
-  saveReviewedSignal(signal: ReviewedSignal): void;
+  saveReviewedSignal(signal: ReviewedSignal, duplicateKey?: string): void;
   listReviewedSignals(limit?: number): ReviewedSignal[];
+  loadRecentDuplicateKeys(limit?: number): Set<string>;
   saveRegimeAssessment(regime: RegimeAssessment): void;
   latestRegimeAssessment(): RegimeAssessment | undefined;
   saveTradeIntent(trade: PipelineTrade): void;
   listTradeIntents(limit?: number): PipelineTrade[];
+  // Task 13 (idempotent orders): the local-trade half of the client_order_id ->
+  // broker order mapping. Lets a resubmission of the same intent (same
+  // client_order_id) find the trade record its earlier attempt already created,
+  // so the caller can overwrite that row in place instead of inserting a second
+  // local trade for what Alpaca itself will treat as one broker order.
+  findTradeIntentByClientOrderId(clientOrderId: string): PipelineTrade | undefined;
   saveRiskDecision(tradeId: string, decision: unknown): void;
   listRiskDecisions(limit?: number): unknown[];
   saveExitPlan(tradeId: string, exitPlan: unknown): void;
   listExitPlans(limit?: number): unknown[];
+  // Most recent exit plan whose owning trade was a BUY on `symbol` -- the plan that
+  // protects a currently-open long position. Only BUY-originated plans qualify: a
+  // plan attached to a SELL trade describes closing/reducing a position, not
+  // protecting one, and would carry inverted stop/take-profit multipliers if
+  // reused to evaluate a still-open long. Undefined if no such plan exists (e.g.
+  // a manual buy or pre-existing position that predates exit-plan persistence).
+  // `tradeId` and `highWaterMark` support the trailing stop (Task 7): tradeId
+  // lets the caller persist a ratcheted HWM back via updateHighWaterMark;
+  // highWaterMark is the raw persisted value (undefined if never seeded/set).
+  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan; tradeId: string; highWaterMark?: number } | undefined;
+  // Ratchets the persisted high-water mark for the exit plan owned by `tradeId`.
+  // Callers are expected to only invoke this with a value already confirmed to
+  // be higher than the previous one (see exitMonitor.ts) -- this method itself
+  // performs an unconditional write, it does not re-check monotonicity.
+  updateHighWaterMark(tradeId: string, highWaterMark: number): void;
   saveReconciliationReport(report: ReconciliationReport): void;
   latestReconciliationReport(): ReconciliationReport | undefined;
+  // `state` also carries whatever the caller wants latched/round-tripped through
+  // latestBreakerState (Task 10: peakEquity high-water mark, and now `latch` --
+  // the persisted BreakerLatchState from src/server/breakerLatch.ts). Payload is
+  // opaque JSON here; no schema migration needed to add fields.
   saveBreakerState(state: { asOf: string; status: string }): void;
   latestBreakerState<T = unknown>(): T | undefined;
+  saveCooldown(entry: { symbol: string; expiresAt: string; reason: string }): void;
+  listActiveCooldownSymbols(nowIso: string): string[];
   close(): void;
 };
 
@@ -53,6 +81,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     CREATE TABLE IF NOT EXISTS reviewed_signals (
       id TEXT PRIMARY KEY,
       timestamp TEXT NOT NULL,
+      duplicate_key TEXT,
       payload_json TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS regime_assessments (
@@ -65,6 +94,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       timestamp TEXT NOT NULL,
       symbol TEXT NOT NULL,
       status TEXT NOT NULL,
+      client_order_id TEXT,
       payload_json TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS risk_decisions (
@@ -91,7 +121,40 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       status TEXT NOT NULL,
       payload_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS symbol_cooldowns (
+      symbol TEXT PRIMARY KEY,
+      expires_at TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
+
+  // Backfill-safe migration: databases created before this column existed won't
+  // have it, and CREATE TABLE IF NOT EXISTS above is a no-op against them.
+  const reviewedSignalsColumns = db.prepare("PRAGMA table_info(reviewed_signals)").all();
+  const hasDuplicateKeyColumn = reviewedSignalsColumns.some((col) => col.name === "duplicate_key");
+  if (!hasDuplicateKeyColumn) {
+    db.exec("ALTER TABLE reviewed_signals ADD COLUMN duplicate_key TEXT");
+  }
+
+  // Backfill-safe migration (Task 7, trailing stop): exit_plans rows created
+  // before this column existed won't have it, and CREATE TABLE IF NOT EXISTS
+  // above is a no-op against them.
+  const exitPlansColumns = db.prepare("PRAGMA table_info(exit_plans)").all();
+  const hasHighWaterMarkColumn = exitPlansColumns.some((col) => col.name === "high_water_mark");
+  if (!hasHighWaterMarkColumn) {
+    db.exec("ALTER TABLE exit_plans ADD COLUMN high_water_mark REAL");
+  }
+
+  // Backfill-safe migration (Task 13, idempotent orders): trade_intents rows
+  // created before this column existed won't have it, and CREATE TABLE IF NOT
+  // EXISTS above is a no-op against them.
+  const tradeIntentsColumns = db.prepare("PRAGMA table_info(trade_intents)").all();
+  const hasClientOrderIdColumn = tradeIntentsColumns.some((col) => col.name === "client_order_id");
+  if (!hasClientOrderIdColumn) {
+    db.exec("ALTER TABLE trade_intents ADD COLUMN client_order_id TEXT");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_trade_intents_client_order_id ON trade_intents(client_order_id)");
 
   return {
     appendAuditEvents(events) {
@@ -127,12 +190,18 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         details: row.details_json ? JSON.parse(String(row.details_json)) : undefined,
       }));
     },
-    saveReviewedSignal(signal) {
-      db.prepare("INSERT OR REPLACE INTO reviewed_signals (id, timestamp, payload_json) VALUES (?, ?, ?)")
-        .run(signal.id, signal.sourceTimestamp, JSON.stringify(signal));
+    saveReviewedSignal(signal, duplicateKey) {
+      db.prepare("INSERT OR REPLACE INTO reviewed_signals (id, timestamp, duplicate_key, payload_json) VALUES (?, ?, ?, ?)")
+        .run(signal.id, signal.sourceTimestamp, duplicateKey || null, JSON.stringify(signal));
     },
     listReviewedSignals(limit = 250) {
       return rowsToPayloads<ReviewedSignal>(db.prepare("SELECT payload_json FROM reviewed_signals ORDER BY timestamp DESC LIMIT ?").all(limit));
+    },
+    loadRecentDuplicateKeys(limit = 1000) {
+      const rows = db.prepare(
+        "SELECT duplicate_key FROM reviewed_signals WHERE duplicate_key IS NOT NULL ORDER BY timestamp DESC LIMIT ?",
+      ).all(limit);
+      return new Set(rows.map((row) => String(row.duplicate_key)));
     },
     saveRegimeAssessment(regime) {
       db.prepare("INSERT OR REPLACE INTO regime_assessments (id, timestamp, payload_json) VALUES (?, ?, ?)")
@@ -142,11 +211,16 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       return rowToPayload<RegimeAssessment>(db.prepare("SELECT payload_json FROM regime_assessments ORDER BY timestamp DESC LIMIT 1").get());
     },
     saveTradeIntent(trade) {
-      db.prepare("INSERT OR REPLACE INTO trade_intents (id, timestamp, symbol, status, payload_json) VALUES (?, ?, ?, ?, ?)")
-        .run(trade.id, trade.timestamp, trade.symbol, trade.status, JSON.stringify(trade));
+      db.prepare("INSERT OR REPLACE INTO trade_intents (id, timestamp, symbol, status, client_order_id, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(trade.id, trade.timestamp, trade.symbol, trade.status, trade.clientOrderId || null, JSON.stringify(trade));
     },
     listTradeIntents(limit = 250) {
       return rowsToPayloads<PipelineTrade>(db.prepare("SELECT payload_json FROM trade_intents ORDER BY timestamp DESC LIMIT ?").all(limit));
+    },
+    findTradeIntentByClientOrderId(clientOrderId) {
+      return rowToPayload<PipelineTrade>(
+        db.prepare("SELECT payload_json FROM trade_intents WHERE client_order_id = ? ORDER BY timestamp DESC LIMIT 1").get(clientOrderId),
+      );
     },
     saveRiskDecision(tradeId, decision) {
       db.prepare("INSERT OR REPLACE INTO risk_decisions (id, timestamp, trade_id, payload_json) VALUES (?, ?, ?, ?)")
@@ -156,11 +230,50 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       return rowsToPayloads(db.prepare("SELECT payload_json FROM risk_decisions ORDER BY timestamp DESC LIMIT ?").all(limit));
     },
     saveExitPlan(tradeId, exitPlan) {
-      db.prepare("INSERT OR REPLACE INTO exit_plans (id, timestamp, trade_id, payload_json) VALUES (?, ?, ?, ?)")
-        .run(`exit-${tradeId}`, new Date().toISOString(), tradeId, JSON.stringify({ tradeId, exitPlan }));
+      // Seed the high-water mark at the plan's entryPrice, if the plan carries
+      // one (Task 7, trailing stop). This is what lets the very first
+      // monitoring cycle already have a real HWM to ratchet from, rather than
+      // requiring a second cycle to "discover" one. Plans without an
+      // entryPrice (predating this feature, or constructed directly in tests)
+      // seed NULL -- exitMonitor.ts treats that as "no trailing this cycle",
+      // never as zero/garbage.
+      const entryPrice = (exitPlan as { entryPrice?: unknown } | null | undefined)?.entryPrice;
+      const seedHighWaterMark = typeof entryPrice === "number" && Number.isFinite(entryPrice) ? entryPrice : null;
+      db.prepare("INSERT OR REPLACE INTO exit_plans (id, timestamp, trade_id, payload_json, high_water_mark) VALUES (?, ?, ?, ?, ?)")
+        .run(`exit-${tradeId}`, new Date().toISOString(), tradeId, JSON.stringify({ tradeId, exitPlan }), seedHighWaterMark);
     },
     listExitPlans(limit = 250) {
       return rowsToPayloads(db.prepare("SELECT payload_json FROM exit_plans ORDER BY timestamp DESC LIMIT ?").all(limit));
+    },
+    latestBuySideExitPlanForSymbol(symbol) {
+      // Recent-first scan over this symbol's exit plans (joined to the owning
+      // trade for its symbol/side), picking the first one whose trade was a
+      // BUY. Bounded scan (50) rather than a single most-recent row, since the
+      // single most-recent trade for an open symbol could be a partial SELL.
+      const rows = db.prepare(`
+        SELECT ep.trade_id AS trade_id, ep.payload_json AS exit_payload, ep.high_water_mark AS high_water_mark, ti.payload_json AS trade_payload
+        FROM exit_plans ep
+        JOIN trade_intents ti ON ep.trade_id = ti.id
+        WHERE ti.symbol = ?
+        ORDER BY ep.timestamp DESC
+        LIMIT 50
+      `).all(symbol);
+      for (const row of rows) {
+        const tradePayload = JSON.parse(String(row.trade_payload)) as { side?: "buy" | "sell" };
+        if (tradePayload.side !== "buy") continue;
+        const exitPayload = JSON.parse(String(row.exit_payload)) as { exitPlan?: ExitPlan };
+        if (!exitPayload.exitPlan) continue;
+        return {
+          side: "buy" as const,
+          exitPlan: exitPayload.exitPlan,
+          tradeId: String(row.trade_id),
+          highWaterMark: typeof row.high_water_mark === "number" ? row.high_water_mark : undefined,
+        };
+      }
+      return undefined;
+    },
+    updateHighWaterMark(tradeId, highWaterMark) {
+      db.prepare("UPDATE exit_plans SET high_water_mark = ? WHERE trade_id = ?").run(highWaterMark, tradeId);
     },
     saveReconciliationReport(report) {
       db.prepare("INSERT OR REPLACE INTO reconciliation_reports (id, timestamp, status, payload_json) VALUES (?, ?, ?, ?)")
@@ -175,6 +288,19 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     },
     latestBreakerState() {
       return rowToPayload(db.prepare("SELECT payload_json FROM breaker_states ORDER BY timestamp DESC LIMIT 1").get());
+    },
+    saveCooldown(entry) {
+      const now = new Date().toISOString();
+      // Opportunistic cleanup: drop rows that are already expired instead of letting the
+      // table grow forever. No background job needed — reads already filter by expiresAt,
+      // this just keeps the table small on the write path we already have open.
+      db.prepare("DELETE FROM symbol_cooldowns WHERE expires_at <= ?").run(now);
+      db.prepare("INSERT OR REPLACE INTO symbol_cooldowns (symbol, expires_at, reason, updated_at) VALUES (?, ?, ?, ?)")
+        .run(entry.symbol, entry.expiresAt, entry.reason, now);
+    },
+    listActiveCooldownSymbols(nowIso) {
+      const rows = db.prepare("SELECT symbol FROM symbol_cooldowns WHERE expires_at > ?").all(nowIso);
+      return rows.map((row) => String(row.symbol));
     },
     close() {
       db.close();

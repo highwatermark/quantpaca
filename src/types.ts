@@ -47,6 +47,11 @@ export interface StockAnalysis {
   riskProfile: 'Low' | 'Medium' | 'High';
   reasoning: string;
   whipsawCheck: string; // Explains whether whipsaw or genuine trend reversal
+  // Structured verdict the signal engine gates SELLs on and haircuts BUY confidence
+  // for (see src/server/whipsawGate.ts). Optional: rows persisted before this field
+  // existed won't have it -- any code reading it back must treat a missing value as
+  // "unclear" (the same fail-closed default normalizeWhipsawVerdict applies).
+  whipsawVerdict?: 'whipsaw' | 'reversal' | 'unclear';
   decision: 'BUY' | 'SELL' | 'HOLD' | 'NONE';
   timestamp: string;
 }
