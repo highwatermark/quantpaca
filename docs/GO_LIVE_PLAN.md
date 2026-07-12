@@ -133,11 +133,11 @@ The engines are good; the monolithic `server.ts` bypasses them. Fix the wiring.
 ### 1.4 Risk-gate corrections
 - [x] **Latch the breaker.** Once tripped, `block_new_buys`/`close_only` persists until explicit admin reset (Telegram command + admin API route), regardless of equity recovery (`breakerEngine.ts`, state persisted via `saveBreakerState`).
   *Accept:* test — equity dips past threshold then recovers; buys remain blocked until reset is called.
-- [ ] **Fix the portfolio exposure cap.** Replace the hardcoded `100` (`server.ts:1223`) with an env limit (`QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT`, default 60), loaded once at boot like the others in `riskLimits.ts`.
+- [x] **Fix the portfolio exposure cap.** Replace the hardcoded `100` (`server.ts:1223`) with an env limit (`QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT`, default 60), loaded once at boot like the others in `riskLimits.ts`.
   *Accept:* sizing rejects/shrinks when aggregate exposure would exceed the cap; parse test in `riskLimits.test.ts` style.
-- [ ] **Route every buy path through sizing.** Manual override (`server.ts:1357`) must go through `sizeTradeIntent` (or at minimum enforce the same per-position/exposure caps).
+- [x] **Route every buy path through sizing.** Manual override (`server.ts:1357`) must go through `sizeTradeIntent` (or at minimum enforce the same per-position/exposure caps).
   *Accept:* manual override of an oversized qty is clamped/rejected — test proves it.
-- [ ] **Idempotent orders.** Send a deterministic `client_order_id` (hash of intent id) on every Alpaca order (`server.ts:378-384`).
+- [x] **Idempotent orders.** Send a deterministic `client_order_id` (hash of intent id) on every Alpaca order (`server.ts:378-384`).
   *Accept:* resubmitting the same intent cannot create a second broker order (mock-Alpaca test).
 
 **Phase 1 exit criteria:** all boxes checked, `npm run lint && npm test` green, and a
@@ -248,3 +248,71 @@ Portfolio optimization (target weights, rebalancing, correlation/sector limits b
 exposure cap), Track 3 self-learning loops, options/short strategies, additional signal
 sources beyond the registry above. These are explicitly deferred — do not build them
 during Phases 1–3.
+
+---
+
+## Phase 1 completion report (2026-07-12, branch `phase1-wiring-fixes`, HEAD `e86c93b`)
+
+**Status: all 14 Phase 1 checkboxes complete.** 20 commits, 49 → 185 tests, `npm run lint
+&& npm test` green (verified independently at HEAD). Every task went through a fresh
+implementer, an adversarial spec+quality review, and fix/re-review loops; a final
+whole-branch review (verdict: "Ready to merge") caught and fixed two cross-task defects
+no per-task review could see.
+
+**Exit-criteria verification (mix of live sync + integration tests):**
+- *Real regime mode recorded* — ✅ LIVE: manual paper sync persisted `risk_on / allow /
+  0.8×` with real inputs (SPY trend +0.87%, QQQ +2.48%, drawdown −1.69%, realized vol
+  18.1%, BTC −12.8%).
+- *Exit plan evaluated in the loop* — ✅ LIVE: the risk evaluator ran plan evaluation in
+  the sync cycle (no open positions, so no exits fired); each exit type (take-profit,
+  time, plan-stop, trailing, regime-change, legacy fallback) proven by integration tests
+  through the real `/api/sync` path.
+- *Dedup rejection on re-sync* — ✅ by integration tests (incl. same-email +
+  different-LLM-wording case); ⚠️ NOT demonstrable live: no real Gmail OAuth token
+  exists (`googleAuth.ts` is still a mock). Re-demonstrate live once Gmail OAuth is real.
+- Also live-demonstrated: honest zero-signal degradation with Gmail absent (zero
+  fabricated targets, logged), Claude analysis HOLD → no trade. Zero broker orders
+  placed during all demonstration syncs; `autoTrading` restored to `false`.
+
+**Live-sync discoveries (found only because the plan mandated a real sync):**
+1. Daily-bars fetch omitted `start` → Alpaca returns `bars: null` on weekends/holidays →
+   regime permanently degraded. Fixed (`e86c93b`) + regression tests.
+2. Final-review finding M1 confirmed live: a failed fetch caches the conservative default
+   with `asOf = now`, suppressing retry for 30 min, while a successful fetch stamps
+   `asOf` from the newest daily bar (usually > 30 min) so the cache rarely engages on
+   success. Both directions fail safe. **Fix folded into Phase 2.1's first task.**
+
+**Schema migrations shipped (guardrail 5 disclosure):** `reviewed_signals.duplicate_key`
+(+ dedup persistence), `exit_plans.high_water_mark`, `trade_intents.client_order_id`
+(+ index), new `symbol_cooldowns` table. All PRAGMA-guarded, safe on fresh and existing
+DBs. New env vars: `QUANTPACA_SYMBOL_COOLDOWN_HOURS` (default 24, 0 disables),
+`QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT` (default 60). No new dependencies.
+
+**Decisions requiring explicit human sign-off (do not start Phase 2 without reading):**
+1. *(Carried from Track 0/1, made while you were AFK)* `dailyLoss` metric is required for
+   BUYs but optional for SELLs in the risk engine — degraded broker data can't block a
+   de-risking sell. Confirm or reverse.
+2. *client_order_id derivation* is a content hash (`symbol|side|qty|source|day`) because
+   no stable intent id exists — two legitimately different same-day trades with identical
+   params would silently dedupe. Mostly masked by the 24h cooldown; replace with a stable
+   signal id in Phase 2. Sign off before live.
+3. *Sell trades also record a cooldown* — after a take-profit exit, a legitimate same-day
+   re-entry BUY on that symbol is blocked for 24h (judged desirable anti-whipsaw; your
+   call).
+4. *Manual-override buys* are clamped by hard caps and blocked by a latched breaker, but
+   NOT by regime `close_only` (deliberate: caps yes, signal-quality gating of human
+   orders no). Confirm the asymmetry or ask for the gate in Phase 2.
+5. *Alpaca duplicate-order error wording* is inferred from docs, not yet observed against
+   a real paper duplicate; verify during Phase 2.2 order-lifecycle work.
+
+**Deferred to Phase 2 (agreed by final review):** M1 asOf semantics (→ 2.1 scheduler
+task); daily-trade-cap currently also blocks protective sells once hit (→ 2.2 brackets);
+Telegram alert fires on every empty sync — must fix before the 15-min scheduler or it's
+~96 alerts/day (→ 2.1); HWM re-seed on successful same-day resubmission (→ 2.2);
+thesis-invalidation exit reason has no live signal source until Phase 2.4's Burry
+mapping (regime-change source is live as of Task 9).
+
+**Branch decision needed:** `phase1-wiring-fixes` is ready to merge to `main` per the
+final review. Options: (a) merge locally, (b) open a PR for your own review first,
+(c) hold. The executor stopped here per guardrail 1 — Phase 2 begins only after your
+sign-off.
