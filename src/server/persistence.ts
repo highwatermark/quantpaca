@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync as NodeDatabaseSync } from "node:sqlite";
-import { AuditEvent, ExitPlan, PipelineTrade } from "./tradingSafety";
+import { AuditEvent, BROKER_SUCCESS_TRADE_STATUSES, ExitPlan, PipelineTrade, TradeState } from "./tradingSafety";
 import { ReconciliationReport, RegimeAssessment, ReviewedSignal, SizedTradeIntent } from "./domainTypes";
 
 type DatabaseSync = {
@@ -30,6 +30,13 @@ export type ProductionStore = {
   // so the caller can overwrite that row in place instead of inserting a second
   // local trade for what Alpaca itself will treat as one broker order.
   findTradeIntentByClientOrderId(clientOrderId: string): PipelineTrade | undefined;
+  // Task 5 (order-status polling): fetch one trade_intents row by its own id,
+  // full payload. Needed wherever a caller must read-modify-write the COMPLETE
+  // trade record (e.g. cancelBracketLegsBeforeSell's post-422 leg re-poll,
+  // server.ts) -- saveTradeIntent replaces the whole payload_json for that id,
+  // so any partial reconstruction of a trade before resaving it would silently
+  // drop fields. Undefined if no row exists for that id.
+  getTradeIntentById(tradeId: string): PipelineTrade | undefined;
   saveRiskDecision(tradeId: string, decision: unknown): void;
   listRiskDecisions(limit?: number): unknown[];
   saveExitPlan(tradeId: string, exitPlan: unknown): void;
@@ -48,7 +55,35 @@ export type ProductionStore = {
   // lets the exit monitor cancel live broker legs before a software exit
   // sell (see server.ts MODULE 2). Read straight off the same trade payload
   // already joined in here; no extra query.
-  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan; tradeId: string; highWaterMark?: number; legOrderIds?: string[] } | undefined;
+  // `legStates` (Task 5, order-status polling): the same trade's persisted
+  // brokerLegStates map (legId -> last known TradeState), so
+  // cancelBracketLegsBeforeSell (server.ts) can skip a leg it already knows
+  // is terminal without a second query.
+  //
+  // Task 5 / bracket-orders review finding 1: this now filters to trades
+  // whose CURRENT status is in BROKER_SUCCESS_TRADE_STATUSES (Accepted,
+  // PartiallyFilled, Filled) -- the same status-gating pattern Task C1 used
+  // for exit-plan persistence (see server.ts executeTradeIntent), applied
+  // here to the READ side. Before this fix, a BUY trade whose own order later
+  // went terminal in a way that closed the lot without ever becoming a new,
+  // newer-timestamped BUY (e.g. the poller discovers it was actually
+  // Rejected/Canceled after this row was written) could still be picked as
+  // "the" live entry, handing back a stale plan or stale/wrong bracket leg
+  // ids. Filtering on the LIVE current status (trade_intents.status is
+  // updated in place by every saveTradeIntent call, including the poller's)
+  // keeps this answer honest as of the moment it's read.
+  //
+  // Single-lot assumption (documented, not fixed by this task): this method
+  // still returns at most ONE row -- the most recent live BUY -- per symbol.
+  // If a symbol were ever accumulated across multiple concurrently-open lots
+  // (e.g. two separate BUYs before either was sold), this collapses them to
+  // the newest one; the older lot's exit plan/legs would not be returned.
+  // The system currently merges all positions for a symbol into one Alpaca
+  // position and this codebase does not track multiple concurrent lots per
+  // symbol anywhere else either, so this is consistent with the rest of the
+  // system, not a regression -- but it is a real limitation or true per-lot
+  // accounting, which is out of scope here.
+  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan; tradeId: string; highWaterMark?: number; legOrderIds?: string[]; legStates?: Record<string, TradeState> } | undefined;
   // Ratchets the persisted high-water mark for the exit plan owned by `tradeId`.
   // Callers are expected to only invoke this with a value already confirmed to
   // be higher than the previous one (see exitMonitor.ts) -- this method itself
@@ -242,6 +277,9 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         db.prepare("SELECT payload_json FROM trade_intents WHERE client_order_id = ? ORDER BY timestamp DESC LIMIT 1").get(clientOrderId),
       );
     },
+    getTradeIntentById(tradeId) {
+      return rowToPayload<PipelineTrade>(db.prepare("SELECT payload_json FROM trade_intents WHERE id = ?").get(tradeId));
+    },
     saveRiskDecision(tradeId, decision) {
       db.prepare("INSERT OR REPLACE INTO risk_decisions (id, timestamp, trade_id, payload_json) VALUES (?, ?, ?, ?)")
         .run(`risk-${tradeId}`, new Date().toISOString(), tradeId, JSON.stringify({ tradeId, decision }));
@@ -279,19 +317,33 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         LIMIT 50
       `).all(symbol);
       for (const row of rows) {
-        const tradePayload = JSON.parse(String(row.trade_payload)) as { side?: "buy" | "sell"; brokerLegOrderIds?: unknown };
+        const tradePayload = JSON.parse(String(row.trade_payload)) as {
+          side?: "buy" | "sell";
+          status?: string;
+          brokerLegOrderIds?: unknown;
+          brokerLegStates?: Record<string, unknown>;
+        };
         if (tradePayload.side !== "buy") continue;
+        // Task 5 / bracket-orders review finding 1: only a trade whose CURRENT
+        // status still means "reached the broker live" qualifies as the entry
+        // for an open lot -- see the method's doc comment above.
+        if (!tradePayload.status || !BROKER_SUCCESS_TRADE_STATUSES.has(tradePayload.status as TradeState)) continue;
         const exitPayload = JSON.parse(String(row.exit_payload)) as { exitPlan?: ExitPlan };
         if (!exitPayload.exitPlan) continue;
         const legOrderIds = Array.isArray(tradePayload.brokerLegOrderIds)
           ? tradePayload.brokerLegOrderIds.filter((id): id is string => typeof id === "string" && id.length > 0)
           : undefined;
+        const legStates =
+          tradePayload.brokerLegStates && typeof tradePayload.brokerLegStates === "object"
+            ? (tradePayload.brokerLegStates as Record<string, TradeState>)
+            : undefined;
         return {
           side: "buy" as const,
           exitPlan: exitPayload.exitPlan,
           tradeId: String(row.trade_id),
           highWaterMark: typeof row.high_water_mark === "number" ? row.high_water_mark : undefined,
           ...(legOrderIds && legOrderIds.length > 0 ? { legOrderIds } : {}),
+          ...(legStates ? { legStates } : {}),
         };
       }
       return undefined;

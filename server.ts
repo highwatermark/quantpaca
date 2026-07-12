@@ -8,6 +8,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { AppConfig, StockAnalysis, Trade, SyncLog } from "./src/types";
 import {
   AuditEvent,
+  BROKER_SUCCESS_TRADE_STATUSES,
   BrokerConfig,
   buildBrokerConfigFromEnv,
   ExitPlan,
@@ -16,7 +17,14 @@ import {
   stripPersistedSecrets,
   submitTradeThroughPipeline,
   TradeRequest,
+  TradeState,
 } from "./src/server/tradingSafety";
+import {
+  fetchBrokerOrder,
+  applyLegPollResult,
+  isTerminalTradeState,
+  pollPendingOrders,
+} from "./src/server/orderStatusPoller";
 import { createProductionStore } from "./src/server/persistence";
 import { buildBracketLegs, BRACKET_TIME_IN_FORCE, PLAIN_TIME_IN_FORCE } from "./src/server/bracketOrders";
 import { createRawSignal } from "./src/server/signalEngine";
@@ -140,11 +148,8 @@ const BROKER_REACHED_TRADE_STATUSES = new Set([
 // "trade.exitPlan is present". Otherwise a rejected retry/duplicate signal's freshly
 // built (and never-executed) plan can overwrite latestBuySideExitPlanForSymbol's answer
 // for a real, still-open position, silently changing its stop-loss/take-profit/HWM.
-const BROKER_SUCCESS_TRADE_STATUSES = new Set([
-  "Accepted",
-  "PartiallyFilled",
-  "Filled",
-]);
+// (Task 5: moved to tradingSafety.ts so persistence.ts can reuse the same set --
+// see that module's comment.)
 
 const getBrokerConfig = () => buildBrokerConfigFromEnv(process.env);
 
@@ -399,7 +404,21 @@ async function executeTradeIntent(input: {
   // client_order_id dedup collapsed into the SAME broker order -- reuse that
   // earlier local trade's id so saveTradeIntent below overwrites it in place
   // instead of inserting a second local record for one broker order.
-  if (result.trade.clientOrderId) {
+  //
+  // Gated on BROKER_REACHED_TRADE_STATUSES (Task 5): only an attempt that
+  // itself reached the broker is a genuine resubmission of "the same order"
+  // deriveClientOrderId's content hash is meant to reconcile. A RiskRejected
+  // attempt never left this process (e.g. blocked by the symbol cooldown) --
+  // it is NOT the same broker order as an earlier successful attempt that
+  // happens to share the same content hash, and repointing/overwriting the
+  // earlier trade's row with this one's data would silently clobber a live
+  // position's trade record (its brokerOrderId, bracket leg ids, and status)
+  // with a rejected attempt's. Task 5 now reads trade_intents.status as the
+  // live source of truth for "is this still the open lot's entry order"
+  // (latestBuySideExitPlanForSymbol, persistence.ts) and reads/writes whole
+  // trade rows by id (getTradeIntentById) -- both depend on this row never
+  // being clobbered by an unrelated, never-reached-the-broker attempt.
+  if (result.trade.clientOrderId && BROKER_REACHED_TRADE_STATUSES.has(result.trade.status)) {
     try {
       const existing = productionStore.findTradeIntentByClientOrderId(result.trade.clientOrderId);
       if (existing && existing.id !== result.trade.id) {
@@ -760,6 +779,16 @@ async function cancelAlpacaOrder(brokerConfig: BrokerConfig, orderId: string): P
 // disclosure can't be forgotten at a call site. No legs recorded (a plain
 // order, a pre-existing position, or an unconfigured/dry-run broker) is a
 // no-op success: the sell proceeds exactly as it did before Task 4.
+//
+// Task 5 (order-status polling) closes two bracket-orders review findings:
+// 1. The leg lookup now comes from latestBuySideExitPlanForSymbol's
+//    status-filtered query (persistence.ts) -- see that method's doc comment.
+// 2. A leg already known terminal (poller previously recorded it in
+//    brokerLegStates) is SKIPPED, not DELETE-d -- and a 422 "not cancelable"
+//    on a leg still believed live is re-polled ONCE before failing closed: if
+//    the re-poll shows the leg is actually terminal already, the sell
+//    proceeds (nothing left to cancel); if it's still live (or the re-poll
+//    itself fails), this fails closed exactly as before Task 5.
 async function cancelBracketLegsBeforeSell(input: {
   db: any;
   symbol: string;
@@ -770,7 +799,7 @@ async function cancelBracketLegsBeforeSell(input: {
   const brokerConfig = getBrokerConfig();
   if (!brokerConfig.configured) return { ok: true, canceledCount: 0, reason: "" };
 
-  const auditFailure = (message: string, details: Record<string, unknown>) => {
+  const auditNote = (message: string, details: Record<string, unknown>) => {
     appendAuditEvents(input.db, [{
       id: `ae-bracket-cancel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       timestamp: new Date().toISOString(),
@@ -782,12 +811,17 @@ async function cancelBracketLegsBeforeSell(input: {
   };
 
   let legOrderIds: string[] = [];
+  let legStates: Record<string, TradeState> = {};
+  let entryTradeId: string | undefined;
   try {
-    legOrderIds = productionStore.latestBuySideExitPlanForSymbol(input.symbol)?.legOrderIds || [];
+    const record = productionStore.latestBuySideExitPlanForSymbol(input.symbol);
+    legOrderIds = record?.legOrderIds || [];
+    legStates = record?.legStates || {};
+    entryTradeId = record?.tradeId;
   } catch (err: any) {
     const reason = `failed to look up bracket legs for ${input.symbol} (${err?.message || String(err)})`;
     console.error(`[bracket-cancel] ${reason}; skipping this sell.`, err);
-    auditFailure(
+    auditNote(
       `Failed to look up bracket legs for ${input.symbol} before a sell; the sell was SKIPPED. The position may still be covered by broker-native bracket legs.`,
       { symbol: input.symbol, error: err?.message || String(err) },
     );
@@ -796,16 +830,78 @@ async function cancelBracketLegsBeforeSell(input: {
 
   let canceledCount = 0;
   for (const legId of legOrderIds) {
-    const cancelResult = await cancelAlpacaOrder(brokerConfig, legId);
-    if (!cancelResult.ok) {
-      const reason = `failed to cancel bracket leg ${legId} for ${input.symbol}${cancelResult.status ? ` (broker status ${cancelResult.status})` : ""}`;
-      auditFailure(
-        `Failed to cancel bracket leg ${legId} for ${input.symbol} before a sell; the sell was SKIPPED. The position remains protected by its broker-native bracket legs.`,
-        { symbol: input.symbol, legId, status: cancelResult.status },
-      );
-      return { ok: false, canceledCount, reason };
+    if (isTerminalTradeState(legStates[legId])) {
+      // Finding 2: already known terminal from a prior poll -- nothing to
+      // cancel, and DELETE-ing it would only ever come back "not cancelable".
+      continue;
     }
-    canceledCount++;
+
+    const cancelResult = await cancelAlpacaOrder(brokerConfig, legId);
+    if (cancelResult.ok) {
+      canceledCount++;
+      // Record this leg as Canceled now that we know it for certain -- a
+      // successful DELETE is at least as strong evidence of terminal state as
+      // a poll, and recording it here (not waiting for the next poll cycle)
+      // keeps it out of the poller's candidate set going forward instead of
+      // leaving it "not known terminal" indefinitely.
+      if (entryTradeId) {
+        try {
+          const entryTrade = productionStore.getTradeIntentById(entryTradeId);
+          if (entryTrade) {
+            productionStore.saveTradeIntent({
+              ...entryTrade,
+              brokerLegStates: { ...(entryTrade.brokerLegStates || {}), [legId]: "Canceled" },
+            });
+          }
+        } catch (saveErr: any) {
+          console.error(`[bracket-cancel] Failed to persist canceled-leg state for ${legId} (${input.symbol}).`, saveErr);
+        }
+      }
+      continue;
+    }
+
+    if (cancelResult.status === 422 && entryTradeId) {
+      // Finding 2: the broker is telling us this leg can't be canceled --
+      // most likely because it already went terminal (filled, or
+      // OCO-canceled by its sibling leg filling) since we last polled it.
+      // Re-poll ONCE to find out, rather than assuming either way.
+      const poll = await fetchBrokerOrder({ brokerConfig, orderId: legId, fetchImpl: fetch });
+      if (poll.ok) {
+        const entryTrade = productionStore.getTradeIntentById(entryTradeId);
+        if (entryTrade) {
+          const outcome = applyLegPollResult(entryTrade, legId, poll, () => new Date());
+          try {
+            productionStore.saveTradeIntent(outcome.trade);
+          } catch (saveErr: any) {
+            console.error(`[bracket-cancel] Failed to persist re-polled leg state for ${legId} (${input.symbol}).`, saveErr);
+          }
+          if (outcome.auditEvents.length) {
+            appendAuditEvents(input.db, outcome.auditEvents.map((event) => ({
+              id: `ae-bracket-repoll-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: new Date().toISOString(),
+              actor: input.actor,
+              ...event,
+            })));
+          }
+          if (outcome.becameTerminal) {
+            auditNote(
+              `Bracket leg ${legId} for ${input.symbol} was already terminal at the broker (confirmed by re-polling after a 422 "not cancelable" response); proceeding with the sell without a DELETE.`,
+              { symbol: input.symbol, legId, legState: outcome.legMappedState },
+            );
+            continue;
+          }
+        }
+      }
+    }
+
+    // Still live (or the re-poll failed/wasn't applicable) -- fail closed,
+    // same as before Task 5.
+    const reason = `failed to cancel bracket leg ${legId} for ${input.symbol}${cancelResult.status ? ` (broker status ${cancelResult.status})` : ""}`;
+    auditNote(
+      `Failed to cancel bracket leg ${legId} for ${input.symbol} before a sell; the sell was SKIPPED. The position remains protected by its broker-native bracket legs.`,
+      { symbol: input.symbol, legId, status: cancelResult.status },
+    );
+    return { ok: false, canceledCount, reason };
   }
   return { ok: true, canceledCount, reason: "" };
 }
@@ -1575,6 +1671,58 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           console.error("Failed handling outbox element retry:", queueErr.message);
         }
       }
+    }
+
+    // ==========================================================
+    // MODULE 1.5: ORDER-STATUS POLLING (Phase 2 Task 5,
+    // docs/GO_LIVE_PLAN.md Phase 2.2)
+    // Polls every locally non-terminal trade's own order AND every
+    // not-yet-known-terminal bracket leg against the broker (bounded, oldest
+    // first -- see src/server/orderStatusPoller.ts), updating local state
+    // through the existing mapBrokerStatusToTradeState mapping. Runs
+    // unconditionally (not gated on autoTrading, and NOT skipped on a
+    // reduced/market-closed cycle -- unlike the Claude-driven analysis loop
+    // further down) because order-status truth matters every cycle: a
+    // position's bracket legs can fill or a partial fill can go stale
+    // whether or not this cycle places any new trades. Gated only on the
+    // broker actually being configured (pollPendingOrders no-ops otherwise,
+    // same convention as every other Alpaca-calling module in this file).
+    // Runs BEFORE MODULE 2 so that same cycle's exit evaluation and bracket
+    // leg cancellation see the freshest known state.
+    // ==========================================================
+    try {
+      const brokerConfig = getBrokerConfig();
+      if (brokerConfig.configured) {
+        // Bounded window of recent trades to consider as poll candidates.
+        // selectPollTargets itself re-sorts and caps to
+        // MAX_ORDERS_PER_POLL_CYCLE, oldest first, so this window only needs
+        // to be generous enough to contain every currently-open order; 250
+        // matches every other unbounded listTradeIntents call in this file.
+        const candidateTrades = productionStore.listTradeIntents(250);
+        const pollResult = await pollPendingOrders({
+          trades: candidateTrades,
+          brokerConfig,
+          fetchImpl: fetch,
+          cancelOrder: (orderId) => cancelAlpacaOrder(brokerConfig, orderId),
+          saveTrade: (trade) => productionStore.saveTradeIntent(trade),
+        });
+        for (const line of pollResult.logs) addLog("sync", line);
+        for (const line of pollResult.errorLogs) addLog("error", line);
+        if (pollResult.auditEvents.length) {
+          appendAuditEvents(db, pollResult.auditEvents.map((event) => ({
+            id: `ae-poll-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            actor: "order_status_poller",
+            ...event,
+          })));
+        }
+      }
+    } catch (pollErr: any) {
+      addLog(
+        "error",
+        "Order-status poll failed; continuing this sync cycle without updated broker order state.",
+        pollErr?.message || String(pollErr),
+      );
     }
 
     // ==========================================================

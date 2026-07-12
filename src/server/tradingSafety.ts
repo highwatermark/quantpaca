@@ -97,7 +97,55 @@ export type PipelineTrade = Trade & {
   // orders after a degenerate-plan or bracket-rejection fail-open, and any
   // trade that never reached the broker.
   brokerLegOrderIds?: string[];
+  // Task 5 (order-status polling, docs/GO_LIVE_PLAN.md Phase 2.2): the last
+  // known TradeState for each entry in brokerLegOrderIds, keyed by leg order
+  // id -- see src/server/orderStatusPoller.ts. Lets cancelBracketLegsBeforeSell
+  // (server.ts) skip a leg that a prior poll already found terminal
+  // (filled/canceled/expired/rejected) instead of issuing a DELETE against an
+  // order the broker will reject as "not cancelable" (closes bracket-orders
+  // review finding 2). Additive JSON field, same no-migration story as
+  // brokerLegOrderIds above. Undefined/missing entries are treated as "not yet
+  // known terminal" -- fail open to polling/canceling that leg, never assumed
+  // terminal by absence.
+  brokerLegStates?: Record<string, TradeState>;
+  // Task 5: the broker-reported filled_qty and (requested qty - filledQty) the
+  // last time this trade's own order was polled. Only meaningful once the
+  // trade has reached PartiallyFilled or Filled -- undefined beforehand (never
+  // defaulted to 0, so "never polled" stays distinguishable from "confirmed
+  // zero filled").
+  filledQty?: number;
+  remainingQty?: number;
+  // Task 5: set whenever the most recent poll of this trade's OWN order (not
+  // its legs) failed to reach the broker or returned a non-OK response.
+  // Cleared (set back to undefined) the next time a poll succeeds. The order's
+  // `status` is deliberately left untouched when this is set -- "never invent
+  // a fill": a poll failure must never advance or regress the locally known
+  // state, only flag that the state is now unconfirmed as of this cycle.
+  lastPollError?: string;
+  // Task 5: set on the ENTRY trade when a poll of one of its bracket legs
+  // discovers that leg filled -- i.e. the position was closed BROKER-side
+  // (take-profit or stop-loss executed), not by this system's own software
+  // exit path. Informational/audit bookkeeping: the position no longer shows
+  // up in Alpaca's live /positions once this happens, so MODULE 2's exit
+  // evaluation already stops considering it naturally; this field just makes
+  // that fact visible on the trade record and in the audit trail instead of
+  // silently disappearing.
+  exitClosedBrokerSide?: { legId: string; legType: string; price?: number; at: string };
 };
+
+// Task 5 (order-status polling): trade states that mean an order actually
+// reached the broker and was accepted in some live/filled form -- the set
+// latestBuySideExitPlanForSymbol (persistence.ts) and cancelBracketLegsBeforeSell
+// (server.ts) key "is this trade still the live entry for this symbol's open
+// lot" on. Moved here (was a server.ts-local const) so persistence.ts can
+// reuse the exact same set instead of forking its own copy -- see the C1 fix
+// this task closes (docs/GO_LIVE_PLAN.md Phase 2.2, bracket-orders review
+// finding 1) for why persistence.ts now needs it too.
+export const BROKER_SUCCESS_TRADE_STATUSES: ReadonlySet<TradeState> = new Set([
+  "Accepted",
+  "PartiallyFilled",
+  "Filled",
+]);
 
 type BrokerOrderResponse = {
   id?: string;
