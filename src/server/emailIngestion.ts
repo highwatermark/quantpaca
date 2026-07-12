@@ -8,6 +8,8 @@
 //   2. Teaser-only content: analyzing only the ~100-200 char snippet means trade
 //      decisions are made without ever reading the newsletter.
 
+import { parseFiniteNumber } from "./numericSafety";
+
 const MAX_BODY_CHARS = 8000;
 const TRUNCATION_MARKER = "\n[truncated]";
 
@@ -87,10 +89,13 @@ function extractSourceTimestamp(message: GmailMessage): string | null {
 }
 
 function parseInternalDate(internalDate: string | undefined): string | null {
-  if (!internalDate) return null;
-  const ms = Number(internalDate);
-  if (!Number.isFinite(ms) || ms <= 0) return null;
-  const date = new Date(ms);
+  // Numeric validity goes through the codebase's single source of truth
+  // (numericSafety.parseFiniteNumber) rather than a hand-rolled check, matching
+  // riskEngine/breakerEngine/riskLimits. Positivity is our additional constraint
+  // on top: epoch millis must be > 0 to be a plausible send time.
+  const parsed = parseFiniteNumber(internalDate, "gmail.internalDate");
+  if (parsed.ok === false || parsed.value <= 0) return null;
+  const date = new Date(parsed.value);
   if (Number.isNaN(date.getTime())) return null;
   return date.toISOString();
 }
