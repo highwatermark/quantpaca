@@ -18,6 +18,7 @@ import {
 import { createProductionStore } from "./src/server/persistence";
 import { createRawSignal } from "./src/server/signalEngine";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
+import { extractEmailScanTarget, EmailScanTarget } from "./src/server/emailIngestion";
 import { detectRegime } from "./src/server/regimeEngine";
 import { assessPortfolio } from "./src/server/portfolioEngine";
 import { reconcileBrokerState } from "./src/server/reconciliationEngine";
@@ -980,7 +981,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     }
 
     // Variable to store Gmail messages
-    let emailsToScan: any[] = [];
+    let emailsToScan: EmailScanTarget[] = [];
 
   if (authHeader) {
     addLog("sync", "Attempting to retrieve messages with active Gmail OAuth token...");
@@ -999,18 +1000,23 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
         for (const msg of messages) {
           const detailRes = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`,
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
             { headers: { Authorization: authHeader } }
           );
           if (detailRes.ok) {
             const detailData = await detailRes.json();
-            const subjectHeader = detailData.payload.headers.find((h: any) => h.name === "Subject");
-            const snippet = detailData.snippet || "";
-            emailsToScan.push({
-              source: "email",
-              title: subjectHeader ? subjectHeader.value : "ZipTrader Thesis",
-              content: snippet,
-            });
+            const extraction = extractEmailScanTarget(detailData);
+            if (extraction.ok === false) {
+              // Fail-closed: no real send time could be recovered for this message.
+              // Never fabricate "now" -- skip it rather than let an undated thesis
+              // sail through the freshness check.
+              addLog("error", `Skipping Gmail message ${msg.id}: ${extraction.reason}`);
+              continue;
+            }
+            if (extraction.bodyDegraded) {
+              addLog("sync", `Body extraction degraded for Gmail message ${msg.id}; using snippet fallback.`);
+            }
+            emailsToScan.push(extraction.target);
           }
         }
       } else {
@@ -1024,12 +1030,16 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     addLog("sync", "No authorization token detected. Simulating recent Gmail Inbox scan for @ghost.io...");
   }
 
-  // If no live emails scanned, add high quality simulated one for demonstration
+  // If no live emails scanned, add high quality simulated one for demonstration.
+  // This is simulated demo content, not a real Gmail message, so there is no real
+  // send time to capture -- "now" is the honest timestamp for freshly-generated
+  // demo data. (Task 3 removes this hardcoded fallback entirely.)
   if (emailsToScan.length === 0) {
     emailsToScan.push({
       source: "email",
       title: "ZipTrader: Why MARA and Clean Energy are pulling back — Pullback Accumulation",
       content: "MARA shares slid 10% on market Bitcoin volatility. Fundamentals remain stellar. Is it a trend reversal or simple whipsaw volatility? Our analysis points to macro liquidation. Fundamentals validated by steady hash rates.",
+      sourceTimestamp: new Date().toISOString(),
     });
   }
 
@@ -1060,9 +1070,12 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
   }
 
   // 3. Process each scanned thesis with Claude
+  // The YouTube target keeps a "now" timestamp deliberately: youtubeSentiment is
+  // the output of a web search that just completed above, not an ingested
+  // document with its own real send time to recover.
   const scanTargets = [
     ...emailsToScan,
-    { source: "youtube", title: "ZipTrader Channel Feed Analyzed", content: youtubeSentiment }
+    { source: "youtube", title: "ZipTrader Channel Feed Analyzed", content: youtubeSentiment, sourceTimestamp: new Date().toISOString() }
   ];
 
   const parsedAnalyses: StockAnalysis[] = [];
@@ -1130,7 +1143,11 @@ For "reasoning", write a concise human sentence explaining the fundamental thesi
           reasoning: parsed.reasoning,
           whipsawCheck: parsed.whipsawCheck,
           decision: parsed.decision as any,
-          timestamp: new Date().toISOString(),
+          // Real source timestamp (Gmail internalDate/Date header for email, or
+          // "now" for the just-completed YouTube web search) -- not "now" for
+          // every thesis regardless of actual age. This is what lets the signal
+          // engine's freshness check (maxAgeHours) do anything at all.
+          timestamp: target.sourceTimestamp,
         };
 
         const rawSignal = createRawSignal({

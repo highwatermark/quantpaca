@@ -105,11 +105,11 @@ tune them, the executor may not.
 The engines are good; the monolithic `server.ts` bypasses them. Fix the wiring.
 
 ### 1.1 Signal integrity
-- [ ] **Persist dedup state.** Load `seenKeys` for `reviewSignal` from the SQLite store (derive from prior `reviewed_signals` rows) instead of a fresh empty `Set` per call (`server.ts:1144`, `signalEngine.ts:37`).
+- [x] **Persist dedup state.** Load `seenKeys` for `reviewSignal` from the SQLite store (derive from prior `reviewed_signals` rows) instead of a fresh empty `Set` per call (`server.ts:1144`, `signalEngine.ts:37`).
   *Accept:* syncing twice on the same email produces `duplicate` rejection the second time — proven by an integration test.
-- [ ] **Use real source timestamps.** Capture the Gmail `internalDate`/`Date` header during ingestion (`server.ts:1006-1012`) and set `sourceTimestamp` from it, not `new Date()` (`server.ts:1132,1138`).
+- [x] **Use real source timestamps.** Capture the Gmail `internalDate`/`Date` header during ingestion (`server.ts:1006-1012`) and set `sourceTimestamp` from it, not `new Date()` (`server.ts:1132,1138`).
   *Accept:* a thesis older than `maxAgeHours` (72h) is rejected as `stale` in an integration test.
-- [ ] **Ingest full email bodies**, not just the snippet (`server.ts:1007`). Decode the message payload; cap length before sending to Claude.
+- [x] **Ingest full email bodies**, not just the snippet (`server.ts:1007`). Decode the message payload; cap length before sending to Claude.
   *Accept:* analysis prompt contains body text for a multi-paragraph fixture email.
 - [ ] **Delete trade-capable fallbacks.** Remove the hardcoded MARA demo thesis (`server.ts:1026-1033`) and the canned bullish YouTube fallback (`server.ts:1057`). On ingestion failure: log, alert via Telegram, produce zero signals.
   *Accept:* with Gmail unavailable, a sync produces no signals and no trades; a test asserts this.
