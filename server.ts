@@ -1024,7 +1024,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         }
       } else {
         const errTxt = await gmailRes.text();
-        addLog("error", "Gmail API failed. Operating with offline simulation database.", errTxt);
+        addLog("error", "Gmail API failed. No email signals this sync.", errTxt);
       }
     } catch (err: any) {
       addLog("error", "Gmail sync connection error.", err.message);
