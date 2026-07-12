@@ -90,3 +90,22 @@ test("the domain-suffix blocklist constants contain both alpaca notification dom
   assert.ok(GLOBAL_SENDER_BLOCKLIST_DOMAIN_SUFFIXES.includes("@alpaca.markets"));
   assert.ok(GLOBAL_SENDER_BLOCKLIST_DOMAIN_SUFFIXES.includes("@ealerts.alpaca.markets"));
 });
+
+// Phase 2 Task 9 (docs/GO_LIVE_PLAN.md Phase 2.4, Motley Fool premium source):
+// premiuminfo.fool.com is Motley Fool's marketing/teaser sender -- it must
+// never reach Claude as a thesis, even though it shares the fool.com parent
+// domain with the legitimate premium recommendation sender.
+test("evaluateSender blocks the Motley Fool premiuminfo marketing sender", () => {
+  const decision = evaluateSender("The Motley Fool <fool@premiuminfo.fool.com>", []);
+  assert.equal(decision.outcome, "blocked");
+  assert.equal(decision.address, "fool@premiuminfo.fool.com");
+});
+
+test("evaluateSender does NOT block the legitimate Motley Fool premium sender (only the premiuminfo marketing address is blocked)", () => {
+  const decision = evaluateSender("The Motley Fool <fool@motley.fool.com>", ["fool@motley.fool.com"]);
+  assert.equal(decision.outcome, "allowed");
+});
+
+test("the exact-match blocklist constant contains the Motley Fool premiuminfo marketing address", () => {
+  assert.ok(GLOBAL_SENDER_BLOCKLIST.includes("fool@premiuminfo.fool.com"));
+});

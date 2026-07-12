@@ -29,6 +29,15 @@ export type SourceConfig = {
   trustTier: TrustTier;
   maxAgeHours: number;
   enabled: boolean;
+  // Phase 2 Task 9 (docs/GO_LIVE_PLAN.md Phase 2.4, Motley Fool premium
+  // source): optional, additive. Threaded into the Claude analysis prompt
+  // when present (server.ts) so a source whose genre differs from the
+  // ZipTrader-flavored default prompt (e.g. an explicit dated BUY/SELL
+  // recommendation letter, vs. a whipsaw-framed newsletter) can steer
+  // extraction without a source-specific code path. Absent for every
+  // pre-Task-9 source (e.g. ziptrader) -- prompt behavior for those is
+  // byte-for-byte unchanged.
+  promptHint?: string;
 };
 
 // Guardrail 8 (docs/GO_LIVE_PLAN.md Phase 2.1): bounds both per-source and
@@ -41,18 +50,43 @@ export type SourceConfig = {
 export const GMAIL_MAX_RESULTS_PER_SOURCE = 5;
 export const MAX_ENABLED_SOURCES_PER_CYCLE = 8;
 
+// Phase 2 Task 9's Motley Fool prompt hint, verbatim from the go-live plan's
+// task brief. Exported so callers/tests can reference the exact text instead
+// of duplicating it.
+export const MOTLEY_FOOL_PROMPT_HINT =
+  "This is a Motley Fool premium recommendation newsletter. Extract the PRIMARY recommendation: the specific ticker being recommended as a new BUY, or an explicit SELL instruction. Service names (Epic Portfolio, Hidden Gems, Rule Breakers) indicate recommendation letters; ignore performance recaps and marketing copy. Multiple tickers: choose the headline recommendation only.";
+
 // The default registry, shipped so a fresh deploy (or an upgrade from the
 // pre-Task-8 hardcoded single source) keeps working with zero operator
-// action: exactly the existing ZipTrader source, unchanged query/allowlist/
-// maxAgeHours (72h, matching signalEngine.ts's prior hardcoded default).
-const DEFAULT_SOURCES: SourceConfig[] = [
+// action. `_comment` is not part of SourceConfig -- it's tolerated by
+// validateEntry (which only reads known keys) purely as an in-file note for
+// a human reading the JSON; it never affects behavior.
+const DEFAULT_SOURCES: (SourceConfig & { _comment?: string })[] = [
   {
     id: "ziptrader",
     gmailQuery: "from:charlie-from-ziptrader@ghost.io",
     senderAllowlist: ["charlie-from-ziptrader@ghost.io"],
     trustTier: "high",
+    // Matches signalEngine.ts's prior hardcoded default.
     maxAgeHours: 72,
     enabled: true,
+  },
+  {
+    // Phase 2 Task 9 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 1): shipped
+    // DISABLED -- Motley Fool is a paid-membership source and the plan calls
+    // for a human to review recommendation emails against the promptHint
+    // before flipping it on. Data-driven enable: flip `enabled` to `true` in
+    // this file, no code change or deploy needed.
+    id: "motley-fool",
+    gmailQuery: "from:fool@motley.fool.com",
+    senderAllowlist: ["fool@motley.fool.com"],
+    trustTier: "high",
+    // Recommendation letters are weekly-cadence; 96h catches a weekend gap.
+    maxAgeHours: 96,
+    enabled: false,
+    promptHint: MOTLEY_FOOL_PROMPT_HINT,
+    _comment:
+      "Disabled by default. Motley Fool is a paid membership -- review a few recommendation emails against promptHint, then set \"enabled\": true to activate. No code change needed. See docs/GO_LIVE_PLAN.md Phase 2.4.",
   },
 ];
 
@@ -76,6 +110,15 @@ export type SourceRegistryLoadResult = {
   // Malformed file/entry problems -- fail-closed, always logged and alerted
   // by the caller, never silently guessed around.
   issues: SourceRegistryIssue[];
+  // Phase 2 Task 9: ids of known default sources (DEFAULT_SOURCES) that were
+  // MISSING from an existing file and were appended, forced disabled, on
+  // this load (additive registry migration -- general, not Fool-specific).
+  // Always empty on the createDefaultFile path (that path ships every known
+  // default already) and empty on a file-level failure (a malformed file is
+  // never safely extendable). An id already present in the file for ANY
+  // reason -- valid, malformed, enabled, or disabled -- is left completely
+  // untouched; migration only ever appends, never edits.
+  migratedIds: string[];
 };
 
 export function loadSourceRegistry(filePath: string): SourceRegistryLoadResult {
@@ -101,9 +144,40 @@ export function loadSourceRegistry(filePath: string): SourceRegistryLoadResult {
     return fileLevelFailure(`Signal source registry file (${filePath}) must contain a JSON array of source entries; got ${typeof parsed}.`);
   }
 
+  // Phase 2 Task 9: additive registry migration, general (not Fool-specific).
+  // Any DEFAULT_SOURCES id absent from this file's raw entries (regardless of
+  // whether those existing entries are themselves valid) is appended, forced
+  // DISABLED -- a migration must never silently turn ON a new signal source,
+  // only make it visible for a human to review and enable. Reuses the normal
+  // validate/cap pipeline below by simply extending `entries` before it runs,
+  // rather than special-casing the appended rows.
+  const existingIds = new Set<string>();
+  for (const entry of parsed as any[]) {
+    if (entry && typeof entry === "object" && !Array.isArray(entry) && typeof entry.id === "string" && entry.id.trim()) {
+      existingIds.add(entry.id.trim());
+    }
+  }
+  const missingDefaults = DEFAULT_SOURCES.filter((d) => !existingIds.has(d.id));
+  const migratedIds = missingDefaults.map((d) => d.id);
+  let entries: unknown[] = parsed;
+  if (missingDefaults.length > 0) {
+    const migratedEntries = missingDefaults.map((d) => ({ ...d, senderAllowlist: [...d.senderAllowlist], enabled: false }));
+    entries = [...parsed, ...migratedEntries];
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(entries, null, 2) + "\n");
+    } catch {
+      // Fail open toward keeping ingestion working, same reasoning as
+      // createDefaultFile below: the in-memory `entries` used for THIS load
+      // already reflects the migration (disabled, so no ingestion effect
+      // either way this cycle), and a failed write simply means the next
+      // load retries the same migration -- idempotent, not a fail-closed
+      // condition.
+    }
+  }
+
   const issues: SourceRegistryIssue[] = [];
   const valid: SourceConfig[] = [];
-  parsed.forEach((entry, index) => {
+  entries.forEach((entry, index) => {
     const result = validateEntry(entry, index);
     // Explicit `=== true`/`=== false` (not a truthy `if`): this tsconfig
     // doesn't enable strictNullChecks, and without it TS's discriminated-
@@ -125,7 +199,7 @@ export function loadSourceRegistry(filePath: string): SourceRegistryLoadResult {
     cappedIds.push(...valid.slice(MAX_ENABLED_SOURCES_PER_CYCLE).map((s) => s.id));
   }
 
-  return { sources, createdDefaultFile: false, cappedIds, issues };
+  return { sources, createdDefaultFile: false, cappedIds, issues, migratedIds };
 }
 
 function createDefaultFile(filePath: string): SourceRegistryLoadResult {
@@ -141,11 +215,15 @@ function createDefaultFile(filePath: string): SourceRegistryLoadResult {
     // it couldn't write a config file it will happily retry writing next
     // cycle. The in-memory default is still returned below either way.
   }
-  return { sources: DEFAULT_SOURCES.map((s) => ({ ...s, senderAllowlist: [...s.senderAllowlist] })), createdDefaultFile, cappedIds: [], issues: [] };
+  // Phase 2 Task 9: only ENABLED defaults surface as this cycle's sources --
+  // motley-fool ships disabled, so it's written to disk (above) but excluded
+  // here, same as any other disabled entry on the normal load path.
+  const enabledDefaults = DEFAULT_SOURCES.filter((s) => s.enabled).map((s) => ({ ...s, senderAllowlist: [...s.senderAllowlist] }));
+  return { sources: enabledDefaults, createdDefaultFile, cappedIds: [], issues: [], migratedIds: [] };
 }
 
 function fileLevelFailure(message: string): SourceRegistryLoadResult {
-  return { sources: [], createdDefaultFile: false, cappedIds: [], issues: [{ scope: "file", message }] };
+  return { sources: [], createdDefaultFile: false, cappedIds: [], issues: [{ scope: "file", message }], migratedIds: [] };
 }
 
 type EntryValidation = { ok: true; source: SourceConfig } | { ok: false; id?: string; message: string };
@@ -186,6 +264,12 @@ function validateEntry(entry: unknown, index: number): EntryValidation {
     return { ok: false, id, message: `Source "${id}" has an invalid "enabled" (must be a boolean); disabled.` };
   }
 
+  // Phase 2 Task 9: optional, additive. Validated as a string WHEN PRESENT;
+  // absent by default (e.g. every pre-Task-9 entry, ziptrader included).
+  if (e.promptHint !== undefined && typeof e.promptHint !== "string") {
+    return { ok: false, id, message: `Source "${id}" has an invalid "promptHint" (must be a string when present); disabled.` };
+  }
+
   return {
     ok: true,
     source: {
@@ -195,6 +279,11 @@ function validateEntry(entry: unknown, index: number): EntryValidation {
       trustTier: e.trustTier,
       maxAgeHours: maxAgeParsed.value,
       enabled: e.enabled,
+      // Conditionally spread rather than always setting the key to `undefined`
+      // -- keeps the normalized object's own-key shape identical to before
+      // Task 9 when promptHint is absent (assert.deepEqual-friendly for
+      // existing tests, and no key at all for the ~99% of sources without one).
+      ...(typeof e.promptHint === "string" ? { promptHint: e.promptHint } : {}),
     },
   };
 }

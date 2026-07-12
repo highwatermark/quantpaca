@@ -14,7 +14,12 @@
 // Exact-match blocklist: brokerage trade-confirmation senders named in the
 // go-live plan. Lowercase -- comparisons are case-insensitive (From headers
 // are compared after lowercasing in parseFromAddress below).
-export const GLOBAL_SENDER_BLOCKLIST: readonly string[] = ["noreply@robinhood.com", "titan@investordelivery.com"];
+// "fool@premiuminfo.fool.com" (Phase 2 Task 9, docs/GO_LIVE_PLAN.md Phase
+// 2.4): Motley Fool's marketing/teaser sender, distinct from the legitimate
+// premium recommendation sender "fool@motley.fool.com" -- an exact-match
+// entry keeps this precise (a domain-suffix block on "@fool.com" would also
+// catch the legitimate sender).
+export const GLOBAL_SENDER_BLOCKLIST: readonly string[] = ["noreply@robinhood.com", "titan@investordelivery.com", "fool@premiuminfo.fool.com"];
 
 // Domain-suffix blocklist: any sender address ending in one of these suffixes
 // is blocked, regardless of the local part. Anchored with a leading "@" and

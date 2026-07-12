@@ -29,6 +29,11 @@ export type EmailScanTarget = {
   messageId?: string;
   trustTier: TrustTier;
   maxAgeHours: number;
+  // Phase 2 Task 9 (docs/GO_LIVE_PLAN.md Phase 2.4, Motley Fool premium
+  // source): carried straight through from the registry entry's own
+  // `promptHint` (sourceRegistry.ts) -- additive to the Claude analysis
+  // prompt when present, absent for every source that doesn't set one.
+  promptHint?: string;
 };
 
 // Unchanged by this task -- registry governs email sources only (task

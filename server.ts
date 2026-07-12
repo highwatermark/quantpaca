@@ -2467,6 +2467,17 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
         `Signal source registry: ${registryResult.cappedIds.length} enabled source(s) exceeded the ${MAX_ENABLED_SOURCES_PER_CYCLE}-source cap (Guardrail 8) and were skipped this cycle: ${registryResult.cappedIds.join(", ")}.`,
       );
     }
+    if (registryResult.migratedIds.length > 0) {
+      // Phase 2 Task 9: additive registry migration -- an existing registry
+      // file that predates a newly-shipped default source (e.g. motley-fool)
+      // was just extended with it, disabled, on this load. Logged (not
+      // alerted -- this is an expected, non-error one-time upgrade event, not
+      // a malformed-config issue) so an operator sees it and can review/enable.
+      addLog(
+        "sync",
+        `Signal source registry: added missing default source(s), disabled, during migration: ${registryResult.migratedIds.join(", ")}. Review and enable in ${SOURCE_REGISTRY_PATH} when ready.`,
+      );
+    }
     if (registryResult.issues.length > 0) {
       await alertOnSourceRegistryIssues(currentConfig, registryResult.issues);
     }
@@ -2550,6 +2561,10 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
               messageId: extraction.target.messageId,
               trustTier: source.trustTier,
               maxAgeHours: source.maxAgeHours,
+              // Phase 2 Task 9: additive, carried straight through from the
+              // registry entry -- absent for every source without one (e.g.
+              // ziptrader), so analysis prompt content is unchanged for them.
+              promptHint: source.promptHint,
             });
           }
         } else {
@@ -2681,6 +2696,13 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
       addLog("sync", `Analyzing thesis with Claude: "${target.title.substring(0, 45)}..."`);
       const anthropic = getClaudeClient();
 
+      // Phase 2 Task 9 (docs/GO_LIVE_PLAN.md Phase 2.4): additive per-source
+      // prompt awareness. Only email targets carry a registry-sourced
+      // promptHint at all, and it's optional even then -- absent for every
+      // source that doesn't set one (ziptrader included), so the prompt text
+      // below is byte-for-byte unchanged for those.
+      const promptHintSection = target.kind === "email" && target.promptHint ? `\n\n${target.promptHint}` : "";
+
       // Ask Claude for strict quantitative evaluation; the JSON schema below is
       // enforced by the API (structured outputs), not just requested in the prompt.
       const response = await anthropic.messages.create({
@@ -2693,7 +2715,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             content: `Analyze the following stock newsletter or trading commentary from ZipTrader.
 Source Type: ${target.source}
 Title: ${target.title}
-Content: ${target.content}
+Content: ${target.content}${promptHintSection}
 
 You must extract the stock ticker symbol mentioned (like PLTR, MARA, TSLA, NVDA), assess growth potential score (0 to 100), market sentiment score (-100 to 100), and define a risk profile ('Low' | 'Medium' | 'High').
 Crucially, when the stock goes down for any reason, assess whether it is a support level 'whipsaw' because of the overall market volatility OR a genuine 'trend reversal' before deciding to act. Validate the fundamentals and the core thesis.
