@@ -742,6 +742,74 @@ async function cancelAlpacaOrder(brokerConfig: BrokerConfig, orderId: string): P
   }
 }
 
+// Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): the ONE shared cancel-legs-before-
+// sell step used by every sell call site -- the software exit monitor
+// (MODULE 2), the emergency close-all endpoint, and manual override sells --
+// so the bracket interaction can never drift between them. A position whose
+// BUY was placed as a broker-native bracket has live take_profit/stop_loss
+// child orders holding its shares; a plain sell submitted while they're open
+// is rejected by Alpaca ("insufficient qty -- held for orders"). So: look up
+// the symbol's persisted leg ids and cancel each via DELETE /v2/orders/{id}
+// BEFORE the sell.
+//
+// Fail CLOSED, always audited: if the leg lookup throws or any cancel fails,
+// returns `ok: false` and the caller must SKIP the sell -- the broker legs
+// are that position's only protection at that moment, and a sell that Alpaca
+// would reject anyway must not be reported as a successful liquidation. Both
+// failure modes append an audit event here (not in the callers) so the
+// disclosure can't be forgotten at a call site. No legs recorded (a plain
+// order, a pre-existing position, or an unconfigured/dry-run broker) is a
+// no-op success: the sell proceeds exactly as it did before Task 4.
+async function cancelBracketLegsBeforeSell(input: {
+  db: any;
+  symbol: string;
+  // For the audit trail: which sell path is asking (e.g. "exit_monitor",
+  // "emergency_close", "manual_override").
+  actor: string;
+}): Promise<{ ok: boolean; canceledCount: number; reason: string }> {
+  const brokerConfig = getBrokerConfig();
+  if (!brokerConfig.configured) return { ok: true, canceledCount: 0, reason: "" };
+
+  const auditFailure = (message: string, details: Record<string, unknown>) => {
+    appendAuditEvents(input.db, [{
+      id: `ae-bracket-cancel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "broker",
+      actor: input.actor,
+      message,
+      details,
+    }]);
+  };
+
+  let legOrderIds: string[] = [];
+  try {
+    legOrderIds = productionStore.latestBuySideExitPlanForSymbol(input.symbol)?.legOrderIds || [];
+  } catch (err: any) {
+    const reason = `failed to look up bracket legs for ${input.symbol} (${err?.message || String(err)})`;
+    console.error(`[bracket-cancel] ${reason}; skipping this sell.`, err);
+    auditFailure(
+      `Failed to look up bracket legs for ${input.symbol} before a sell; the sell was SKIPPED. The position may still be covered by broker-native bracket legs.`,
+      { symbol: input.symbol, error: err?.message || String(err) },
+    );
+    return { ok: false, canceledCount: 0, reason };
+  }
+
+  let canceledCount = 0;
+  for (const legId of legOrderIds) {
+    const cancelResult = await cancelAlpacaOrder(brokerConfig, legId);
+    if (!cancelResult.ok) {
+      const reason = `failed to cancel bracket leg ${legId} for ${input.symbol}${cancelResult.status ? ` (broker status ${cancelResult.status})` : ""}`;
+      auditFailure(
+        `Failed to cancel bracket leg ${legId} for ${input.symbol} before a sell; the sell was SKIPPED. The position remains protected by its broker-native bracket legs.`,
+        { symbol: input.symbol, legId, status: cancelResult.status },
+      );
+      return { ok: false, canceledCount, reason };
+    }
+    canceledCount++;
+  }
+  return { ok: true, canceledCount, reason: "" };
+}
+
 // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): submits a BUY as a broker-native
 // bracket order (order_class "bracket", carrying the exit plan's stop-loss
 // and take-profit) so protection survives process death, instead of relying
@@ -1714,51 +1782,18 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           const sellQty = Math.min(decision.qty, Math.floor(parseFloat(pos.qty)) || 0);
           if (sellQty <= 0) continue;
 
-          // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): if this BUY was placed as
-          // a broker-native bracket, its take_profit/stop_loss child legs are
-          // still open orders holding this symbol's shares -- a plain sell
-          // here would be rejected by Alpaca while they're live. Cancel them
-          // first. Fail CLOSED: if any cancel fails, the broker legs are this
-          // position's ONLY protection right now, so skip the software exit
-          // this cycle entirely (log + audit) rather than risk a rejected
-          // sell leaving the position both unsold and undocumented. No legs
-          // recorded (a plain order, or a dry-run/unconfigured broker) is a
-          // no-op here -- the sell proceeds exactly as before this task.
-          const cancelBrokerConfig = getBrokerConfig();
-          let legLookupFailed = false;
-          let legOrderIds: string[] = [];
-          if (cancelBrokerConfig.configured) {
-            try {
-              legOrderIds = productionStore.latestBuySideExitPlanForSymbol(decision.symbol)?.legOrderIds || [];
-            } catch (err: any) {
-              legLookupFailed = true;
-              console.error(`[bracket-cancel] Failed to look up bracket legs for ${decision.symbol}; skipping this software exit.`, err);
-            }
-          }
-          if (legLookupFailed) {
-            addLog("error", `Software exit for ${decision.symbol} skipped: failed to look up its bracket legs. Position may still be covered by a broker-native bracket.`);
+          // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): clear this symbol's live
+          // bracket legs before the liquidation sell (see the shared helper
+          // for the full rationale). Fail closed: a lookup/cancel failure
+          // skips this software exit for the cycle -- the broker legs remain
+          // the position's active protection (audited by the helper).
+          const legCancel = await cancelBracketLegsBeforeSell({ db, symbol: decision.symbol, actor: "exit_monitor" });
+          if (!legCancel.ok) {
+            addLog("error", `Software exit for ${decision.symbol} skipped: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);
             continue;
           }
-          if (legOrderIds.length > 0) {
-            let allCanceled = true;
-            for (const legId of legOrderIds) {
-              const cancelResult = await cancelAlpacaOrder(cancelBrokerConfig, legId);
-              if (!cancelResult.ok) {
-                allCanceled = false;
-                addLog("error", `Failed to cancel bracket leg ${legId} for ${decision.symbol}; skipping this software exit -- the broker-native bracket legs remain this position's active protection.`);
-                appendAuditEvents(db, [{
-                  id: `ae-bracket-cancel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                  timestamp: new Date().toISOString(),
-                  type: "broker",
-                  actor: "exit_monitor",
-                  message: `Failed to cancel bracket leg ${legId} for ${decision.symbol} before a software exit; the software exit was SKIPPED this cycle. The position remains protected by its broker-native bracket legs.`,
-                  details: { symbol: decision.symbol, legId, status: cancelResult.status },
-                }]);
-                break;
-              }
-            }
-            if (!allCanceled) continue;
-            addLog("trade", `Canceled ${legOrderIds.length} bracket leg(s) for ${decision.symbol} before the software exit sell.`);
+          if (legCancel.canceledCount > 0) {
+            addLog("trade", `Canceled ${legCancel.canceledCount} bracket leg(s) for ${decision.symbol} before the software exit sell.`);
           }
 
           const liquidationTrade = await executeTradeIntent({
@@ -2476,6 +2511,30 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
 
     addLog("override", `Manual Override Triggered: Place market order: ${side.toUpperCase()} ${qty} ${symbol}`);
 
+    // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): a manual SELL on a position
+    // whose BUY was placed as a broker-native bracket must clear the live
+    // legs first, or Alpaca rejects the sell ("insufficient qty -- held for
+    // orders"). Shared helper -- same fail-closed semantics as the exit
+    // monitor and close-all: if a cancel fails, the sell is NOT submitted
+    // (the legs remain the protection) and the response says so honestly
+    // instead of claiming success for an order that never went out.
+    if (side === "sell") {
+      const legCancel = await cancelBracketLegsBeforeSell({ db, symbol, actor: "manual_override" });
+      if (!legCancel.ok) {
+        addLog("error", `Manual override SELL for ${symbol} skipped: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);
+        writeDB(db);
+        res.status(502).json({
+          success: false,
+          error: "Manual trade override rejected",
+          details: `Failed to cancel this position's live bracket leg(s), so the sell was NOT submitted (${legCancel.reason}). The position remains protected by its broker-native bracket order; retry once the broker is reachable.`,
+        });
+        return;
+      }
+      if (legCancel.canceledCount > 0) {
+        addLog("override", `Canceled ${legCancel.canceledCount} bracket leg(s) for ${symbol} before the manual override sell.`);
+      }
+    }
+
     const tradeVal = await executeTradeIntent({
       db,
       config: currentConfig,
@@ -2545,7 +2604,18 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     }
 
     writeDB(db);
-    res.json({ success: true, trade: tradeVal, ...(clamp ? { clamp } : {}) });
+    // Task 4 honesty fix: `orderPlaced` (additive field) reports whether this
+    // trade actually reached the broker successfully; for a SELL, `success`
+    // itself is honest -- a RiskRejected/BrokerFailed sell must never read as
+    // a successful liquidation (the UI reads trade.status and error only, so
+    // this is backward-compatible). BUY `success` semantics are unchanged.
+    const orderPlaced = BROKER_SUCCESS_TRADE_STATUSES.has(tradeVal.status);
+    res.json({
+      success: side === "sell" ? orderPlaced : true,
+      orderPlaced,
+      trade: tradeVal,
+      ...(clamp ? { clamp } : {}),
+    });
   } catch (err: any) {
     console.error("Critical error in /api/override/trade:", err);
     res.status(500).json({ error: "Manual trade override failed", details: err.message });
@@ -2571,6 +2641,14 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
 
     const portfolio = await getAlpacaPortfolio();
 
+    // Task 4 honesty fix: per-symbol outcomes, reported truthfully. Before
+    // this fix, the endpoint unconditionally claimed every position was sold
+    // -- even when a sell was RiskRejected/BrokerFailed, or (with brackets
+    // now the default for BUYs) would have been rejected by Alpaca because
+    // the shares were held by live bracket legs. The panic button must never
+    // silently no-op.
+    const results: Array<{ symbol: string; sold: boolean; status: string; reason?: string }> = [];
+
     for (const pos of portfolio.positions) {
       const currentPrice = parseFloat(pos.current_price);
       if (!currentPrice || !Number.isFinite(currentPrice)) {
@@ -2580,6 +2658,22 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
           type: "error",
           message: `Emergency close skipped for ${pos.symbol}; no deterministic current price was available.`,
         });
+        results.push({ symbol: pos.symbol, sold: false, status: "Skipped", reason: "no deterministic current price was available" });
+        continue;
+      }
+      // Task 4: clear live bracket legs before the sell (shared helper; same
+      // fail-closed semantics as the exit monitor). A cancel failure skips
+      // THIS symbol only -- its legs remain the protection -- and the rest of
+      // the portfolio still closes; the failure is counted and audited.
+      const legCancel = await cancelBracketLegsBeforeSell({ db, symbol: pos.symbol, actor: "emergency_close" });
+      if (!legCancel.ok) {
+        db.syncLogs.unshift({
+          id: "l-" + Math.random().toString(36).substr(2, 9),
+          timestamp,
+          type: "error",
+          message: `Emergency close skipped for ${pos.symbol}: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`,
+        });
+        results.push({ symbol: pos.symbol, sold: false, status: "Skipped", reason: legCancel.reason });
         continue;
       }
       const emergencyTrade = await executeTradeIntent({
@@ -2596,7 +2690,17 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
         },
       });
       db.trades.unshift(emergencyTrade);
+      const sold = BROKER_SUCCESS_TRADE_STATUSES.has(emergencyTrade.status);
+      results.push({
+        symbol: pos.symbol,
+        sold,
+        status: emergencyTrade.status,
+        ...(sold ? {} : { reason: emergencyTrade.riskDecision?.reason || `sell ended in status ${emergencyTrade.status}` }),
+      });
     }
+
+    const soldCount = results.filter((r) => r.sold).length;
+    const failedCount = results.length - soldCount;
 
     if (!getBrokerConfig().configured) {
       const totalPosValue = parseFloat(db.simulatedPortfolio.long_market_value) || 0;
@@ -2605,11 +2709,24 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
       db.simulatedPortfolio.positions = [];
     }
 
-    // Send panic telegram broadcast
-    await sendTelegramAlert(config.telegram, "🚨 <b>Portfolio Panic Trigger: EMERGENCY CLOSE DISPATCHED.</b> All open paper positions have been sold to secure liquidated capital reserves.");
+    // Send panic telegram broadcast -- honest about the real outcome, never
+    // an unconditional "everything sold" claim.
+    const failedSymbols = results.filter((r) => !r.sold).map((r) => r.symbol);
+    const tgMessage = failedCount === 0
+      ? `🚨 <b>Portfolio Panic Trigger: EMERGENCY CLOSE DISPATCHED.</b> ${soldCount} of ${results.length} open position(s) sold.`
+      : `🚨 <b>Portfolio Panic Trigger: EMERGENCY CLOSE PARTIAL.</b> ${soldCount} of ${results.length} position(s) sold; ${failedCount} FAILED/SKIPPED (${failedSymbols.join(", ")}). Skipped bracket-protected positions remain covered by their broker legs. Manual review required.`;
+    await sendTelegramAlert(config.telegram, tgMessage);
 
     writeDB(db);
-    res.json({ success: true, message: "Emergency portfolio liquidate sequence executed successfully." });
+    res.json({
+      success: failedCount === 0,
+      soldCount,
+      failedCount,
+      results,
+      message: failedCount === 0
+        ? `Emergency close executed: ${soldCount} of ${results.length} position(s) sold.`
+        : `Emergency close PARTIAL: ${soldCount} of ${results.length} position(s) sold; ${failedCount} failed/skipped (${failedSymbols.join(", ")}). Manual review required.`,
+    });
   } catch (err: any) {
     console.error("Critical error in /api/override/close-all:", err);
     res.status(500).json({ error: "Emergency close out failed", details: err.message });

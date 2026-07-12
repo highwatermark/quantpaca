@@ -25,6 +25,8 @@ const ADMIN_TOKEN = "test-admin-token-0123456789";
 const sqlitePath = path.join(dataDir, "quantpaca.sqlite");
 
 let postedOrders: Array<{ clientOrderId: string; body: any }>;
+let deleteCalls: string[];
+let deleteShouldFailFor: Set<string>;
 let orderCounter: number;
 // Symbols in this set get a 422 "bracket" rejection on their FIRST (bracket)
 // POST /orders attempt, so the retry-with-suffix path can be exercised.
@@ -32,6 +34,8 @@ let bracketRejectSymbols: Set<string>;
 
 function resetMockBroker() {
   postedOrders = [];
+  deleteCalls = [];
+  deleteShouldFailFor = new Set();
   orderCounter = 0;
   bracketRejectSymbols = new Set();
 }
@@ -64,6 +68,11 @@ globalThis.fetch = (async (input: any, init?: any) => {
       return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.includes("/orders") && init?.method === "DELETE") {
+      const orderId = url.split("/orders/")[1]?.split("?")[0];
+      deleteCalls.push(String(orderId));
+      if (deleteShouldFailFor.has(String(orderId))) {
+        return new Response(JSON.stringify({ message: "order not cancelable" }), { status: 422 });
+      }
       return new Response(null, { status: 204 });
     }
     if (url.includes("/orders") && init?.method === "POST") {
@@ -267,4 +276,65 @@ test("SELL orders never carry a bracket, even when a plan exists for the symbol"
   function resetMockBrokerKeepCounter() {
     postedOrders = [];
   }
+});
+
+test("manual override sell on a bracket-protected position: the live legs are canceled before the sell is submitted, and the response reports the sell reached the broker", async (t) => {
+  resetMockBroker();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+  await setConfig(port, {});
+
+  const buy = await placeOrder(port, { symbol: "BRKMSEL", qty: 1, side: "buy", price: 100 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
+  const legIds: string[] = buy.body.trade.brokerLegOrderIds;
+  assert.equal(legIds.length, 2, "sanity: the buy was placed as a bracket");
+
+  postedOrders = [];
+  const sell = await placeOrder(port, { symbol: "BRKMSEL", qty: 1, side: "sell", price: 110 });
+  assert.equal(sell.status, 200, JSON.stringify(sell.body));
+  assert.equal(sell.body.trade.status, "Accepted", JSON.stringify(sell.body));
+  assert.equal(sell.body.success, true);
+  assert.equal(sell.body.orderPlaced, true, "the response must carry the honest broker-reached flag");
+
+  // Both legs canceled before the sell reached the broker.
+  for (const legId of legIds) {
+    assert.ok(deleteCalls.includes(legId), `expected DELETE /orders/${legId}, got: ${JSON.stringify(deleteCalls)}`);
+  }
+  const sellPost = postedOrders.find((o) => o.body.symbol === "BRKMSEL" && o.body.side === "sell");
+  assert.ok(sellPost, "expected the sell to reach the broker after the legs were canceled");
+  assert.equal(sellPost!.body.order_class, undefined);
+});
+
+test("manual override sell where a leg cancel fails: the sell is NOT submitted (fail closed -- the legs remain the protection) and the response is honest about it", async (t) => {
+  resetMockBroker();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+  await setConfig(port, {});
+
+  const buy = await placeOrder(port, { symbol: "BRKMFAIL", qty: 1, side: "buy", price: 100 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
+  const legIds: string[] = buy.body.trade.brokerLegOrderIds;
+  assert.equal(legIds.length, 2);
+  deleteShouldFailFor.add(legIds[0]);
+
+  postedOrders = [];
+  const sell = await placeOrder(port, { symbol: "BRKMFAIL", qty: 1, side: "sell", price: 110 });
+
+  // No sell may reach the broker while the legs could not be cleared.
+  const sellPost = postedOrders.find((o) => o.body.symbol === "BRKMFAIL" && o.body.side === "sell");
+  assert.equal(sellPost, undefined, "the sell must be skipped when a leg cancel fails");
+
+  // The response must NOT claim success.
+  assert.notEqual(sell.status, 200, JSON.stringify(sell.body));
+  assert.notEqual(sell.body.success, true);
+  assert.match(String(sell.body.details || sell.body.error || ""), /(cancel|leg|bracket)/i);
+
+  // And the failure is audited.
+  const messages = await auditMessages(port);
+  assert.ok(
+    messages.some((m) => /BRKMFAIL/.test(m) && /(cancel|leg)/i.test(m)),
+    `expected an audited event about the failed leg cancel, got: ${JSON.stringify(messages)}`,
+  );
 });
