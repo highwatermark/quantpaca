@@ -89,6 +89,22 @@ export function evaluateOpenPositionExits(input: {
   // DB handle. Optional; omitting it just means ratchets aren't persisted
   // (the freshly-ratcheted value is still used for this cycle's evaluation).
   onHighWaterMarkRatchet?: (tradeId: string, symbol: string, highWaterMark: number) => void;
+  // This cycle's regime assessment (Task 9, docs/GO_LIVE_PLAN.md Phase 1.3),
+  // supplied by server.ts from the sync-scoped RegimeAssessment (MODULE 2.5).
+  // Undefined -- no assessment computed this cycle -- is the fail-closed
+  // default: it is never coerced into "close_only", so an absent/degraded
+  // regime feed can never liquidate a position.
+  //
+  // Gated per-plan below on the plan's OWN regimeChangeAction, not just
+  // forwarded blindly: evaluateExitPlan's regime dimension is a bare
+  // `regimePermission === "close_only"` check with no awareness of the plan
+  // shape, so this module is what enforces "only plans that opted into
+  // regimeChangeAction 'close' ever liquidate on a regime flip."
+  regimePermission?: "allow" | "reduce_size" | "block_new_buys" | "close_only";
+  // Recorded in the regime_change reasoning string alongside regimePermission
+  // so a liquidation's audit trail names the regime that caused it. Purely
+  // descriptive -- never affects the trigger decision above.
+  regimeMode?: string;
 }): ExitEvaluationResult {
   const planExits: PlanExitDecision[] = [];
   const legacyExits: LegacyExitDecision[] = [];
@@ -143,11 +159,18 @@ export function evaluateOpenPositionExits(input: {
       }
     }
 
+    // Only forward this cycle's regime permission to evaluateExitPlan when the
+    // plan itself opted into a "close" regime-change response -- see the
+    // regimePermission doc comment above for why this gating lives here and
+    // not in exitEngine.ts.
+    const regimePermissionForPlan = record.exitPlan.regimeChangeAction === "close" ? input.regimePermission : undefined;
+
     const evaluation = evaluateExitPlan({
       exitPlan: record.exitPlan,
       side: record.side,
       currentPrice: validated.currentPrice,
       now: input.now,
+      regimePermission: regimePermissionForPlan,
       highWaterMark: effectiveHighWaterMark,
     });
 
@@ -157,7 +180,10 @@ export function evaluateOpenPositionExits(input: {
         symbol: pos.symbol,
         qty,
         reason: evaluation.reason as PlanExitReason,
-        reasoning: buildPlanReasoning(evaluation.reason as PlanExitReason, record.exitPlan, validated.currentPrice, effectiveHighWaterMark),
+        reasoning: buildPlanReasoning(evaluation.reason as PlanExitReason, record.exitPlan, validated.currentPrice, effectiveHighWaterMark, {
+          mode: input.regimeMode,
+          permission: regimePermissionForPlan,
+        }),
       });
     }
     // Plan present and numerically valid: it owns this symbol's exit decision
@@ -211,7 +237,13 @@ function validatePlanInputs(pos: OpenPositionSnapshot, exitPlan: ExitPlan): Plan
   return { ok: true, field: "", currentPrice: currentPriceResult.value };
 }
 
-function buildPlanReasoning(reason: PlanExitReason, plan: ExitPlan, currentPrice: number, highWaterMark?: number): string {
+function buildPlanReasoning(
+  reason: PlanExitReason,
+  plan: ExitPlan,
+  currentPrice: number,
+  highWaterMark?: number,
+  regime?: { mode?: string; permission?: string },
+): string {
   switch (reason) {
     case "take_profit":
       return `take_profit hit: target ${Number(plan.takeProfitPrice).toFixed(2)}, current ${currentPrice.toFixed(2)}`;
@@ -222,7 +254,7 @@ function buildPlanReasoning(reason: PlanExitReason, plan: ExitPlan, currentPrice
     case "thesis_invalidation":
       return `thesis_invalidation triggered: ${plan.thesisInvalidation}`;
     case "regime_change":
-      return `regime_change triggered: regimeChangeAction=${plan.regimeChangeAction}`;
+      return `regime_change triggered: regime mode=${regime?.mode ?? "unknown"}, tradePermission=${regime?.permission ?? "unknown"} (plan regimeChangeAction=${plan.regimeChangeAction})`;
     case "trailing_stop": {
       const hwm = Number(highWaterMark);
       const threshold = hwm * (1 - Number(plan.trailingStopPercent) / 100);

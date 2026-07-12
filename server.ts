@@ -982,12 +982,77 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     }
 
     // ==========================================================
+    // MODULE 2.5: MARKET REGIME ASSESSMENT
+    // Feeds real SPY/QQQ trend, broad-market drawdown, and a realized-vol proxy
+    // (src/server/marketDataFetcher.ts) into detectRegime (regimeEngine.ts)
+    // instead of the permanent conservative default a bare `detectRegime({})`
+    // call produces. A persisted assessment younger than REGIME_STALENESS_MS is
+    // reused without a refetch; otherwise this fetches fresh bars and persists
+    // a new assessment. A fetch that comes back with nothing usable (or throws)
+    // degrades to detectRegime({})'s own conservative default -- fail closed,
+    // per docs/GO_LIVE_PLAN.md Phase 1.3. Gated on autoTrading (like MODULE 2
+    // below): this keeps sync hermetic (no Alpaca calls) when trading is off,
+    // matching every other Alpaca call in this file. Runs BEFORE MODULE 2 (Task
+    // 9, docs/GO_LIVE_PLAN.md Phase 1.3) so this cycle's own regime assessment
+    // -- not a stale one from a prior cycle -- feeds both MODULE 2's
+    // regime-change exit dimension immediately below and the buy path further
+    // down this sync.
+    // ==========================================================
+    let regimeAssessment: RegimeAssessment = productionStore.latestRegimeAssessment() || detectRegime({});
+    if (currentConfig.system && currentConfig.system.autoTrading) {
+      const cachedAsOf = regimeAssessment.asOf;
+      const cachedAsOfMs = cachedAsOf ? Date.parse(cachedAsOf) : NaN;
+      const cachedIsFresh = Number.isFinite(cachedAsOfMs) && Date.now() - cachedAsOfMs < REGIME_STALENESS_MS;
+
+      if (cachedIsFresh) {
+        addLog("sync", `Regime assessment reused (asOf ${cachedAsOf}; younger than ${REGIME_STALENESS_MS / 60000} min).`);
+      } else {
+        try {
+          const fetched = await fetchMarketRegimeInputs({
+            brokerConfig: getBrokerConfig(),
+            dataBaseUrl: process.env.ALPACA_DATA_URL || "https://data.alpaca.markets",
+            fetchImpl: fetch,
+          });
+          const assessed = detectRegime(fetched.inputs);
+          regimeAssessment = { ...assessed, asOf: fetched.asOf, inputs: fetched.inputs };
+          if (fetched.unavailableReasons.length) {
+            addLog(
+              "sync",
+              `Regime market-data unavailable for some inputs (falling back to conservative defaults for those fields): ${fetched.unavailableReasons.join("; ")}`,
+            );
+          }
+          addLog(
+            "sync",
+            `Regime assessment refreshed: marketMode=${regimeAssessment.marketMode}, tradePermission=${regimeAssessment.tradePermission}, sizeMultiplier=${regimeAssessment.sizeMultiplier}.`,
+          );
+        } catch (regimeErr: any) {
+          const conservative = detectRegime({});
+          regimeAssessment = { ...conservative, asOf: new Date().toISOString(), inputs: {} };
+          addLog(
+            "error",
+            "Regime market-data refetch failed; falling back to the conservative default (unclear / reduce_size / 0.5x).",
+            regimeErr?.message || String(regimeErr),
+          );
+        }
+        productionStore.saveRegimeAssessment(regimeAssessment);
+      }
+    }
+
+    // ==========================================================
     // MODULE 2: ACTIVE PORTFOLIO RISK CONTROLLER
     // Evaluates each open position's persisted exit plan (stop-loss,
-    // take-profit, time-exit, thesis-invalidation -- see exitEngine.ts) via
-    // evaluateOpenPositionExits (src/server/exitMonitor.ts). A position with no
-    // plan, or a plan that fails numeric validation, falls back to the legacy
-    // hardcoded 5% unrealized_plpc stop-loss so it is never left unprotected.
+    // take-profit, time-exit, thesis-invalidation, regime-change -- see
+    // exitEngine.ts) via evaluateOpenPositionExits (src/server/exitMonitor.ts).
+    // A position with no plan, or a plan that fails numeric validation, falls
+    // back to the legacy hardcoded 5% unrealized_plpc stop-loss so it is never
+    // left unprotected. The regime-change dimension is fed this cycle's
+    // tradePermission/marketMode from MODULE 2.5 above (Task 9,
+    // docs/GO_LIVE_PLAN.md Phase 1.3): a plan whose regimeChangeAction is
+    // "close" liquidates only when tradePermission is affirmatively
+    // "close_only" this cycle. detectRegime({})'s conservative default
+    // (reduce_size) can never be "close_only", so a missing/degraded
+    // market-data feed can never liquidate a position through this dimension --
+    // exits fail closed in the protective direction.
     // See docs/GO_LIVE_PLAN.md Phase 1.2.
     // ==========================================================
     if (currentConfig.system && currentConfig.system.autoTrading) {
@@ -1007,6 +1072,13 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
           })),
           now: new Date(),
           legacyStopLossPercent: stopPercent,
+          // This cycle's regime assessment (MODULE 2.5 above) -- undefined
+          // permission (e.g. autoTrading was off last time regimeAssessment was
+          // computed) is passed through as-is; evaluateExitPlan only ever
+          // triggers on an exact "close_only" match, so undefined/reduce_size/
+          // allow/block_new_buys all fail closed here.
+          regimePermission: regimeAssessment.tradePermission,
+          regimeMode: regimeAssessment.marketMode,
           lookupPlan: (symbol) => productionStore.latestBuySideExitPlanForSymbol(symbol),
           onHighWaterMarkRatchet: (tradeId, symbol, highWaterMark) => {
             try {
@@ -1100,60 +1172,6 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         }
       } catch (riskManagerErr: any) {
         addLog("error", "Portfolio risk evaluator hit error", riskManagerErr.message);
-      }
-    }
-
-    // ==========================================================
-    // MODULE 2.5: MARKET REGIME ASSESSMENT
-    // Feeds real SPY/QQQ trend, broad-market drawdown, and a realized-vol proxy
-    // (src/server/marketDataFetcher.ts) into detectRegime (regimeEngine.ts)
-    // instead of the permanent conservative default a bare `detectRegime({})`
-    // call produces. A persisted assessment younger than REGIME_STALENESS_MS is
-    // reused without a refetch; otherwise this fetches fresh bars and persists
-    // a new assessment. A fetch that comes back with nothing usable (or throws)
-    // degrades to detectRegime({})'s own conservative default -- fail closed,
-    // per docs/GO_LIVE_PLAN.md Phase 1.3. Gated on autoTrading (like MODULE 2
-    // above): the assessment is only ever consumed by the buy path below, and
-    // this keeps sync hermetic (no Alpaca calls) when trading is off, matching
-    // every other Alpaca call in this file.
-    // ==========================================================
-    let regimeAssessment: RegimeAssessment = productionStore.latestRegimeAssessment() || detectRegime({});
-    if (currentConfig.system && currentConfig.system.autoTrading) {
-      const cachedAsOf = regimeAssessment.asOf;
-      const cachedAsOfMs = cachedAsOf ? Date.parse(cachedAsOf) : NaN;
-      const cachedIsFresh = Number.isFinite(cachedAsOfMs) && Date.now() - cachedAsOfMs < REGIME_STALENESS_MS;
-
-      if (cachedIsFresh) {
-        addLog("sync", `Regime assessment reused (asOf ${cachedAsOf}; younger than ${REGIME_STALENESS_MS / 60000} min).`);
-      } else {
-        try {
-          const fetched = await fetchMarketRegimeInputs({
-            brokerConfig: getBrokerConfig(),
-            dataBaseUrl: process.env.ALPACA_DATA_URL || "https://data.alpaca.markets",
-            fetchImpl: fetch,
-          });
-          const assessed = detectRegime(fetched.inputs);
-          regimeAssessment = { ...assessed, asOf: fetched.asOf, inputs: fetched.inputs };
-          if (fetched.unavailableReasons.length) {
-            addLog(
-              "sync",
-              `Regime market-data unavailable for some inputs (falling back to conservative defaults for those fields): ${fetched.unavailableReasons.join("; ")}`,
-            );
-          }
-          addLog(
-            "sync",
-            `Regime assessment refreshed: marketMode=${regimeAssessment.marketMode}, tradePermission=${regimeAssessment.tradePermission}, sizeMultiplier=${regimeAssessment.sizeMultiplier}.`,
-          );
-        } catch (regimeErr: any) {
-          const conservative = detectRegime({});
-          regimeAssessment = { ...conservative, asOf: new Date().toISOString(), inputs: {} };
-          addLog(
-            "error",
-            "Regime market-data refetch failed; falling back to the conservative default (unclear / reduce_size / 0.5x).",
-            regimeErr?.message || String(regimeErr),
-          );
-        }
-        productionStore.saveRegimeAssessment(regimeAssessment);
       }
     }
 

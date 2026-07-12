@@ -263,3 +263,95 @@ test("trailing stop: a plan lacking trailingStopPercent/entryPrice (pre-existing
   });
   assert.equal(result.planExits.length, 0);
 });
+
+// --- Regime-change exit hook (Task 9) ---
+//
+// evaluateOpenPositionExits gates evaluateExitPlan's regime dimension on the
+// PLAN's own regimeChangeAction: the caller's regimePermission is only ever
+// forwarded to evaluateExitPlan when the plan says "close" is its
+// regime-change response. This is what makes "close_only but the plan doesn't
+// opt in" fail to trigger even though exitEngine.ts's own check is a bare
+// `regimePermission === "close_only"` with no awareness of the plan shape.
+//
+// Prices/thresholds below are engineered to be safely inside every other
+// dimension's "no trigger" zone (mid-range price, far stop-loss/take-profit,
+// future timeExitAt, no HWM) so only the regime dimension is under test.
+
+test("regime-change: close_only permission + a plan with regimeChangeAction \"close\" triggers a regime_change exit", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "RGM1", qty: 5, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    regimePermission: "close_only",
+    regimeMode: "risk_off",
+    lookupPlan: planLookup({ RGM1: { side: "buy", exitPlan: basePlan({ regimeChangeAction: "close" }) } }),
+  });
+  assert.equal(result.planExits.length, 1);
+  assert.equal(result.planExits[0].reason, "regime_change");
+  assert.equal(result.legacyExits.length, 0);
+});
+
+test("regime-change: reasoning records the regime mode and permission that triggered the exit", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "RGM2", qty: 1, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    regimePermission: "close_only",
+    regimeMode: "risk_off",
+    lookupPlan: planLookup({ RGM2: { side: "buy", exitPlan: basePlan({ regimeChangeAction: "close" }) } }),
+  });
+  assert.equal(result.planExits.length, 1);
+  assert.match(result.planExits[0].reasoning, /risk_off/);
+  assert.match(result.planExits[0].reasoning, /close_only/);
+});
+
+test("regime-change: permission reduce_size does not trigger a regime exit even with regimeChangeAction \"close\"", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "RGM3", qty: 1, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    regimePermission: "reduce_size",
+    regimeMode: "volatile",
+    lookupPlan: planLookup({ RGM3: { side: "buy", exitPlan: basePlan({ regimeChangeAction: "close" }) } }),
+  });
+  assert.equal(result.planExits.length, 0);
+  assert.equal(result.legacyExits.length, 0);
+});
+
+test("regime-change: permission allow does not trigger a regime exit even with regimeChangeAction \"close\"", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "RGM4", qty: 1, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    regimePermission: "allow",
+    regimeMode: "trend_up",
+    lookupPlan: planLookup({ RGM4: { side: "buy", exitPlan: basePlan({ regimeChangeAction: "close" }) } }),
+  });
+  assert.equal(result.planExits.length, 0);
+});
+
+test("regime-change: close_only but the plan's regimeChangeAction is not \"close\" does not trigger a regime exit", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "RGM5", qty: 1, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    regimePermission: "close_only",
+    regimeMode: "risk_off",
+    lookupPlan: planLookup({ RGM5: { side: "buy", exitPlan: basePlan({ regimeChangeAction: "hold" }) } }),
+  });
+  assert.equal(result.planExits.length, 0);
+  assert.equal(result.legacyExits.length, 0);
+});
+
+test("regime-change: missing/undefined regimePermission does not trigger a regime exit even with regimeChangeAction \"close\"", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "RGM6", qty: 1, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    // regimePermission intentionally omitted -- simulates the absence of any
+    // regime assessment for this cycle (fail-closed: absence must never
+    // liquidate a position).
+    lookupPlan: planLookup({ RGM6: { side: "buy", exitPlan: basePlan({ regimeChangeAction: "close" }) } }),
+  });
+  assert.equal(result.planExits.length, 0);
+});
