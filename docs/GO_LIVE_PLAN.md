@@ -121,11 +121,11 @@ The engines are good; the monolithic `server.ts` bypasses them. Fix the wiring.
 ### 1.2 Exits actually execute
 - [x] **Wire `evaluateExitPlan` into the monitoring loop.** In the portfolio controller (`server.ts:908-979`), load open exit plans and evaluate stop-loss, take-profit, time-exit, and thesis-invalidation against live positions; execute resulting closes through `executeTradeIntent`.
   *Accept:* integration tests for each exit type (position at +take-profit closes; position past `timeExitAt` closes).
-- [ ] **Trailing stop.** Populate and evaluate `trailingStopPercent` (`tradingSafety.ts:43`) in the exit plan.
+- [x] **Trailing stop.** Populate and evaluate `trailingStopPercent` (`tradingSafety.ts:43`) in the exit plan.
   *Accept:* unit test: stop ratchets up with price, triggers on retrace.
 
 ### 1.3 Regime engine gets real data
-- [ ] **Build a market-data fetcher** for SPY & QQQ trend (e.g., 20d vs 50d), broad-market drawdown, and a volatility proxy (VIX or realized SPY vol), using the Alpaca market-data API already configured. Feed the result into `detectRegime(...)` each sync instead of `{}` (`server.ts:656,1208`). Persist each assessment.
+- [x] **Build a market-data fetcher** for SPY & QQQ trend (e.g., 20d vs 50d), broad-market drawdown, and a volatility proxy (VIX or realized SPY vol), using the Alpaca market-data API already configured. Feed the result into `detectRegime(...)` each sync instead of `{}` (`server.ts:656,1208`). Persist each assessment.
   *Accept:* regime assessments in SQLite show non-"unclear" modes with real inputs recorded; staleness > 30 min falls back to conservative default (fail closed).
 - [ ] **Regime-change exit hook.** When regime transitions to `close_only`, the exit monitor evaluates `regimeChangeAction` on open plans.
   *Accept:* test simulating regime flip closes flagged positions.

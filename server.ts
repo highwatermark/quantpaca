@@ -35,6 +35,8 @@ import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
 import { loadCooldownConfig } from "./src/server/cooldownConfig";
 import { sizeTradeIntent } from "./src/server/sizingEngine";
+import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marketDataFetcher";
+import { RegimeAssessment } from "./src/server/domainTypes";
 
 dotenv.config();
 
@@ -1101,6 +1103,60 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
       }
     }
 
+    // ==========================================================
+    // MODULE 2.5: MARKET REGIME ASSESSMENT
+    // Feeds real SPY/QQQ trend, broad-market drawdown, and a realized-vol proxy
+    // (src/server/marketDataFetcher.ts) into detectRegime (regimeEngine.ts)
+    // instead of the permanent conservative default a bare `detectRegime({})`
+    // call produces. A persisted assessment younger than REGIME_STALENESS_MS is
+    // reused without a refetch; otherwise this fetches fresh bars and persists
+    // a new assessment. A fetch that comes back with nothing usable (or throws)
+    // degrades to detectRegime({})'s own conservative default -- fail closed,
+    // per docs/GO_LIVE_PLAN.md Phase 1.3. Gated on autoTrading (like MODULE 2
+    // above): the assessment is only ever consumed by the buy path below, and
+    // this keeps sync hermetic (no Alpaca calls) when trading is off, matching
+    // every other Alpaca call in this file.
+    // ==========================================================
+    let regimeAssessment: RegimeAssessment = productionStore.latestRegimeAssessment() || detectRegime({});
+    if (currentConfig.system && currentConfig.system.autoTrading) {
+      const cachedAsOf = regimeAssessment.asOf;
+      const cachedAsOfMs = cachedAsOf ? Date.parse(cachedAsOf) : NaN;
+      const cachedIsFresh = Number.isFinite(cachedAsOfMs) && Date.now() - cachedAsOfMs < REGIME_STALENESS_MS;
+
+      if (cachedIsFresh) {
+        addLog("sync", `Regime assessment reused (asOf ${cachedAsOf}; younger than ${REGIME_STALENESS_MS / 60000} min).`);
+      } else {
+        try {
+          const fetched = await fetchMarketRegimeInputs({
+            brokerConfig: getBrokerConfig(),
+            dataBaseUrl: process.env.ALPACA_DATA_URL || "https://data.alpaca.markets",
+            fetchImpl: fetch,
+          });
+          const assessed = detectRegime(fetched.inputs);
+          regimeAssessment = { ...assessed, asOf: fetched.asOf, inputs: fetched.inputs };
+          if (fetched.unavailableReasons.length) {
+            addLog(
+              "sync",
+              `Regime market-data unavailable for some inputs (falling back to conservative defaults for those fields): ${fetched.unavailableReasons.join("; ")}`,
+            );
+          }
+          addLog(
+            "sync",
+            `Regime assessment refreshed: marketMode=${regimeAssessment.marketMode}, tradePermission=${regimeAssessment.tradePermission}, sizeMultiplier=${regimeAssessment.sizeMultiplier}.`,
+          );
+        } catch (regimeErr: any) {
+          const conservative = detectRegime({});
+          regimeAssessment = { ...conservative, asOf: new Date().toISOString(), inputs: {} };
+          addLog(
+            "error",
+            "Regime market-data refetch failed; falling back to the conservative default (unclear / reduce_size / 0.5x).",
+            regimeErr?.message || String(regimeErr),
+          );
+        }
+        productionStore.saveRegimeAssessment(regimeAssessment);
+      }
+    }
+
     // Variable to store Gmail messages
     let emailsToScan: EmailScanTarget[] = [];
 
@@ -1369,7 +1425,12 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
               openOrders: await getAlpacaOpenOrders(),
               source: getBrokerConfig().configured ? "alpaca" : "local_simulated_snapshot",
             });
-            const regime = productionStore.latestRegimeAssessment() || detectRegime({});
+            // Reuse this sync's already-fetched/persisted assessment (MODULE 2.5)
+            // rather than re-querying the store or recomputing per item; recompute
+            // with this item's symbol only to pick up the BTC-linked reason text
+            // for crypto-linked equities (see regimeEngine.ts) -- marketMode/
+            // tradePermission/sizeMultiplier are unaffected by symbol.
+            const regime = detectRegime({ ...regimeAssessment.inputs, symbol: item.symbol });
             const stopLossPercent = Number(currentConfig.system.stopLossPercent);
             if (!Number.isFinite(stopLossPercent) || stopLossPercent <= 0) {
               addLog("error", `Order skipped for ${item.symbol}. stopLossPercent is not a positive finite number.`);
