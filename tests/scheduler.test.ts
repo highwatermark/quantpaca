@@ -60,6 +60,7 @@ type DepsState = {
   cycleResults: Array<{ failed: boolean }>;
   pauseCalls: number;
   runCalls: number;
+  tradingReady: boolean;
 };
 
 function makeDeps(): { state: DepsState; deps: SchedulerDeps } {
@@ -72,6 +73,7 @@ function makeDeps(): { state: DepsState; deps: SchedulerDeps } {
     cycleResults: [],
     pauseCalls: 0,
     runCalls: 0,
+    tradingReady: true,
   };
   const deps: SchedulerDeps = {
     now: () => 0,
@@ -82,6 +84,7 @@ function makeDeps(): { state: DepsState; deps: SchedulerDeps } {
     clearTimer: () => {},
     getIntervalMinutesRaw: () => state.intervalRaw,
     isAutoTradingOn: () => state.autoTradingOn,
+    isTradingReady: () => state.tradingReady,
     runScheduledCycle: async () => {
       state.runCalls++;
       return state.cycleResults.shift() || { failed: false };
@@ -129,6 +132,29 @@ test("autoTrading off: a tick skips running a cycle entirely", async () => {
   const scheduler = createScheduler(deps);
   await scheduler.runTickNow();
   assert.equal(state.runCalls, 0);
+});
+
+// Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): startup reconciliation.
+test("startup reconciliation pending: a tick skips running a cycle entirely and logs it, but still re-arms the next tick", async () => {
+  const { state, deps } = makeDeps();
+  state.tradingReady = false;
+  const scheduler = createScheduler(deps);
+  await scheduler.runTickNow();
+  assert.equal(state.runCalls, 0);
+  assert.ok(
+    state.logs.some((l) => /skip/i.test(l) && /startup reconciliation pending/i.test(l)),
+    `expected a "startup reconciliation pending" skip log, got: ${JSON.stringify(state.logs)}`,
+  );
+  assert.equal(state.timers.length, 1, "the scheduler must keep ticking (re-arm) while reconciliation is pending");
+});
+
+test("startup reconciliation ready + autoTrading on: a tick runs a cycle normally", async () => {
+  const { state, deps } = makeDeps();
+  state.tradingReady = true;
+  state.autoTradingOn = true;
+  const scheduler = createScheduler(deps);
+  await scheduler.runTickNow();
+  assert.equal(state.runCalls, 1);
 });
 
 test("interval is read fresh on every tick, so a config change applies without restart", async () => {

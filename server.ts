@@ -52,6 +52,15 @@ import { RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
 import { EMPTY_SYNC_ALERT_STATE_KEY, shouldSendThrottledAlert } from "./src/server/alertThrottle";
 import { createScheduler, MAX_BUYS_PER_CYCLE, MAX_CONSECUTIVE_FAILURES } from "./src/server/scheduler";
+import {
+  buyGateRejectionReason,
+  clearOrphans,
+  getOrphanOrders,
+  hasUnresolvedOrphans,
+  isTradingReady,
+  runStartupReconciliation,
+  STARTUP_ORPHANS_APP_STATE_KEY,
+} from "./src/server/startupReconciliation";
 
 dotenv.config();
 
@@ -307,15 +316,27 @@ async function executeTradeIntent(input: {
       cooldownLoadFailed = true;
     }
   }
+  // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2, startup reconciliation):
+  // the order chokepoint for boot safety. Computed BEFORE the tradability
+  // network call below (same "don't spend a network call on an order that's
+  // rejected either way" reasoning the market-hours gate already documents)
+  // since this is the cheapest, most fundamental check -- until startup
+  // reconciliation has completed at least once, this process does not yet
+  // know the true state of its own open orders, so no new BUY may increase
+  // exposure. Undefined for a sell -- see startupReconciliation.ts's
+  // buyGateRejectionReason, which is always undefined for "sell".
+  const reconciliationRejectionReason = buyGateRejectionReason(input.request.side);
+
   // Phase 2 Task 3: per-asset tradability guard (BUY only, fail closed on any
   // fetch/parse failure). Skipped when the broker isn't configured (simulated/
   // dry-run mode has no Alpaca asset endpoint to check against -- same
   // precedent as checkMarketOpenForScheduledCycle treating an unconfigured
-  // broker as open) and when the market-hours chokepoint has already rejected
-  // this BUY (no need to spend a network call and cache slot on an order that
+  // broker as open), when the market-hours chokepoint has already rejected
+  // this BUY, and when the startup-reconciliation gate above already has
+  // (no need to spend a network call and cache slot on an order that
   // is rejected either way).
   let tradabilityRejectionReason: string | null = null;
-  if (input.request.side === "buy" && brokerConfig.configured && !input.marketKnownClosed) {
+  if (input.request.side === "buy" && brokerConfig.configured && !input.marketKnownClosed && !reconciliationRejectionReason) {
     const tradability = await checkAssetTradable(input.request.symbol, {
       baseUrl: brokerConfig.baseUrl,
       apiKey: brokerConfig.apiKey,
@@ -323,7 +344,9 @@ async function executeTradeIntent(input: {
     });
     if (!tradability.tradable) tradabilityRejectionReason = tradability.reason;
   }
-  const riskDecision: RiskDecision = input.marketKnownClosed && input.request.side === "buy"
+  const riskDecision: RiskDecision = reconciliationRejectionReason
+    ? { status: "rejected", reason: reconciliationRejectionReason }
+    : input.marketKnownClosed && input.request.side === "buy"
     ? { status: "rejected", reason: "Market is closed (or clock state unknown); BUY blocked at the market-hours chokepoint. Risk-reducing sells are exempt." }
     : tradabilityRejectionReason
     ? { status: "rejected", reason: tradabilityRejectionReason }
@@ -1513,6 +1536,40 @@ app.post("/api/reconciliation/run", requireAdminCommand, async (req, res) => {
   }
 });
 
+// Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): startup reconciliation's
+// orphan sweep never auto-cancels an unmatched open broker order -- it might
+// be a legitimate manual order a human placed directly, and canceling
+// something a human is relying on would be its own incident. Instead new
+// BUYs stay blocked (sells are unaffected) while ANY orphan is unresolved.
+// This route is how a human resolves that block after reviewing the orphan
+// list (GET /api/reconciliation/latest does not carry it; read it via
+// productionStore's app_state key if needed, or trust the Telegram alert this
+// module sends when an orphan is first found). Clearing is explicitly a
+// "trust" operation, not a "fix" operation: it does NOT cancel, modify, or
+// otherwise touch the underlying broker order(s) -- they are left exactly as
+// they were. If the same order is still open and still unmatched at the next
+// boot (or next scheduled reconciliation, once that exists), it will be
+// flagged again.
+app.post("/api/reconciliation/orphans/clear", requireAdminCommand, async (req, res) => {
+  const clearedOrphans = clearOrphans();
+  try {
+    productionStore.setAppState(STARTUP_ORPHANS_APP_STATE_KEY, JSON.stringify([]));
+    productionStore.appendAuditEvents([
+      {
+        id: `ae-orphans-clear-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        type: "broker",
+        actor: "admin_api",
+        message: `Admin cleared ${clearedOrphans.length} orphan broker order(s) after review; BUY orders unblocked. The underlying broker order(s) were NOT canceled.`,
+        details: { clearedCount: clearedOrphans.length, clearedOrphanIds: clearedOrphans.map((o) => o.id) },
+      },
+    ]);
+  } catch (err) {
+    console.error("[reconciliation] Failed to persist the cleared orphan list; the in-memory BUY gate is unblocked regardless.", err);
+  }
+  res.json({ cleared: clearedOrphans.length, orphans: clearedOrphans });
+});
+
 app.get("/api/telegram/status", (req, res) => {
   const roles = parseTelegramAdminRoles(process.env.TELEGRAM_ADMIN_ROLES);
   res.json({
@@ -1535,6 +1592,14 @@ app.get("/api/health", async (req, res) => {
       baseUrl: broker.baseUrl,
       reachable: false,
       error: undefined as string | undefined,
+    },
+    // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): startup reconciliation
+    // visibility -- lets an operator (or a test) see the BUY gate's state
+    // without reaching into app_state/SQLite directly.
+    startupReconciliation: {
+      tradingReady: isTradingReady(),
+      orphanCount: getOrphanOrders().length,
+      hasUnresolvedOrphans: hasUnresolvedOrphans(),
     },
   };
   if (broker.configured) {
@@ -2923,6 +2988,10 @@ const scheduler = createScheduler({
   clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
   getIntervalMinutesRaw: () => readDB().config?.system?.runIntervalMins,
   isAutoTradingOn: () => Boolean(readDB().config?.system?.autoTrading),
+  // Phase 2 Task 6: read fresh every tick, same as isAutoTradingOn -- a tick
+  // that fires while startup reconciliation is still pending (or retrying)
+  // skips the whole cycle (scheduler.ts logs "startup reconciliation pending").
+  isTradingReady: () => isTradingReady(),
   runScheduledCycle: async () => {
     const result = await runSyncCycle("scheduled", null);
     return { failed: result.ok ? result.failed : true };
@@ -2983,6 +3052,66 @@ async function runScheduledSyncTickForTests(): Promise<void> {
   await scheduler.runTickNow();
 }
 
+// Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): the boot-time reconciliation
+// step, wired here as a standalone async function (not inlined in run()) so
+// tests can invoke exactly this -- with the real store/broker/Telegram
+// plumbing -- without booting vite/the HTTP listener/process guards the rest
+// of run() sets up. Mirrors runScheduledSyncTickForTests's existing pattern.
+// Resolves once the FIRST reconciliation attempt completes; every retry after
+// that runs in the background via the injected setTimer (see
+// startupReconciliation.ts's runStartupReconciliation for why this never
+// blocks server startup for the full retry budget).
+async function performStartupReconciliation(): Promise<void> {
+  const brokerConfig = getBrokerConfig();
+  try {
+    await runStartupReconciliation({
+      brokerConfig,
+      fetchImpl: fetch,
+      // Same bounded window every other pollPendingOrders call site in this
+      // file uses (productionStore.listTradeIntents(250)).
+      listTrades: () => productionStore.listTradeIntents(250),
+      saveTrade: (trade) => productionStore.saveTradeIntent(trade),
+      cancelOrder: (orderId) => cancelAlpacaOrder(brokerConfig, orderId),
+      // Straight to the durable SQLite store (bypasses db.json/dbMutex --
+      // GET /api/audit already prefers productionStore.listAuditEvents()
+      // over db.auditEvents whenever the former is non-empty, so this alone
+      // is sufficient for every audit-reading route/test to see these events).
+      appendAuditEvents: (events) =>
+        productionStore.appendAuditEvents(
+          events.map((event) => ({
+            id: `ae-startup-reconciliation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            actor: "startup_reconciliation",
+            ...event,
+          })),
+        ),
+      persistOrphans: (orphans) => productionStore.setAppState(STARTUP_ORPHANS_APP_STATE_KEY, JSON.stringify(orphans)),
+      sendTelegramAlert: (message) => sendTelegramAlert(readDB().config?.telegram, message),
+      log: (message) => console.log(message),
+      setTimer: (callback, delayMs) => {
+        const handle = setTimeout(callback, delayMs);
+        handle.unref?.();
+        return handle;
+      },
+      clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    });
+  } catch (err: any) {
+    // runStartupReconciliation is documented to never throw (every I/O path
+    // inside it is caught) -- this is a defensive backstop only, so a bug in
+    // that guarantee can never crash the boot sequence itself. tradingReady
+    // simply stays at whatever it already was (false, on a fresh boot) --
+    // fail closed.
+    console.error("[startup-reconciliation] Unexpected error running startup reconciliation; BUY orders stay blocked.", err?.message || err);
+  }
+}
+
+// Test-visible manual trigger (same rationale as runScheduledSyncTickForTests
+// above): runs exactly the real boot-time reconciliation logic on demand,
+// without waiting for run() (which NODE_ENV=test never calls).
+async function runStartupReconciliationForTests(): Promise<void> {
+  await performStartupReconciliation();
+}
+
 // Dev support or vite mounting
 async function run() {
   const startupIssues = validateStartupEnv(process.env);
@@ -2994,6 +3123,15 @@ async function run() {
     console.error("[startup] Fatal configuration issues found. Refusing to start.");
     process.exit(1);
   }
+
+  // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): startup reconciliation.
+  // Runs BEFORE the HTTP server starts accepting connections and BEFORE
+  // scheduler.start() -- store is already open (productionStore, module
+  // scope, above) at this point. Skipped only implicitly: run() itself is
+  // never called under NODE_ENV=test (see the bottom of this file), and
+  // performStartupReconciliation's own runStartupReconciliation call treats
+  // an unconfigured broker as "nothing to reconcile, ready immediately".
+  await performStartupReconciliation();
 
   const distPath = path.join(process.cwd(), "dist");
 
@@ -3024,7 +3162,7 @@ async function run() {
   });
 }
 
-export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests };
+export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests, runStartupReconciliationForTests };
 
 if (process.env.NODE_ENV !== "test") {
   run();

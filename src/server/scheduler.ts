@@ -68,6 +68,13 @@ export type SchedulerDeps = {
   // applies without a server restart.
   getIntervalMinutesRaw: () => unknown;
   isAutoTradingOn: () => boolean;
+  // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2, startup reconciliation):
+  // backed by src/server/startupReconciliation.ts's isTradingReady(). A tick
+  // that finds this false skips the ENTIRE scheduled cycle (not just BUYs --
+  // see the module doc comment there for why a plain "not ready" is a
+  // stronger condition than "orphans found", which only blocks BUYs at the
+  // executeTradeIntent chokepoint while cycles keep running normally).
+  isTradingReady: () => boolean;
   // Runs exactly one scheduled sync cycle end-to-end and reports whether it
   // counts as failed (threw, or every ingestion source errored -- see
   // server.ts's runSyncCycle). Expected to never throw; if it does, the tick
@@ -119,6 +126,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
     if (!deps.isAutoTradingOn()) {
       deps.log("[scheduler] Tick skipped: autoTrading is off.");
+      armNext(intervalMinutes);
+      return;
+    }
+
+    if (!deps.isTradingReady()) {
+      deps.log("[scheduler] Tick skipped: startup reconciliation pending.");
       armNext(intervalMinutes);
       return;
     }
