@@ -1634,7 +1634,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
               stopLossPrice: price * (1 - stopLossPercent / 100),
               limits: {
                 maxSinglePositionPercent: currentConfig.system.maxPositionSizePercent,
-                maxPortfolioExposurePercent: 100,
+                maxPortfolioExposurePercent: riskLimits.maxPortfolioExposurePercent,
                 maxNotionalPerTrade: maxPositionValue,
                 minBuyingPowerAfterTrade: riskLimits.minBuyingPower,
               },

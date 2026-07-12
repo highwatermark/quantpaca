@@ -9,6 +9,7 @@ export interface RiskLimits {
   maxDrawdownFromPeakPercent: FiniteNumber;
   maxDrawdownFromBaselinePercent: FiniteNumber;
   baselineEquity: FiniteNumber | null;
+  maxPortfolioExposurePercent: FiniteNumber;
 }
 
 type RequiredPositiveKey = Exclude<keyof RiskLimits, "baselineEquity">;
@@ -37,6 +38,26 @@ export function loadRiskLimits(
       continue;
     }
     limits[key] = parsed.value;
+  }
+
+  // Portfolio-level exposure cap: bounded to (0, 100] since it is a percent-of-equity
+  // ceiling on aggregate long exposure, unlike the other REQUIRED_POSITIVE limits above
+  // which have no natural upper bound.
+  const rawMaxPortfolioExposurePercent = env.QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT ?? "60";
+  const parsedMaxPortfolioExposurePercent = parseFiniteNumber(
+    rawMaxPortfolioExposurePercent,
+    "QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT",
+  );
+  if (
+    !parsedMaxPortfolioExposurePercent.ok ||
+    parsedMaxPortfolioExposurePercent.value <= 0 ||
+    parsedMaxPortfolioExposurePercent.value > 100
+  ) {
+    errors.push(
+      `QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT="${String(rawMaxPortfolioExposurePercent)}" must be a finite number in (0, 100].`,
+    );
+  } else {
+    limits.maxPortfolioExposurePercent = parsedMaxPortfolioExposurePercent.value;
   }
 
   // Optional: when unset, the baseline-drawdown breaker check is skipped (conservative
