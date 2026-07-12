@@ -998,7 +998,23 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
     // regime-change exit dimension immediately below and the buy path further
     // down this sync.
     // ==========================================================
-    let regimeAssessment: RegimeAssessment = productionStore.latestRegimeAssessment() || detectRegime({});
+    // The store read is fallible (persistence calls can throw -- same reason
+    // exitMonitor.ts documents lookupPlan as throw-capable) and, since the
+    // Task 9 reorder, it now runs BEFORE MODULE 2's protective exits. It must
+    // therefore never abort the sync: a broken regime store degrades to
+    // detectRegime({})'s conservative default (reduce_size -- which can never
+    // fire regime-change exits) so exit evaluation still runs this cycle.
+    let regimeAssessment: RegimeAssessment;
+    try {
+      regimeAssessment = productionStore.latestRegimeAssessment() || detectRegime({});
+    } catch (regimeStoreErr: any) {
+      regimeAssessment = detectRegime({});
+      addLog(
+        "error",
+        "Regime assessment store read failed; degrading to the conservative default (unclear / reduce_size / 0.5x) so exit evaluation still runs this cycle.",
+        regimeStoreErr?.message || String(regimeStoreErr),
+      );
+    }
     if (currentConfig.system && currentConfig.system.autoTrading) {
       const cachedAsOf = regimeAssessment.asOf;
       const cachedAsOfMs = cachedAsOf ? Date.parse(cachedAsOf) : NaN;
@@ -1034,7 +1050,18 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
             regimeErr?.message || String(regimeErr),
           );
         }
-        productionStore.saveRegimeAssessment(regimeAssessment);
+        // Persisting is best-effort for the same reason as the read above:
+        // a broken store must not abort the sync before MODULE 2's protective
+        // exits run. The in-memory regimeAssessment still feeds this cycle.
+        try {
+          productionStore.saveRegimeAssessment(regimeAssessment);
+        } catch (regimeSaveErr: any) {
+          addLog(
+            "error",
+            "Regime assessment could not be persisted; continuing with the in-memory assessment for this cycle.",
+            regimeSaveErr?.message || String(regimeSaveErr),
+          );
+        }
       }
     }
 

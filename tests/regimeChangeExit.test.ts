@@ -337,3 +337,62 @@ test("no regime exit: a benign regime (mild-rise bars) does not liquidate a posi
     `expected no sell for RGBENIGN under a benign regime, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`,
   );
 });
+
+test("fail-open for protection: a throwing regime-assessment store read degrades to the conservative default and MODULE 2 exits still evaluate (a triggered take-profit fires)", async (t) => {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  currentBars = buildMildRiseBars();
+  positionsFixture = [];
+
+  await setAutoTrading(port);
+
+  const buy = await placeOrder(port, { symbol: "RGDBFAIL", qty: 2, side: "buy", price: 100 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body.trade.riskDecision));
+  // Plan created by executeTradeIntent: takeProfitPrice = 115 (15% target).
+  // The mocked position below sits at 130 -- take_profit is clearly triggered.
+  positionsFixture = [
+    {
+      symbol: "RGDBFAIL",
+      qty: "2",
+      market_value: "260",
+      cost_basis: "200",
+      unrealized_pl: "60.00",
+      current_price: "130",
+      avg_entry_price: "100",
+    },
+  ];
+
+  // Sabotage the regime-assessment storage via a second raw DB handle (pattern:
+  // tests/symbolCooldown.test.ts): the server's long-lived store handle will now
+  // throw "no such table" on latestRegimeAssessment()/saveRegimeAssessment().
+  // This MUST NOT suppress MODULE 2 -- exits are protective, so a broken regime
+  // store degrades to the conservative default (reduce_size, which can never
+  // fire regime exits) while every other exit dimension still evaluates.
+  // NOTE: this test must stay LAST in the file, and no createProductionStore
+  // helper may be called between the drop and the sync -- opening a new store
+  // handle recreates the table (CREATE TABLE IF NOT EXISTS) and would silently
+  // defuse the sabotage.
+  const { DatabaseSync } = await import("node:sqlite");
+  const raw = new DatabaseSync(sqlitePath);
+  raw.exec("DROP TABLE regime_assessments");
+  raw.close();
+
+  const sync = await runSync(port);
+
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const exitTrade = trades.find((tr) => tr.symbol === "RGDBFAIL" && tr.side === "sell");
+  assert.ok(
+    exitTrade,
+    `expected the take-profit exit to fire despite the broken regime store, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`,
+  );
+  assert.match(exitTrade.reasoning, /take_profit/);
+
+  // And the degradation must be visible in the sync log, not silent.
+  const logLines: string[] = sync.logs.map((l: any) => `${l.message} ${l.details || ""}`);
+  assert.ok(
+    logLines.some((line) => /regime/i.test(line) && /(unavailable|conservative|degrad|fail)/i.test(line)),
+    `expected a log entry about the regime store degradation, got: ${JSON.stringify(logLines)}`,
+  );
+});
