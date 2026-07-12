@@ -2331,6 +2331,26 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
           } else if (item.decision === "SELL" && currentShares && parseInt(currentShares.qty) > 0) {
             const qty = parseInt(currentShares.qty);
             addLog("sync", `Submitting sell recommendation intent to close position of ${qty} shares for ${item.symbol}...`);
+
+            // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): the automation
+            // SELL-decision path is a sell call site like any other -- clear
+            // this symbol's live bracket legs first (shared helper; same
+            // fail-closed semantics as MODULE 2). A cancel failure skips
+            // THIS cycle's sell only (log + audit, both handled here/in the
+            // helper) -- the broker legs remain the position's protection,
+            // the analysis loop continues with the next target, and the
+            // next cycle re-evaluates. Without this, every trend-reversal
+            // close on a bracket-protected position would be deterministically
+            // rejected by Alpaca ("insufficient qty -- held for orders").
+            const legCancel = await cancelBracketLegsBeforeSell({ db, symbol: item.symbol, actor: "automation" });
+            if (!legCancel.ok) {
+              addLog("error", `Automation SELL for ${item.symbol} skipped this cycle: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);
+              continue;
+            }
+            if (legCancel.canceledCount > 0) {
+              addLog("trade", `Canceled ${legCancel.canceledCount} bracket leg(s) for ${item.symbol} before the automation sell.`);
+            }
+
             const newTrade = await executeTradeIntent({
               db,
               config: currentConfig,

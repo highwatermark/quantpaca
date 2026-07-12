@@ -43,7 +43,10 @@ function barsResponse() {
   });
 }
 
-const analysisFixture = {
+// Mutable: the default NONE decision keeps the automation order path inert for
+// the MODULE 2 (exit monitor) tests; the automation-SELL tests below swap in a
+// SELL decision (whipsawVerdict "reversal" so the whipsaw gate lets it through).
+let analysisFixture: Record<string, unknown> = {
   symbol: "NONE",
   growthScore: 0,
   sentimentScore: 0,
@@ -53,6 +56,26 @@ const analysisFixture = {
   whipsawVerdict: "unclear",
   decision: "NONE",
 };
+
+function resetAnalysisFixtureToNone() {
+  analysisFixture = { ...analysisFixture, symbol: "NONE", decision: "NONE", whipsawVerdict: "unclear" };
+}
+
+function sellAnalysisFixtureFor(symbol: string) {
+  analysisFixture = {
+    symbol,
+    // Confidence is derived as (growthScore + max(sentimentScore, 0)) / 2 and
+    // must clear the signal review's low_confidence floor (35) or the SELL
+    // decision never reaches the order path at all.
+    growthScore: 80,
+    sentimentScore: 80,
+    riskProfile: "High",
+    reasoning: "trend reversal thesis for this held position",
+    whipsawCheck: "verified reversal",
+    whipsawVerdict: "reversal", // SELL passes the whipsaw gate only on a verified reversal
+    decision: "SELL",
+  };
+}
 
 function fixtureMessageResponse(content: Array<{ type: "text"; text: string }>) {
   return new Response(
@@ -298,6 +321,113 @@ test("cancel failure fails closed: when a leg cancel fails, the software exit is
   rawStore.close();
   assert.ok(
     auditEvents.some((e) => /BRAK2/.test(e.message) && /(cancel|leg)/i.test(e.message)),
+    `expected an audited event about the failed leg cancel, got: ${JSON.stringify(auditEvents.map((e) => e.message))}`,
+  );
+});
+
+test("automation SELL decision on a bracket-protected position: the live legs are canceled (DELETE observed) before the sell is submitted", async (t) => {
+  resetMockBroker();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+  t.after(resetAnalysisFixtureToNone);
+
+  await setAutoTrading(port);
+
+  const buy = await placeOrder(port, { symbol: "AUTOSELL", qty: 2, side: "buy", price: 100 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
+  const legIds: string[] = buy.body.trade.brokerLegOrderIds;
+  assert.equal(legIds.length, 2, "sanity: the buy was placed as a bracket with two legs");
+
+  // Held at cost -- no exit-plan dimension (stop 95 / TP 115 / trailing / time)
+  // is anywhere near triggering, so MODULE 2 stays quiet and the ONLY sell
+  // this sync can produce is the automation SELL-decision path under test.
+  positionsFixture = [
+    {
+      symbol: "AUTOSELL",
+      qty: "2",
+      market_value: "200",
+      cost_basis: "200",
+      unrealized_pl: "0.00",
+      unrealized_plpc: "0.0000",
+      current_price: "100",
+      avg_entry_price: "100",
+    },
+  ];
+  sellAnalysisFixtureFor("AUTOSELL");
+  postedOrders = [];
+
+  const sync = await runSync(port);
+
+  // Both legs canceled...
+  for (const legId of legIds) {
+    assert.ok(deleteCalls.includes(legId), `expected DELETE /orders/${legId}, got: ${JSON.stringify(deleteCalls)}`);
+  }
+  // ...then the automation sell reached the broker, plain.
+  const sellPost = postedOrders.find((o) => o.body.symbol === "AUTOSELL" && o.body.side === "sell");
+  assert.ok(sellPost, `expected the automation sell to reach the broker, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
+  assert.equal(sellPost!.body.order_class, undefined, "liquidation sells must stay plain");
+
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const sellTrade = trades.find((tr) => tr.symbol === "AUTOSELL" && tr.side === "sell");
+  assert.ok(sellTrade, "expected the automation sell trade to be recorded");
+  assert.equal(sellTrade.status, "Accepted", JSON.stringify(sellTrade));
+});
+
+test("automation SELL where a leg cancel fails: the sell is skipped this cycle (no sell POST), the skip is logged + audited, and the sync cycle still completes", async (t) => {
+  resetMockBroker();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+  t.after(resetAnalysisFixtureToNone);
+
+  await setAutoTrading(port);
+
+  const buy = await placeOrder(port, { symbol: "AUTOFAIL", qty: 1, side: "buy", price: 100 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
+  const legIds: string[] = buy.body.trade.brokerLegOrderIds;
+  assert.equal(legIds.length, 2);
+  deleteShouldFailFor.add(legIds[0]);
+
+  positionsFixture = [
+    {
+      symbol: "AUTOFAIL",
+      qty: "1",
+      market_value: "100",
+      cost_basis: "100",
+      unrealized_pl: "0.00",
+      unrealized_plpc: "0.0000",
+      current_price: "100",
+      avg_entry_price: "100",
+    },
+  ];
+  sellAnalysisFixtureFor("AUTOFAIL");
+  postedOrders = [];
+
+  const sync = await runSync(port);
+
+  // No sell may reach the broker while the legs could not be cleared.
+  const sellPost = postedOrders.find((o) => o.body.symbol === "AUTOFAIL" && o.body.side === "sell");
+  assert.equal(sellPost, undefined, "the automation sell must be skipped when a leg cancel fails");
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  assert.equal(
+    trades.find((tr) => tr.symbol === "AUTOFAIL" && tr.side === "sell"),
+    undefined,
+    "no sell trade record should exist for the skipped automation sell",
+  );
+
+  // The skip is logged...
+  const logLines: string[] = (sync.logs || []).map((l: any) => `${l.message} ${l.details || ""}`);
+  assert.ok(
+    logLines.some((line) => /AUTOFAIL/.test(line) && /(cancel|leg)/i.test(line)),
+    `expected a log entry about the failed leg cancel, got: ${JSON.stringify(logLines)}`,
+  );
+  // ...and audited.
+  const rawStore = createProductionStore(sqlitePath);
+  const auditEvents = rawStore.listAuditEvents(500);
+  rawStore.close();
+  assert.ok(
+    auditEvents.some((e) => /AUTOFAIL/.test(e.message) && /(cancel|leg)/i.test(e.message)),
     `expected an audited event about the failed leg cancel, got: ${JSON.stringify(auditEvents.map((e) => e.message))}`,
   );
 });
