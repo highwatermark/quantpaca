@@ -1,0 +1,200 @@
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4): the per-source signal
+// registry. Extends Gmail ingestion from a single hardcoded ZipTrader query
+// (the pre-Task-8 behavior in server.ts) to a config-driven list of sources
+// -- each declaring its own Gmail query, sender allowlist, trust tier, and
+// freshness window. Config is DATA (a JSON file), not code and not an env
+// var, so an operator can add Motley Fool / Burry-style sources (the next two
+// tasks) without a deploy.
+//
+// Fail-closed validation, per the plan's standing rule ("never a partial
+// guess"): a malformed FILE disables every source; a malformed ENTRY disables
+// only that entry, leaving the rest of the file live. Both are reported back
+// via `issues` so the caller (server.ts) can log them and fire a (throttled)
+// Telegram alert -- this module itself has no logging/alerting side effects,
+// it only decides and reports.
+//
+// The registry is read fresh on every call (no in-memory caching here) so an
+// operator's edit to the file takes effect on the very next sync cycle,
+// without a restart.
+
+import fs from "node:fs";
+import path from "node:path";
+import { TrustTier } from "./domainTypes";
+import { parseFiniteNumber } from "./numericSafety";
+
+export type SourceConfig = {
+  id: string;
+  gmailQuery: string;
+  senderAllowlist: string[];
+  trustTier: TrustTier;
+  maxAgeHours: number;
+  enabled: boolean;
+};
+
+// Guardrail 8 (docs/GO_LIVE_PLAN.md Phase 2.1): bounds both per-source and
+// aggregate Gmail ingestion volume, independent of how many sources an
+// operator lists in the registry file. GMAIL_MAX_RESULTS_PER_SOURCE replaces
+// the inline `maxResults=5` literal the pre-Task-8 single-source query used;
+// MAX_ENABLED_SOURCES_PER_CYCLE is new -- it caps how many registry entries a
+// single sync cycle will ever iterate over (and therefore how many Claude
+// calls email ingestion alone can trigger).
+export const GMAIL_MAX_RESULTS_PER_SOURCE = 5;
+export const MAX_ENABLED_SOURCES_PER_CYCLE = 8;
+
+// The default registry, shipped so a fresh deploy (or an upgrade from the
+// pre-Task-8 hardcoded single source) keeps working with zero operator
+// action: exactly the existing ZipTrader source, unchanged query/allowlist/
+// maxAgeHours (72h, matching signalEngine.ts's prior hardcoded default).
+const DEFAULT_SOURCES: SourceConfig[] = [
+  {
+    id: "ziptrader",
+    gmailQuery: "from:charlie-from-ziptrader@ghost.io",
+    senderAllowlist: ["charlie-from-ziptrader@ghost.io"],
+    trustTier: "high",
+    maxAgeHours: 72,
+    enabled: true,
+  },
+];
+
+export type SourceRegistryIssue = {
+  scope: "file" | "entry";
+  // Only present for scope "entry" when the entry at least had a usable id;
+  // a file-level issue, or an entry missing even an id, leaves this unset.
+  id?: string;
+  message: string;
+};
+
+export type SourceRegistryLoadResult = {
+  // Enabled, validated sources for this cycle, already capped at
+  // MAX_ENABLED_SOURCES_PER_CYCLE, in file order.
+  sources: SourceConfig[];
+  // True only on the call that created the default file (file was absent).
+  createdDefaultFile: boolean;
+  // Ids of enabled, otherwise-valid sources dropped purely by the 8-source
+  // cap -- not a validation failure, so these are NOT included in `issues`.
+  cappedIds: string[];
+  // Malformed file/entry problems -- fail-closed, always logged and alerted
+  // by the caller, never silently guessed around.
+  issues: SourceRegistryIssue[];
+};
+
+export function loadSourceRegistry(filePath: string): SourceRegistryLoadResult {
+  if (!fs.existsSync(filePath)) {
+    return createDefaultFile(filePath);
+  }
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, "utf-8");
+  } catch (err: any) {
+    return fileLevelFailure(`Could not read the signal source registry file (${filePath}): ${err?.message || String(err)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err: any) {
+    return fileLevelFailure(`Signal source registry file (${filePath}) is not valid JSON: ${err?.message || String(err)}`);
+  }
+
+  if (!Array.isArray(parsed)) {
+    return fileLevelFailure(`Signal source registry file (${filePath}) must contain a JSON array of source entries; got ${typeof parsed}.`);
+  }
+
+  const issues: SourceRegistryIssue[] = [];
+  const valid: SourceConfig[] = [];
+  parsed.forEach((entry, index) => {
+    const result = validateEntry(entry, index);
+    // Explicit `=== true`/`=== false` (not a truthy `if`): this tsconfig
+    // doesn't enable strictNullChecks, and without it TS's discriminated-
+    // union narrowing only fires on an explicit literal comparison -- same
+    // convention numericSafety.ts's ParsedFiniteNumber callers use throughout.
+    if (result.ok === true) {
+      if (result.source.enabled) valid.push(result.source);
+      // enabled: false is a deliberate, well-formed off switch -- excluded
+      // from `sources`, but never reported as an `issue`.
+    } else if (result.ok === false) {
+      issues.push({ scope: "entry", id: result.id, message: result.message });
+    }
+  });
+
+  const cappedIds: string[] = [];
+  let sources = valid;
+  if (valid.length > MAX_ENABLED_SOURCES_PER_CYCLE) {
+    sources = valid.slice(0, MAX_ENABLED_SOURCES_PER_CYCLE);
+    cappedIds.push(...valid.slice(MAX_ENABLED_SOURCES_PER_CYCLE).map((s) => s.id));
+  }
+
+  return { sources, createdDefaultFile: false, cappedIds, issues };
+}
+
+function createDefaultFile(filePath: string): SourceRegistryLoadResult {
+  let createdDefaultFile = false;
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(DEFAULT_SOURCES, null, 2) + "\n");
+    createdDefaultFile = true;
+  } catch {
+    // Fail closed toward KEEPING INGESTION WORKING, not toward the file: if
+    // the default file can't be persisted (e.g. read-only filesystem), a
+    // fresh deploy must not silently drop to zero email sources just because
+    // it couldn't write a config file it will happily retry writing next
+    // cycle. The in-memory default is still returned below either way.
+  }
+  return { sources: DEFAULT_SOURCES.map((s) => ({ ...s, senderAllowlist: [...s.senderAllowlist] })), createdDefaultFile, cappedIds: [], issues: [] };
+}
+
+function fileLevelFailure(message: string): SourceRegistryLoadResult {
+  return { sources: [], createdDefaultFile: false, cappedIds: [], issues: [{ scope: "file", message }] };
+}
+
+type EntryValidation = { ok: true; source: SourceConfig } | { ok: false; id?: string; message: string };
+
+function validateEntry(entry: unknown, index: number): EntryValidation {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+    return { ok: false, message: `Source entry at index ${index} is not an object; disabled.` };
+  }
+  const e = entry as Record<string, unknown>;
+
+  const id = typeof e.id === "string" && e.id.trim() ? e.id.trim() : undefined;
+  if (!id) {
+    return { ok: false, message: `Source entry at index ${index} is missing a valid non-empty "id"; disabled.` };
+  }
+
+  if (typeof e.gmailQuery !== "string" || !e.gmailQuery.trim()) {
+    return { ok: false, id, message: `Source "${id}" has an invalid or empty "gmailQuery"; disabled.` };
+  }
+
+  if (
+    !Array.isArray(e.senderAllowlist) ||
+    e.senderAllowlist.length === 0 ||
+    !e.senderAllowlist.every((a) => typeof a === "string" && a.trim().length > 0)
+  ) {
+    return { ok: false, id, message: `Source "${id}" has an invalid or empty "senderAllowlist" (must be a non-empty array of non-empty strings); disabled.` };
+  }
+
+  if (e.trustTier !== "high" && e.trustTier !== "medium" && e.trustTier !== "low") {
+    return { ok: false, id, message: `Source "${id}" has an invalid "trustTier" (must be "high", "medium", or "low"); disabled.` };
+  }
+
+  const maxAgeParsed = parseFiniteNumber(e.maxAgeHours, "maxAgeHours");
+  if (maxAgeParsed.ok === false || maxAgeParsed.value <= 0) {
+    return { ok: false, id, message: `Source "${id}" has an invalid "maxAgeHours" (must be a finite positive number); disabled.` };
+  }
+
+  if (typeof e.enabled !== "boolean") {
+    return { ok: false, id, message: `Source "${id}" has an invalid "enabled" (must be a boolean); disabled.` };
+  }
+
+  return {
+    ok: true,
+    source: {
+      id,
+      gmailQuery: e.gmailQuery.trim(),
+      senderAllowlist: (e.senderAllowlist as string[]).map((a) => a.trim()),
+      trustTier: e.trustTier,
+      maxAgeHours: maxAgeParsed.value,
+      enabled: e.enabled,
+    },
+  };
+}

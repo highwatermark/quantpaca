@@ -1,7 +1,23 @@
 import { AlpacaAccount, AlpacaPosition } from "../types";
 import { MarketRegimeInputs } from "./marketDataFetcher";
 
-export type SignalSource = "email" | "youtube" | "gemini" | "manual" | "telegram";
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4, signal-source registry):
+// email sources are no longer a single hardcoded "email" literal -- each
+// registry entry (src/server/sourceRegistry.ts) stamps its own id (e.g.
+// "ziptrader") onto every signal it produces, so Phase 3 attribution can
+// compare sources. Widened to plain `string` (with the well-known literals
+// kept in the union purely for editor autocomplete via the `(string & {})`
+// idiom) rather than a closed enum, since registry ids are config-driven, not
+// known at compile time. Every existing call site that compares against a
+// specific literal (e.g. `source === "gemini"`) keeps type-checking exactly
+// as before.
+export type SignalSource = "email" | "youtube" | "gemini" | "manual" | "telegram" | (string & {});
+
+// Phase 2 Task 8: how much a source is trusted, carried through from the
+// registry entry. Recorded on the raw/persisted signal only in this task --
+// no tier-based gating or weighting exists yet (that arrives with the
+// cross-source task per the task brief).
+export type TrustTier = "high" | "medium" | "low";
 
 export type RawSignal = {
   id: string;
@@ -13,6 +29,10 @@ export type RawSignal = {
   normalizedThesisHash: string;
   url?: string;
   aiConfidence?: number;
+  // Phase 2 Task 8: additive, optional -- only email sources routed through
+  // the signal-source registry set this (see sourceRegistry.ts). Recorded
+  // only; not read by any gating logic in this task.
+  trustTier?: TrustTier;
 };
 
 export type ReviewedSignal = {
@@ -29,6 +49,9 @@ export type ReviewedSignal = {
   evidence: string[];
   status: "accepted" | "rejected";
   rejectionReason?: "duplicate" | "stale" | "low_confidence" | "unsupported" | "malformed";
+  // Phase 2 Task 8: carried through from RawSignal.trustTier -- additive,
+  // optional, recorded only (see comment above).
+  trustTier?: TrustTier;
 };
 
 export type RegimeAssessment = {

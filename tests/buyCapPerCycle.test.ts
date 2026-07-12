@@ -44,7 +44,15 @@ function gmailMessageFixture(id: string) {
     snippet: body.slice(0, 100),
     payload: {
       mimeType: "multipart/alternative",
-      headers: [{ name: "Subject", value: subject }],
+      // Phase 2 Task 8 (signal-source registry): the default ZipTrader
+      // source now enforces an exact-match sender allowlist, so a fixture
+      // message needs a matching From header to survive ingestion -- this
+      // test isn't about the registry, it just needs real signals to flow
+      // through so the per-cycle BUY cap has something to cap.
+      headers: [
+        { name: "Subject", value: subject },
+        { name: "From", value: "Charlie <charlie-from-ziptrader@ghost.io>" },
+      ],
       parts: [{ mimeType: "text/plain", body: { data: b64url(body) } }],
     },
   };

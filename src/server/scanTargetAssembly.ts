@@ -7,9 +7,35 @@
 // that can trade"), both fallbacks are gone: a failed or empty source now
 // contributes zero scan-targets rather than fabricated ones.
 
-import { EmailScanTarget } from "./emailIngestion";
+import { TrustTier } from "./domainTypes";
 
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4, signal-source registry):
+// this is the ENRICHED email scan target -- distinct from
+// emailIngestion.ts's own `EmailScanTarget` (the raw per-message extraction
+// result, still literal `source: "email"`, unchanged by this task). The
+// caller (server.ts's per-source ingestion loop) stamps the registry's own
+// id onto `source` (replacing the old generic "email"), plus the additive
+// `trustTier`/`maxAgeHours` carried straight through from that source's
+// registry entry. `kind` is the discriminant used to tell an email target
+// apart from a YoutubeScanTarget below -- `source` itself can no longer do
+// that job now that it holds an arbitrary registry id instead of a fixed
+// literal.
+export type EmailScanTarget = {
+  kind: "email";
+  source: string;
+  title: string;
+  content: string;
+  sourceTimestamp: string;
+  messageId?: string;
+  trustTier: TrustTier;
+  maxAgeHours: number;
+};
+
+// Unchanged by this task -- registry governs email sources only (task
+// brief). Gains the `kind` discriminant additively for symmetry with
+// EmailScanTarget above; `source` stays the literal "youtube" it always was.
 export type YoutubeScanTarget = {
+  kind: "youtube";
   source: "youtube";
   title: string;
   content: string;
@@ -39,6 +65,7 @@ export function assembleScanTargets(
 
   if (youtubeResult.ok) {
     targets.push({
+      kind: "youtube",
       source: "youtube",
       title: "ZipTrader Channel Feed Analyzed",
       content: youtubeResult.sentiment,

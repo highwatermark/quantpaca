@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { RawSignal, ReviewedSignal, SignalSource } from "./domainTypes";
+import { RawSignal, ReviewedSignal, SignalSource, TrustTier } from "./domainTypes";
 import { validateSymbol } from "./tradingSafety";
 
 type RawSignalInput = {
@@ -8,6 +8,11 @@ type RawSignalInput = {
   sourceTimestamp: string;
   symbol: string;
   thesis: string;
+  // Phase 2 Task 8 (signal-source registry): carried straight through onto
+  // the RawSignal (and, via reviewSignal below, the persisted ReviewedSignal).
+  // Optional -- callers outside the registry-governed email path (YouTube,
+  // tests) simply omit it.
+  trustTier?: TrustTier;
   // Fingerprinted for the dedup key (via normalizedThesisHash) INSTEAD of `thesis`
   // when supplied. Exists because `thesis` can be an LLM's free-text re-analysis
   // of a source, and that wording can drift between separate analyses of the
@@ -42,6 +47,7 @@ export function createRawSignal(input: RawSignalInput): RawSignal {
     normalizedThesisHash: hash(normalizeThesis(dedupContent)),
     url: input.url,
     aiConfidence: input.aiConfidence,
+    trustTier: input.trustTier,
   };
 }
 
@@ -86,6 +92,7 @@ export function reviewSignal(rawSignal: RawSignal, options: ReviewOptions = {}):
     invalidationConditions: buildInvalidationConditions(rawSignal.thesis),
     evidence: rawSignal.url ? [rawSignal.url] : [],
     status: "accepted",
+    trustTier: rawSignal.trustTier,
   };
 
   if (!symbolValidation.valid || !rawSignal.sourceId || !rawSignal.thesis) {

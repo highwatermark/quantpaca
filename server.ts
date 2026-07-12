@@ -30,8 +30,10 @@ import { buildBracketLegs, BRACKET_TIME_IN_FORCE, PLAIN_TIME_IN_FORCE } from "./
 import { createRawSignal } from "./src/server/signalEngine";
 import { applyWhipsawGate, normalizeWhipsawVerdict } from "./src/server/whipsawGate";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
-import { extractEmailScanTarget, EmailScanTarget } from "./src/server/emailIngestion";
-import { assembleScanTargets, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
+import { extractEmailScanTarget, extractFromHeader } from "./src/server/emailIngestion";
+import { assembleScanTargets, EmailScanTarget, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
+import { loadSourceRegistry, GMAIL_MAX_RESULTS_PER_SOURCE, MAX_ENABLED_SOURCES_PER_CYCLE, SourceRegistryIssue } from "./src/server/sourceRegistry";
+import { evaluateSender } from "./src/server/senderPolicy";
 import { detectRegime } from "./src/server/regimeEngine";
 import { assessPortfolio } from "./src/server/portfolioEngine";
 import { buildPositionReconciliationReport, reconcileBrokerState } from "./src/server/reconciliationEngine";
@@ -72,6 +74,12 @@ app.use(express.json());
 const DATA_DIR = process.env.QUANTPACA_DATA_DIR || path.join(process.cwd(), "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const productionStore = createProductionStore(path.join(DATA_DIR, "quantpaca.sqlite"));
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4): the signal-source registry
+// lives alongside the rest of this app's data (same DATA_DIR as db.json/the
+// sqlite file), not a new env var -- it's config DATA, edited by operators,
+// not a deploy-time setting. sourceRegistry.ts creates it with the default
+// ZipTrader-only source on first read if it's absent (migration-safe).
+const SOURCE_REGISTRY_PATH = path.join(DATA_DIR, "signal-sources.json");
 
 // Simple queue-based lock to serialize all operations that read or write to DB
 class DBConcurrencyMutex {
@@ -286,6 +294,47 @@ function fingerprintMismatches(mismatches: ReconciliationReport["mismatches"]): 
     .map((m) => `${m.type}:${m.symbol || ""}:${m.localId || ""}:${m.expected || ""}:${m.actual || ""}`)
     .sort()
     .join("|");
+}
+
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4, signal-source registry):
+// config-failure alert state key -- same "no schema migration needed" app_state
+// convention as the other alert-throttle keys above.
+const SOURCE_REGISTRY_ALERT_STATE_KEY = "signal_source_registry_alert_state";
+
+function fingerprintRegistryIssues(issues: SourceRegistryIssue[]): string {
+  return issues
+    .map((i) => `${i.scope}:${i.id || ""}:${i.message}`)
+    .sort()
+    .join("|");
+}
+
+// Throttled Telegram alert for a malformed signal-source registry (file or
+// entry level) -- reuses Task 1's shouldSendThrottledAlert exactly the way
+// the reconciliation-mismatch alert above does: a NEW/different set of
+// issues always alerts immediately (fingerprint changed); the SAME issue set
+// only re-alerts once EMPTY_SYNC_ALERT_WINDOW_MS has elapsed. Only a
+// DELIVERED alert advances the stamp -- an undelivered attempt (Telegram
+// unconfigured/down) must never suppress the next real alert, same
+// fail-open-toward-alerting direction as every other alert-throttle in this
+// file.
+async function alertOnSourceRegistryIssues(config: AppConfig, issues: SourceRegistryIssue[]): Promise<void> {
+  const fingerprint = fingerprintRegistryIssues(issues);
+  let alertState: { fingerprint?: string; lastSentAt?: string } = {};
+  try {
+    const rawAlertState = productionStore.getAppState(SOURCE_REGISTRY_ALERT_STATE_KEY);
+    if (rawAlertState) alertState = JSON.parse(rawAlertState);
+  } catch {
+    alertState = {};
+  }
+  const isNewOrDifferent = alertState.fingerprint !== fingerprint;
+  const dueByThrottle = shouldSendThrottledAlert(alertState.lastSentAt, Date.now(), EMPTY_SYNC_ALERT_WINDOW_MS);
+  if (!isNewOrDifferent && !dueByThrottle) return;
+
+  const tgMsg = `⚠️ <b>Signal source registry validation failed.</b> ${issues.length} issue(s) -- the affected source(s) are disabled (fail closed), never guessed: ${issues.map((i) => i.message).join(" | ").slice(0, 2500)}`;
+  const delivered = await sendTelegramAlert(config.telegram, tgMsg);
+  if (delivered) {
+    productionStore.setAppState(SOURCE_REGISTRY_ALERT_STATE_KEY, JSON.stringify({ fingerprint, lastSentAt: new Date().toISOString() }));
+  }
 }
 
 async function executeTradeIntent(input: {
@@ -2387,63 +2436,144 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
     // Phase 2 Task 1, Item B (docs/GO_LIVE_PLAN.md "Phase 1 completion report"
     // -> "Deferred to Phase 2"): the latest reason this sync contributed zero
     // email scan-targets, threaded into the throttled Telegram alert text
-    // below. All three causes (no OAuth token, non-OK Gmail response, zero
-    // usable messages) share the one throttled alert class -- this makes the
-    // alert text reflect whichever is CURRENT this sync, not whichever
-    // happened to fire first after the last alert.
+    // below. All causes (no OAuth token, zero enabled registry sources, a
+    // non-OK Gmail response, zero usable messages) share the one throttled
+    // alert class -- this makes the alert text reflect whichever is CURRENT
+    // this sync, not whichever happened to fire first after the last alert.
     let emptyEmailReason = "No Gmail authorization token detected.";
 
   if (authHeader) {
     gmailAttempted = true;
     addLog("sync", "Attempting to retrieve messages with active Gmail OAuth token...");
-    try {
-      // Query messages from charlie-from-ziptrader@ghost.io
-      const gmailQuery = "from:charlie-from-ziptrader@ghost.io";
-      const gmailRes = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(gmailQuery)}&maxResults=5`,
-        { headers: { Authorization: authHeader } }
+
+    // Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4): the registry replaces
+    // the old single hardcoded ZipTrader query with a config-driven list of
+    // sources, read FRESH every cycle (an operator's edit to the file takes
+    // effect on the very next sync, no restart needed) -- see
+    // sourceRegistry.ts for the fail-closed validation this wraps.
+    const registryResult = loadSourceRegistry(SOURCE_REGISTRY_PATH);
+    if (registryResult.createdDefaultFile) {
+      addLog("sync", `Signal source registry file not found; created the default registry (ZipTrader only) at ${SOURCE_REGISTRY_PATH}.`);
+    }
+    for (const issue of registryResult.issues) {
+      addLog(
+        "error",
+        `Signal source registry ${issue.scope === "file" ? "file is invalid" : `entry${issue.id ? ` "${issue.id}"` : ""} is invalid`}: ${issue.message}`,
       );
+    }
+    if (registryResult.cappedIds.length > 0) {
+      addLog(
+        "error",
+        `Signal source registry: ${registryResult.cappedIds.length} enabled source(s) exceeded the ${MAX_ENABLED_SOURCES_PER_CYCLE}-source cap (Guardrail 8) and were skipped this cycle: ${registryResult.cappedIds.join(", ")}.`,
+      );
+    }
+    if (registryResult.issues.length > 0) {
+      await alertOnSourceRegistryIssues(currentConfig, registryResult.issues);
+    }
 
-      if (gmailRes.ok) {
-        const gmailData = await gmailRes.json();
-        const messages = gmailData.messages || [];
-        addLog("sync", `Successfully listed ${messages.length} messages from ZipTrader of ghost.io.`);
-        emptyEmailReason =
-          messages.length === 0
-            ? "Gmail returned zero messages matching the tracked sender this sync."
-            : "No message returned this sync was usable (per-message detail fetch failed, or extraction rejected it -- see per-message log entries).";
+    const enabledSources = registryResult.sources;
+    if (enabledSources.length === 0) {
+      addLog("sync", "Signal source registry has zero enabled, valid sources; contributing zero email scan-targets this sync.");
+      emptyEmailReason = "Signal source registry has zero enabled, valid sources.";
+    }
 
-        for (const msg of messages) {
-          const detailRes = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
-            { headers: { Authorization: authHeader } }
+    const perSourceErrored: boolean[] = [];
+    const perSourceReasons: string[] = [];
+
+    for (const source of enabledSources) {
+      try {
+        const gmailRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(source.gmailQuery)}&maxResults=${GMAIL_MAX_RESULTS_PER_SOURCE}`,
+          { headers: { Authorization: authHeader } }
+        );
+
+        if (gmailRes.ok) {
+          const gmailData = await gmailRes.json();
+          const messages = gmailData.messages || [];
+          addLog("sync", `Successfully listed ${messages.length} messages from source "${source.id}" (${source.gmailQuery}).`);
+          perSourceErrored.push(false);
+          perSourceReasons.push(
+            messages.length === 0
+              ? `${source.id}: zero messages matched this sync.`
+              : `${source.id}: messages returned but none were usable this sync (see per-message log entries).`,
           );
-          if (detailRes.ok) {
+
+          for (const msg of messages) {
+            const detailRes = await fetch(
+              `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
+              { headers: { Authorization: authHeader } }
+            );
+            if (!detailRes.ok) continue;
             const detailData = await detailRes.json();
+
+            // Sender policy, blocklist BEFORE allowlist (docs/GO_LIVE_PLAN.md
+            // Phase 2.4): a global brokerage-notification blocklist that no
+            // registry entry can override, checked ahead of this source's own
+            // sender allowlist (exact-match on the parsed From address).
+            const fromHeader = extractFromHeader(detailData);
+            const senderDecision = evaluateSender(fromHeader, source.senderAllowlist);
+            if (senderDecision.outcome === "blocked") {
+              addLog(
+                "error",
+                `Blocklisted sender skipped for source "${source.id}", message ${msg.id}: ${senderDecision.address}.` +
+                  (senderDecision.blocklistConflict
+                    ? ` This address is ALSO present in source "${source.id}"'s senderAllowlist -- the blocklist wins, but check the registry config for a mistaken allowlist entry.`
+                    : ""),
+              );
+              continue;
+            }
+            if (senderDecision.outcome === "rejected") {
+              addLog(
+                "error",
+                `Skipping Gmail message ${msg.id} from source "${source.id}": sender ${senderDecision.address ?? "(unparsable From header)"} is not on the allowlist.`,
+              );
+              continue;
+            }
+
             const extraction = extractEmailScanTarget(detailData);
             if (extraction.ok === false) {
               // Fail-closed: no real send time could be recovered for this message.
               // Never fabricate "now" -- skip it rather than let an undated thesis
               // sail through the freshness check.
-              addLog("error", `Skipping Gmail message ${msg.id}: ${extraction.reason}`);
+              addLog("error", `Skipping Gmail message ${msg.id} from source "${source.id}": ${extraction.reason}`);
               continue;
             }
             if (extraction.bodyDegraded) {
-              addLog("sync", `Body extraction degraded for Gmail message ${msg.id}; using snippet fallback.`);
+              addLog("sync", `Body extraction degraded for Gmail message ${msg.id} (source "${source.id}"); using snippet fallback.`);
             }
-            emailsToScan.push(extraction.target);
+            emailsToScan.push({
+              kind: "email",
+              source: source.id,
+              title: extraction.target.title,
+              content: extraction.target.content,
+              sourceTimestamp: extraction.target.sourceTimestamp,
+              messageId: extraction.target.messageId,
+              trustTier: source.trustTier,
+              maxAgeHours: source.maxAgeHours,
+            });
           }
+        } else {
+          const errTxt = await gmailRes.text();
+          addLog("error", `Gmail API failed for source "${source.id}". No email signals from this source this sync.`, errTxt);
+          perSourceErrored.push(true);
+          perSourceReasons.push(`${source.id}: Gmail API request failed (non-OK response): ${errTxt.substring(0, 200)}`);
         }
-      } else {
-        const errTxt = await gmailRes.text();
-        addLog("error", "Gmail API failed. No email signals this sync.", errTxt);
-        emptyEmailReason = `Gmail API request failed (non-OK response): ${errTxt.substring(0, 200)}`;
-        gmailErrored = true;
+      } catch (err: any) {
+        addLog("error", `Gmail sync connection error for source "${source.id}".`, err.message);
+        perSourceErrored.push(true);
+        perSourceReasons.push(`${source.id}: Gmail sync connection error: ${err.message}`);
       }
-    } catch (err: any) {
-      addLog("error", "Gmail sync connection error.", err.message);
-      emptyEmailReason = `Gmail sync connection error: ${err.message}`;
-      gmailErrored = true;
+    }
+
+    if (enabledSources.length > 0) {
+      // Aggregate across sources, same semantics as the pre-Task-8 single-
+      // source flags: "errored" means every source we actually queried this
+      // cycle failed outright (network error / non-OK response) -- not
+      // merely zero/unusable messages, which is an expected, non-error
+      // outcome that must not trip Guardrail 7's "every attempted source
+      // errored" check below.
+      gmailErrored = perSourceErrored.length > 0 && perSourceErrored.every(Boolean);
+      if (perSourceReasons.length > 0) emptyEmailReason = perSourceReasons.join(" | ");
     }
   } else {
     addLog("sync", "No Gmail authorization token detected. Contributing zero email scan-targets this sync.");
@@ -2615,7 +2745,14 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
         const item: StockAnalysis = {
           id: "an-" + Math.random().toString(36).substr(2, 9),
           symbol: parsed.symbol.toUpperCase(),
-          source: target.source as any,
+          // StockAnalysis.source stays the coarse "email" | "youtube"
+          // category the UI (ZipTraderCard.tsx) switches display copy on --
+          // NOT the specific registry source id. That finer-grained id
+          // (e.g. "ziptrader") is stamped onto the signal-engine layer
+          // (RawSignal/ReviewedSignal) below instead, per the task brief
+          // ("store `source` on every signal"), leaving this display-level
+          // field and the frontend that reads it untouched.
+          source: target.kind === "youtube" ? "youtube" : "email",
           sourceTitle: target.title,
           sourceContent: target.content,
           growthScore: parsed.growthScore,
@@ -2635,7 +2772,12 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
         };
 
         const rawSignal = createRawSignal({
-          source: target.source === "youtube" ? "youtube" : "email",
+          // Phase 2 Task 8 (signal-source registry): an email target's
+          // `source` is now the registry's own id (e.g. "ziptrader"), not a
+          // generic "email" literal -- stamped straight through so Phase 3
+          // attribution can compare sources. YouTube keeps its unchanged
+          // literal "youtube".
+          source: target.source,
           // Finding I1: identify an email by Gmail's message id, not its subject
           // line -- two distinct emails (e.g. a recurring weekly newsletter) can
           // share an identical title, which would otherwise collapse them into one
@@ -2643,7 +2785,7 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
           // message id was never captured. YouTube has no per-message resource
           // (it's a fresh web-search summary each run) so it keeps the title-based
           // sourceId, unchanged.
-          sourceId: target.source === "email" && target.messageId
+          sourceId: target.kind === "email" && target.messageId
             ? `email:${target.messageId}`
             : `${target.source}:${target.title}`,
           sourceTimestamp: item.timestamp,
@@ -2657,13 +2799,21 @@ For "whipsawVerdict", classify that same judgment into exactly one of three stru
           // `target.content` is stable across re-syncs of the same message.
           // YouTube has no such stable content handle (the "content" IS a fresh
           // search summary each run) so it keeps hashing `thesis`, unchanged.
-          dedupContent: target.source === "email" ? target.content : undefined,
-          url: target.source === "youtube" ? "youtube://ziptrader" : "gmail://ziptrader",
+          dedupContent: target.kind === "email" ? target.content : undefined,
+          url: target.kind === "youtube" ? "youtube://ziptrader" : `gmail://${target.source}`,
           // Confidence already carries the whipsaw haircut (or is unchanged for
           // whipsaw/HOLD/NONE) -- this is what flows into sizing's confidenceMultiplier.
           aiConfidence: gated.aiConfidence,
+          // Phase 2 Task 8: recorded-only, carried through from the source's
+          // registry entry -- YouTube (not registry-governed) leaves it unset.
+          trustTier: target.kind === "email" ? target.trustTier : undefined,
         });
-        const reviewedSignal = reviewAndPersistSignal(productionStore, rawSignal);
+        // Phase 2 Task 8: per-source maxAgeHours (email) replaces the
+        // universal 72h default for registry-governed sources -- YouTube
+        // keeps that same 72h default, unchanged, by omitting the override.
+        const reviewedSignal = reviewAndPersistSignal(productionStore, rawSignal, {
+          maxAgeHours: target.kind === "email" ? target.maxAgeHours : undefined,
+        });
         if (reviewedSignal.status === "rejected") {
           addLog("error", `Signal rejected for ${item.symbol}: ${reviewedSignal.rejectionReason}`);
           continue;
