@@ -497,6 +497,52 @@ test("poll fetch failure (500): local state is unchanged, lastPollError is recor
   );
 });
 
+test('poll returns {status:"filled"} with missing filled_qty: state unchanged + lastPollError (stays pollable); next well-formed poll resolves to Filled with correct quantities', async (t) => {
+  resetMockBroker();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+  await setConfig(port, { stopLossPercent: 0, targetProfitPercent: 0 });
+
+  const buy = await placeOrder(port, { symbol: "NOQTY", qty: 4, side: "buy", price: 25 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body));
+  const brokerOrderId = buy.body.trade.brokerOrderId as string;
+
+  // Malformed-but-200 broker response: a fill-implying status with NO usable
+  // filled_qty. Accepting this at face value would record the internally
+  // inconsistent (and, because terminal states are never re-polled,
+  // permanently frozen) filledQty:0 / remainingQty:4 / status:Filled.
+  const order = ordersById.get(brokerOrderId)!;
+  order.status = "filled";
+  delete (order as any).filled_qty;
+
+  const sync = await runSync(port);
+
+  let trade = findTrade("NOQTY");
+  assert.equal(trade!.status, "Accepted", "a fill-implying status with unparsable filled_qty must not advance local state");
+  assert.equal(trade!.filledQty, undefined, "no quantity may be invented from a malformed response");
+  assert.ok(trade!.lastPollError, "expected lastPollError to be recorded");
+  assert.match(String(trade!.lastPollError), /filled_qty/);
+
+  const logLines: string[] = (sync.logs || []).map((l: any) => `${l.message} ${l.details || ""}`);
+  assert.ok(
+    logLines.some((line) => /NOQTY/.test(line) && /filled_qty/.test(line)),
+    `expected a log line about the unusable fill response, got: ${JSON.stringify(logLines)}`,
+  );
+
+  // The order stayed pollable, so the next well-formed response self-corrects.
+  order.filled_qty = "4";
+  order.filled_avg_price = "25.10";
+
+  await runSync(port);
+
+  trade = findTrade("NOQTY");
+  assert.equal(trade!.status, "Filled");
+  assert.equal(trade!.filledQty, 4);
+  assert.equal(trade!.remainingQty, 0);
+  assert.equal(trade!.lastPollError, undefined, "lastPollError must clear once a poll succeeds");
+});
+
 test("filled TP leg discovered: exit closed broker-side is recorded + audited, and a later sell skips the now-terminal leg (no DELETE)", async (t) => {
   resetMockBroker();
   const listener = app.listen(0);

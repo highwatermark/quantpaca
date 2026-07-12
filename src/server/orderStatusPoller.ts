@@ -204,6 +204,14 @@ export type TradePollOutcome = {
   // caller (pollPendingOrders below, or a direct unit test) is responsible for
   // actually issuing the cancel -- this function performs no I/O.
   shouldCancelStalePartial: boolean;
+  // Set when the broker's response was HTTP-OK-shaped but semantically
+  // unusable: a fill-implying status (filled/partially_filled) whose
+  // filled_qty was missing or unparsable. Treated exactly like a fetch
+  // failure -- `trade` above carries only a lastPollError, no state/quantity
+  // change -- so the order STAYS pollable (never advanced into a terminal,
+  // never-re-polled state with an invented filledQty of 0) and self-corrects
+  // on the next well-formed response. Undefined on every usable response.
+  unusableReason?: string;
 };
 
 // Callers are expected to only invoke this once `poll.ok` has been confirmed
@@ -217,10 +225,29 @@ export function applyTradePollResult(
 ): TradePollOutcome {
   const mapped = mapBrokerStatusToTradeState(poll.status);
   const previousStatus = trade.status;
+
+  // A fill-implying status with no usable filled_qty is an unusable response,
+  // not a state advance -- see TradePollOutcome.unusableReason above. Without
+  // this guard, `filledQty ?? 0` below would freeze an internally inconsistent
+  // record (status Filled, filledQty 0, remainingQty = full requested qty)
+  // that could never self-correct, because terminal states are never
+  // re-polled.
+  if ((mapped === "PartiallyFilled" || mapped === "Filled") && poll.filledQty === undefined) {
+    const unusableReason = `broker reported ${poll.status} but filled_qty was missing/unparsable; state unchanged (${previousStatus})`;
+    return {
+      trade: { ...trade, lastPollError: unusableReason },
+      auditEvents: [],
+      shouldCancelStalePartial: false,
+      unusableReason,
+    };
+  }
+
   const updated: PipelineTrade = { ...trade, status: mapped, brokerStatus: poll.status, lastPollError: undefined };
   const auditEvents: PartialAuditEvent[] = [];
 
   if (mapped === "PartiallyFilled" || mapped === "Filled") {
+    // Guaranteed defined by the unusable-response guard above; `?? 0` only
+    // keeps the compiler happy under this tsconfig's non-strict null checks.
     const filledQty = poll.filledQty ?? 0;
     const requestedQty = typeof trade.qty === "number" ? trade.qty : 0;
     const remainingQty = Math.max(0, requestedQty - filledQty);
@@ -381,6 +408,15 @@ export async function pollPendingOrders(input: {
       const outcome = applyTradePollResult(trade, poll, now);
       let finalTrade = outcome.trade;
       auditEvents.push(...outcome.auditEvents);
+
+      if (outcome.unusableReason) {
+        // HTTP-OK but semantically unusable (fill-implying status, no usable
+        // filled_qty) -- logged like a fetch failure; the trade keeps its
+        // state (only lastPollError was set) and stays pollable.
+        errorLogs.push(
+          `Order-status poll unusable for ${trade.symbol} (order ${target.orderId}): ${outcome.unusableReason}.`,
+        );
+      }
 
       if (outcome.shouldCancelStalePartial && finalTrade.brokerOrderId) {
         const cancelResult = await input.cancelOrder(finalTrade.brokerOrderId);
