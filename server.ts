@@ -11,6 +11,7 @@ import {
   BrokerConfig,
   buildBrokerConfigFromEnv,
   redactConfigForClient,
+  RiskDecision,
   stripPersistedSecrets,
   submitTradeThroughPipeline,
   TradeRequest,
@@ -30,6 +31,7 @@ import { evaluateBreaker } from "./src/server/breakerEngine";
 import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
+import { loadCooldownConfig } from "./src/server/cooldownConfig";
 import { sizeTradeIntent } from "./src/server/sizingEngine";
 
 dotenv.config();
@@ -87,6 +89,37 @@ let riskLimits: RiskLimits;
   }
   riskLimits = loaded.limits;
 }
+
+// Same startup pattern as risk limits above: parsed once, fatal on unparsable input,
+// immutable for the process lifetime. 0 is an explicit, documented escape hatch that
+// disables the per-symbol cooldown (see docs/GO_LIVE_PLAN.md Phase 1.1).
+let symbolCooldownHours: number;
+{
+  const loaded = loadCooldownConfig(process.env);
+  if (loaded.ok === false) {
+    for (const error of loaded.errors) console.error(`[startup:fatal] ${error}`);
+    console.error("[startup] Invalid symbol cooldown configuration. Refusing to start.");
+    process.exit(1);
+  }
+  symbolCooldownHours = loaded.config.symbolCooldownHours;
+}
+
+// Trade states that mean the order actually reached the broker — either it was
+// submitted/accepted/filled, or the broker itself rejected it or the submission call
+// failed/returned an unrecognized status. These are the outcomes that put a symbol in
+// cooldown. RiskRejected (blocked before ever reaching the broker, e.g. insufficient
+// buying power or an already-active cooldown) intentionally does NOT extend or restart
+// a cooldown — those rejections are cheap and often transient.
+const BROKER_REACHED_TRADE_STATUSES = new Set([
+  "Accepted",
+  "PartiallyFilled",
+  "Filled",
+  "Rejected",
+  "Canceled",
+  "Expired",
+  "BrokerFailed",
+  "UnknownBrokerState",
+]);
 
 const getBrokerConfig = () => buildBrokerConfigFromEnv(process.env);
 
@@ -155,43 +188,61 @@ async function executeTradeIntent(input: {
     stopLossPercent: input.config.system?.stopLossPercent,
     takeProfitPercent: input.config.system?.targetProfitPercent,
   });
-  const riskDecision = reviewRisk({
-    intent: {
-      id: `intent-${Date.now()}`,
-      symbol: input.request.symbol,
-      side: input.request.side,
-      qty: input.request.qty,
-      notional: input.request.qty * input.request.estimatedPrice,
-      estimatedPrice: input.request.estimatedPrice,
-      sizingReason: "Server order path intent.",
-      capsApplied: input.maxNotional ? ["max_notional_route_limit"] : [],
-    },
-    brokerConfig,
-    portfolio: portfolioAssessment,
-    exitPlan,
-    breaker: { status: breakerState.status },
-    metrics: {
-      dailyLoss: (() => {
-        // Same fallback rule as the breaker input above: a REAL broker must supply
-        // last_equity (missing -> NaN -> reviewRisk fails closed); the simulated
-        // portfolio treats equity as prior close (daily loss 0).
-        const lastEquityForDaily = brokerConfig.configured
-          ? Number(portfolio.last_equity)
-          : Number(portfolio.last_equity ?? portfolio.equity);
-        return breakerState.metrics.equity !== null
-          ? breakerState.metrics.equity - lastEquityForDaily
-          : Number.NaN;
-      })(),
-      dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
-      openPositionCount: portfolioAssessment.positions.length,
-    },
-    limits: {
-      maxDailyLoss: riskLimits.maxDailyLoss,
-      maxDailyTradeCount: riskLimits.maxDailyTradeCount,
-      maxOpenPositions: riskLimits.maxOpenPositions,
-      minBuyingPower: riskLimits.minBuyingPower,
-    },
-  });
+  // Per-symbol cooldown only ever blocks BUYs — de-risking (a SELL) must always stay
+  // available, so the cooldown set is only ever populated for buy-side intents here;
+  // reviewRisk's cooldown check is never given anything to match against for a sell.
+  // On a store read failure we fail closed: a buy whose cooldown state is unknown is
+  // rejected outright instead of proceeding as if no cooldowns exist.
+  let cooldownSymbols: string[] = [];
+  let cooldownLoadFailed = false;
+  if (input.request.side === "buy" && symbolCooldownHours > 0) {
+    try {
+      cooldownSymbols = productionStore.listActiveCooldownSymbols(new Date().toISOString());
+    } catch (err) {
+      console.error("[cooldown] Failed to load active cooldown symbols; failing closed on buy order.", err);
+      cooldownLoadFailed = true;
+    }
+  }
+  const riskDecision: RiskDecision = cooldownLoadFailed
+    ? { status: "rejected", reason: "Failed to load symbol cooldown state; failing closed on this buy order." }
+    : reviewRisk({
+        intent: {
+          id: `intent-${Date.now()}`,
+          symbol: input.request.symbol,
+          side: input.request.side,
+          qty: input.request.qty,
+          notional: input.request.qty * input.request.estimatedPrice,
+          estimatedPrice: input.request.estimatedPrice,
+          sizingReason: "Server order path intent.",
+          capsApplied: input.maxNotional ? ["max_notional_route_limit"] : [],
+        },
+        brokerConfig,
+        portfolio: portfolioAssessment,
+        exitPlan,
+        breaker: { status: breakerState.status },
+        metrics: {
+          dailyLoss: (() => {
+            // Same fallback rule as the breaker input above: a REAL broker must supply
+            // last_equity (missing -> NaN -> reviewRisk fails closed); the simulated
+            // portfolio treats equity as prior close (daily loss 0).
+            const lastEquityForDaily = brokerConfig.configured
+              ? Number(portfolio.last_equity)
+              : Number(portfolio.last_equity ?? portfolio.equity);
+            return breakerState.metrics.equity !== null
+              ? breakerState.metrics.equity - lastEquityForDaily
+              : Number.NaN;
+          })(),
+          dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
+          openPositionCount: portfolioAssessment.positions.length,
+        },
+        limits: {
+          maxDailyLoss: riskLimits.maxDailyLoss,
+          maxDailyTradeCount: riskLimits.maxDailyTradeCount,
+          maxOpenPositions: riskLimits.maxOpenPositions,
+          minBuyingPower: riskLimits.minBuyingPower,
+          cooldownSymbols,
+        },
+      });
   const result = await submitTradeThroughPipeline({
     request: input.request,
     brokerConfig,
@@ -203,6 +254,22 @@ async function executeTradeIntent(input: {
   productionStore.saveTradeIntent(result.trade);
   if (result.trade.riskDecision) productionStore.saveRiskDecision(result.trade.id, result.trade.riskDecision);
   if (result.trade.exitPlan) productionStore.saveExitPlan(result.trade.id, result.trade.exitPlan);
+  // Cooldown is recorded once the order reaches the broker in any capacity — a clean
+  // accept/fill, or a broker-side rejection/failure — but NOT for a RiskRejected trade
+  // that never left this process (e.g. insufficient buying power, an already-active
+  // cooldown, missing exit plan). Those are cheap, often-transient rejections and
+  // re-triggering them must not re-arm or extend an existing cooldown window.
+  if (symbolCooldownHours > 0 && BROKER_REACHED_TRADE_STATUSES.has(result.trade.status)) {
+    try {
+      productionStore.saveCooldown({
+        symbol: result.trade.symbol,
+        expiresAt: new Date(Date.now() + symbolCooldownHours * 60 * 60 * 1000).toISOString(),
+        reason: `Trade ${result.trade.id} for ${result.trade.symbol} reached the broker with status ${result.trade.status}.`,
+      });
+    } catch (err) {
+      console.error("[cooldown] Failed to persist cooldown entry.", err);
+    }
+  }
   return result.trade;
 }
 

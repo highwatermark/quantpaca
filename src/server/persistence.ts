@@ -32,6 +32,8 @@ export type ProductionStore = {
   latestReconciliationReport(): ReconciliationReport | undefined;
   saveBreakerState(state: { asOf: string; status: string }): void;
   latestBreakerState<T = unknown>(): T | undefined;
+  saveCooldown(entry: { symbol: string; expiresAt: string; reason: string }): void;
+  listActiveCooldownSymbols(nowIso: string): string[];
   close(): void;
 };
 
@@ -92,6 +94,12 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       timestamp TEXT NOT NULL,
       status TEXT NOT NULL,
       payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS symbol_cooldowns (
+      symbol TEXT PRIMARY KEY,
+      expires_at TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
   `);
 
@@ -191,6 +199,19 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     },
     latestBreakerState() {
       return rowToPayload(db.prepare("SELECT payload_json FROM breaker_states ORDER BY timestamp DESC LIMIT 1").get());
+    },
+    saveCooldown(entry) {
+      const now = new Date().toISOString();
+      // Opportunistic cleanup: drop rows that are already expired instead of letting the
+      // table grow forever. No background job needed — reads already filter by expiresAt,
+      // this just keeps the table small on the write path we already have open.
+      db.prepare("DELETE FROM symbol_cooldowns WHERE expires_at <= ?").run(now);
+      db.prepare("INSERT OR REPLACE INTO symbol_cooldowns (symbol, expires_at, reason, updated_at) VALUES (?, ?, ?, ?)")
+        .run(entry.symbol, entry.expiresAt, entry.reason, now);
+    },
+    listActiveCooldownSymbols(nowIso) {
+      const rows = db.prepare("SELECT symbol FROM symbol_cooldowns WHERE expires_at > ?").all(nowIso);
+      return rows.map((row) => String(row.symbol));
     },
     close() {
       db.close();

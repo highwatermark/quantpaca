@@ -41,3 +41,31 @@ test("SQLite store persists append-only audit events and pipeline records", () =
   reopened.close();
   fs.unlinkSync(dbPath);
 });
+
+test("symbol cooldowns persist, filter expired entries, and survive reopen", () => {
+  const dbPath = path.join(process.cwd(), "data", "test-cooldown.sqlite");
+  if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+
+  const store = createProductionStore(dbPath);
+
+  store.saveCooldown({ symbol: "PLTR", expiresAt: "2026-07-13T00:00:00.000Z", reason: "trade reached broker" });
+  store.saveCooldown({ symbol: "OLD", expiresAt: "2020-01-01T00:00:00.000Z", reason: "long expired" });
+
+  const active = store.listActiveCooldownSymbols("2026-07-12T00:00:00.000Z");
+  assert.deepEqual(active, ["PLTR"]);
+
+  const noneActive = store.listActiveCooldownSymbols("2030-01-01T00:00:00.000Z");
+  assert.deepEqual(noneActive, []);
+
+  // A later cooldown write for the same symbol replaces (extends) the prior window.
+  store.saveCooldown({ symbol: "PLTR", expiresAt: "2026-07-20T00:00:00.000Z", reason: "second trade" });
+  const stillOne = store.listActiveCooldownSymbols("2026-07-13T00:00:00.000Z");
+  assert.deepEqual(stillOne, ["PLTR"]);
+
+  store.close();
+
+  const reopened = createProductionStore(dbPath);
+  assert.deepEqual(reopened.listActiveCooldownSymbols("2026-07-13T00:00:00.000Z"), ["PLTR"]);
+  reopened.close();
+  fs.unlinkSync(dbPath);
+});

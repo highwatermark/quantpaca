@@ -111,9 +111,9 @@ The engines are good; the monolithic `server.ts` bypasses them. Fix the wiring.
   *Accept:* a thesis older than `maxAgeHours` (72h) is rejected as `stale` in an integration test.
 - [x] **Ingest full email bodies**, not just the snippet (`server.ts:1007`). Decode the message payload; cap length before sending to Claude.
   *Accept:* analysis prompt contains body text for a multi-paragraph fixture email.
-- [ ] **Delete trade-capable fallbacks.** Remove the hardcoded MARA demo thesis (`server.ts:1026-1033`) and the canned bullish YouTube fallback (`server.ts:1057`). On ingestion failure: log, alert via Telegram, produce zero signals.
+- [x] **Delete trade-capable fallbacks.** Remove the hardcoded MARA demo thesis (`server.ts:1026-1033`) and the canned bullish YouTube fallback (`server.ts:1057`). On ingestion failure: log, alert via Telegram, produce zero signals.
   *Accept:* with Gmail unavailable, a sync produces no signals and no trades; a test asserts this.
-- [ ] **Per-symbol cooldown.** After any executed trade or rejected/failed order for a symbol, populate `cooldownSymbols` (already supported at `riskEngine.ts:92`) for a configurable window (default 24h).
+- [x] **Per-symbol cooldown.** After any executed trade or rejected/failed order for a symbol, populate `cooldownSymbols` (already supported at `riskEngine.ts:92`) for a configurable window (default 24h).
   *Accept:* a second BUY for the same symbol within the window returns `requires_human_approval`.
 - [ ] **Gate on the whipsaw check.** The LLM's `whipsawCheck` must become a structured field (e.g., `whipsawVerdict: "whipsaw" | "reversal" | "unclear"`) that the signal engine gates on for SELL decisions and haircuts confidence for BUYs — not just pasted into reasoning text (`server.ts:1140`).
   *Accept:* unit test shows a "reversal-unverified" SELL is downgraded to HOLD.
