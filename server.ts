@@ -37,6 +37,7 @@ import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
 import { loadCooldownConfig } from "./src/server/cooldownConfig";
 import { sizeTradeIntent, computeCapRoom, capRoomToQty } from "./src/server/sizingEngine";
 import { fetchMarketRegimeInputs, REGIME_STALENESS_MS } from "./src/server/marketDataFetcher";
+import { checkAssetTradable } from "./src/server/tradabilityGuard";
 import { RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
 import { EMPTY_SYNC_ALERT_STATE_KEY, shouldSendThrottledAlert } from "./src/server/alertThrottle";
@@ -299,8 +300,26 @@ async function executeTradeIntent(input: {
       cooldownLoadFailed = true;
     }
   }
+  // Phase 2 Task 3: per-asset tradability guard (BUY only, fail closed on any
+  // fetch/parse failure). Skipped when the broker isn't configured (simulated/
+  // dry-run mode has no Alpaca asset endpoint to check against -- same
+  // precedent as checkMarketOpenForScheduledCycle treating an unconfigured
+  // broker as open) and when the market-hours chokepoint has already rejected
+  // this BUY (no need to spend a network call and cache slot on an order that
+  // is rejected either way).
+  let tradabilityRejectionReason: string | null = null;
+  if (input.request.side === "buy" && brokerConfig.configured && !input.marketKnownClosed) {
+    const tradability = await checkAssetTradable(input.request.symbol, {
+      baseUrl: brokerConfig.baseUrl,
+      apiKey: brokerConfig.apiKey,
+      secretKey: brokerConfig.secretKey,
+    });
+    if (!tradability.tradable) tradabilityRejectionReason = tradability.reason;
+  }
   const riskDecision: RiskDecision = input.marketKnownClosed && input.request.side === "buy"
     ? { status: "rejected", reason: "Market is closed (or clock state unknown); BUY blocked at the market-hours chokepoint. Risk-reducing sells are exempt." }
+    : tradabilityRejectionReason
+    ? { status: "rejected", reason: tradabilityRejectionReason }
     : cooldownLoadFailed
     ? { status: "rejected", reason: "Failed to load symbol cooldown state; failing closed on this buy order." }
     : reviewRisk({
@@ -332,6 +351,14 @@ async function executeTradeIntent(input: {
           })(),
           dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
           openPositionCount: portfolioAssessment.positions.length,
+          // Phase 2 Task 3 (PDT guard): threaded straight from the account
+          // snapshot fetched above (portfolio.equity / portfolio.daytrade_count
+          // -- the same fields already read into getAlpacaPortfolio's return
+          // shape). The simulated/unconfigured-broker portfolio always reports
+          // a healthy equity and daytrade_count 0, so the guard never fires
+          // in dry-run mode.
+          accountEquity: portfolio.equity,
+          dayTradeCount: portfolio.daytrade_count,
         },
         limits: {
           maxDailyLoss: riskLimits.maxDailyLoss,

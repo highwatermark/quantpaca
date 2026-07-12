@@ -164,6 +164,15 @@ globalThis.fetch = (async (input: any, init?: any) => {
         headers: { "content-type": "application/json" },
       });
     }
+    if (url.includes("/assets/")) {
+      // Phase 2 Task 3 tradability guard: always tradable/active here -- not
+      // under test in this file.
+      const symbol = url.split("/assets/")[1];
+      return new Response(JSON.stringify({ symbol, tradable: true, status: "active" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     return new Response("unhandled paper-api.alpaca.markets path in test fixture", { status: 404 });
   }
 

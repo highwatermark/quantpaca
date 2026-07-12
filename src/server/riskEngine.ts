@@ -2,6 +2,14 @@ import { BrokerConfig, ExitPlan, RiskDecision, validateSymbol } from "./tradingS
 import { PortfolioAssessment, SizedTradeIntent } from "./domainTypes";
 import { parseFiniteNumber } from "./numericSafety";
 
+// PDT (pattern day trader) guard (docs/GO_LIVE_PLAN.md Phase 2.1, "PDT guard"):
+// FINRA/Alpaca restrict a margin account under $25k equity to 3 day trades in
+// a rolling 5-business-day window; a 4th trips a PDT flag/restriction on the
+// account. See the check below (near the daily-trade-count check) for why a
+// BUY -- not a SELL -- is the conservative point to intervene.
+export const PDT_EQUITY_MIN = 25_000;
+export const PDT_MAX_DAY_TRADES = 3;
+
 type RiskInput = {
   intent: SizedTradeIntent;
   brokerConfig: BrokerConfig;
@@ -14,6 +22,12 @@ type RiskInput = {
     dailyLoss: number;
     dailyTradeCount: number;
     openPositionCount: number;
+    // Broker-reported account equity and PDT day-trade count (Phase 2 Task 3).
+    // Named distinctly from dailyTradeCount above -- that's this system's own
+    // count of trades it placed today; these two are Alpaca's account-level
+    // PDT bookkeeping, threaded straight from the account snapshot.
+    accountEquity: number;
+    dayTradeCount: number;
   };
   limits: {
     maxDailyLoss: number;
@@ -37,6 +51,8 @@ export function reviewRisk(input: RiskInput): RiskDecision {
     [input.metrics.dailyLoss, "metrics.dailyLoss"],
     [input.metrics.dailyTradeCount, "metrics.dailyTradeCount"],
     [input.metrics.openPositionCount, "metrics.openPositionCount"],
+    [input.metrics.accountEquity, "metrics.accountEquity"],
+    [input.metrics.dayTradeCount, "metrics.dayTradeCount"],
     [input.limits.maxDailyLoss, "limits.maxDailyLoss"],
     [input.limits.maxDailyTradeCount, "limits.maxDailyTradeCount"],
     [input.limits.maxOpenPositions, "limits.maxOpenPositions"],
@@ -53,6 +69,13 @@ export function reviewRisk(input: RiskInput): RiskDecision {
       // Fail closed only for buys; for sells, mark it unavailable and skip
       // just the daily-loss comparison below (every other check still runs).
       if (fieldName === "metrics.dailyLoss" && input.intent.side === "sell") {
+        continue;
+      }
+      // Same asymmetry for the two PDT inputs (Phase 2 Task 3): the PDT rule
+      // only ever gates a BUY (see the check below), so an unavailable/
+      // unparsable equity or day-trade count must not block a SELL -- it is
+      // simply never consulted for one.
+      if ((fieldName === "metrics.accountEquity" || fieldName === "metrics.dayTradeCount") && input.intent.side === "sell") {
         continue;
       }
       return { status: "rejected", reason: `Risk input "${fieldName}" is not a finite number; failing closed.` };
@@ -79,6 +102,22 @@ export function reviewRisk(input: RiskInput): RiskDecision {
   }
   if (num("metrics.dailyTradeCount") >= num("limits.maxDailyTradeCount")) {
     return { status: "rejected", reason: "Maximum daily trade count reached." };
+  }
+  // PDT guard (Phase 2 Task 3): a BUY is what OPENS the possibility of a
+  // same-day SELL becoming the 4th day trade, so intervening on the BUY side
+  // is the conservative, simple enforcement point. SELLs are never blocked by
+  // this guard (see the fail-closed skip above) -- an exit that happens to be
+  // a day trade beats a margin call/PDT lockout, and Alpaca's own broker-side
+  // rejection is the final arbiter for an exit.
+  if (
+    input.intent.side === "buy" &&
+    num("metrics.accountEquity") < PDT_EQUITY_MIN &&
+    num("metrics.dayTradeCount") >= PDT_MAX_DAY_TRADES
+  ) {
+    return {
+      status: "rejected",
+      reason: `PDT guard: ${num("metrics.dayTradeCount")} day trades used, equity below $25k`,
+    };
   }
   if (num("metrics.openPositionCount") >= num("limits.maxOpenPositions") && !hasPosition(input.portfolio, input.intent.symbol)) {
     return { status: "rejected", reason: "Maximum open positions reached." };

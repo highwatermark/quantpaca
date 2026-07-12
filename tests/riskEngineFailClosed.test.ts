@@ -41,7 +41,11 @@ const baseInput = () => ({
     emergencyAction: "market_sell" as const,
   },
   breaker: { status: "ok" as const },
-  metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 0 },
+  // accountEquity/dayTradeCount (Phase 2 Task 3, PDT guard): required-for-buy
+  // like dailyLoss above. Defaults here are safely outside the PDT rule
+  // (equity >= $25k) so they don't interfere with the pre-existing checks
+  // this file targets.
+  metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 0, accountEquity: 100000, dayTradeCount: 0 },
   limits: { maxDailyLoss: 500, maxDailyTradeCount: 10, maxOpenPositions: 10, minBuyingPower: 100 },
 });
 

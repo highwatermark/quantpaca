@@ -132,6 +132,15 @@ globalThis.fetch = (async (input: any, init?: any) => {
         status: 200, headers: { "content-type": "application/json" },
       });
     }
+    if (url.includes("/assets/")) {
+      // Phase 2 Task 3 tradability guard: always tradable/active here -- not
+      // under test in this file.
+      const symbol = url.split("/assets/")[1];
+      return new Response(JSON.stringify({ symbol, tradable: true, status: "active" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     return new Response("unhandled paper-api.alpaca.markets path in test fixture", { status: 404 });
   }
 
@@ -304,8 +313,7 @@ test("market open (is_open:true): a scheduled cycle runs full scope -- Claude is
   assert.ok(anthropicCallCount > 0, "a market-open scheduled cycle must make Claude API calls");
 
   const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
-  assert.ok(
-    trades.some((tr: any) => tr.symbol === "MHGT" && tr.side === "buy"),
-    `expected a BUY trade for MHGT once the market is open, got: ${JSON.stringify(trades)}`,
-  );
+  const buy = trades.find((tr: any) => tr.symbol === "MHGT" && tr.side === "buy");
+  assert.ok(buy, `expected a BUY trade for MHGT once the market is open, got: ${JSON.stringify(trades)}`);
+  assert.equal(buy.status, "Accepted", `expected the BUY to actually reach the broker (not be rejected upstream), got: ${JSON.stringify(buy)}`);
 });

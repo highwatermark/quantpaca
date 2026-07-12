@@ -149,13 +149,13 @@ and an exit plan evaluated in the loop (visible in audit events).
 ## Phase 2 — Operational spine + new signal sources (target: 1–2 weeks)
 
 ### 2.1 Autonomous loop
-- [ ] **Scheduler.** Wire `runIntervalMins` (default 15) to an internal interval that runs the sync pipeline when `autoTrading` is on; respect market hours via Alpaca `/clock` (skip order placement when closed). Manual `POST /api/sync` remains for on-demand runs.
+- [x] **Scheduler.** Wire `runIntervalMins` (default 15) to an internal interval that runs the sync pipeline when `autoTrading` is on; respect market hours via Alpaca `/clock` (skip order placement when closed). Manual `POST /api/sync` remains for on-demand runs.
   *Accept:* server left running executes ≥2 unattended cycles, visible in sync logs and audit events.
-- [ ] **Market-hours & tradability guard.** Before any order: check Alpaca clock is open and the asset is `tradable`/not halted.
+- [x] **Market-hours & tradability guard.** Before any order: check Alpaca clock is open and the asset is `tradable`/not halted.
   *Accept:* order attempt while market closed is rejected with an audited reason.
-- [ ] **PDT guard.** Enforce day-trade count against the 3-in-5 limit when equity < $25k (`daytrade_count` already read at `server.ts:322`).
+- [x] **PDT guard.** Enforce day-trade count against the 3-in-5 limit when equity < $25k (`daytrade_count` already read at `server.ts:322`).
   *Accept:* test — 4th would-be day trade is blocked.
-- [ ] **Auto-pause on repeated failure** (guardrail 7). 3 consecutive failed sync cycles → `autoTrading=false`, Telegram alert, stays paused until human resume. **Per-cycle BUY cap** (guardrail 8): max 2 new BUY orders per cycle.
+- [x] **Auto-pause on repeated failure** (guardrail 7). 3 consecutive failed sync cycles → `autoTrading=false`, Telegram alert, stays paused until human resume. **Per-cycle BUY cap** (guardrail 8): max 2 new BUY orders per cycle.
   *Accept:* tests — third consecutive simulated cycle failure pauses trading; a cycle with 3 BUY-decision signals places only 2 orders.
 
 ### 2.2 Order lifecycle
