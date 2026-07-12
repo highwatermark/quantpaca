@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { AppConfig, Trade } from "../types";
 
 export type TradingMode = "paper" | "live";
@@ -76,6 +77,12 @@ export type PipelineTrade = Trade & {
   brokerStatus?: string;
   exitPlan?: ExitPlan;
   riskDecision?: RiskDecision;
+  // Task 13 (idempotent orders): the deterministic id sent to Alpaca as
+  // client_order_id on every broker submission for this trade (see
+  // deriveClientOrderId below). Recorded here -- not just handed to the broker
+  // and forgotten -- so Phase 2 reconciliation can join this local trade back
+  // to the broker order it produced.
+  clientOrderId?: string;
 };
 
 type BrokerOrderResponse = {
@@ -89,12 +96,52 @@ type SubmitTradeInput = {
   brokerConfig: BrokerConfig;
   riskDecision: RiskDecision;
   exitPlan?: ExitPlan;
-  brokerSubmit: () => Promise<BrokerOrderResponse>;
+  // Receives the deterministic client_order_id derived for this intent (see
+  // deriveClientOrderId) so every broker order carries it -- Task 13.
+  brokerSubmit: (clientOrderId: string) => Promise<BrokerOrderResponse>;
   now?: () => Date;
 };
 
 const PAPER_ALPACA_BASE_URL = "https://paper-api.alpaca.markets/v2";
 const LIVE_ALPACA_BASE_URL = "https://api.alpaca.markets/v2";
+
+// Alpaca's client_order_id is capped at 128 chars. "qp-" (greppable prefix) + a
+// 64-char sha256 hex digest = 67 chars, comfortably inside that limit.
+const CLIENT_ORDER_ID_PREFIX = "qp-";
+
+/**
+ * Deterministic client_order_id for every Alpaca order (Task 13: idempotent
+ * orders). Alpaca deduplicates orders sharing a client_order_id -- without one,
+ * any retry/race/double-submit of the same intent creates a second real order.
+ *
+ * This is derived from the intent's stable CONTENT, not a stable intent id,
+ * because none exists on any call path: submitTradeThroughPipeline mints a
+ * fresh `tr-${Math.random()...}` trade id on every call (see baseTrade.id
+ * below), and executeTradeIntent's (server.ts) risk-review `intent.id` is
+ * `intent-${Date.now()}` -- both regenerate on every attempt, including a
+ * resubmission of the exact same logical order, so neither can serve as a
+ * hash input for a *stable* client_order_id. Per the Task 13 brief, the
+ * documented fallback is content-based: symbol|side|qty|source|date.
+ *
+ * Tradeoff (intentional, documented): two genuinely different orders that
+ * happen to share symbol+side+qty+source within the same UTC day will collide
+ * and be treated by Alpaca as the same order -- the second one will NOT create
+ * a second position. This hash is a same-day RETRY/idempotency key, not a
+ * global uniqueness key across distinct trading decisions. If the system gains
+ * a stable per-signal/per-decision id later (Phase 2+), prefer hashing that
+ * instead and drop the content-based fallback.
+ */
+export function deriveClientOrderId(input: {
+  symbol: string;
+  side: string;
+  qty: number;
+  source: string;
+  date: string;
+}): string {
+  const material = `${input.symbol}|${input.side}|${input.qty}|${input.source}|${input.date}`;
+  const digest = createHash("sha256").update(material).digest("hex");
+  return `${CLIENT_ORDER_ID_PREFIX}${digest}`;
+}
 
 export function buildBrokerConfigFromEnv(env: NodeJS.ProcessEnv | Record<string, string | undefined>): BrokerConfig {
   const tradingMode: TradingMode = env.TRADING_MODE === "live" ? "live" : "paper";
@@ -186,6 +233,17 @@ export async function submitTradeThroughPipeline(input: SubmitTradeInput): Promi
   const auditEvents: AuditEvent[] = [];
   const normalizedSymbol = validateSymbol(input.request.symbol);
   const qty = input.riskDecision.adjustedQty || input.request.qty;
+  // Derived unconditionally, on every path (including ones that never reach the
+  // broker, e.g. RiskRejected) so the trade record always carries it -- Task
+  // 13's requirement that the mapping is recorded "for consistency" regardless
+  // of outcome.
+  const clientOrderId = deriveClientOrderId({
+    symbol: normalizedSymbol.normalized || input.request.symbol,
+    side: input.request.side,
+    qty,
+    source: input.request.source,
+    date: timestamp.slice(0, 10),
+  });
 
   const baseTrade: PipelineTrade = {
     id: `tr-${Math.random().toString(36).slice(2, 10)}`,
@@ -202,6 +260,7 @@ export async function submitTradeThroughPipeline(input: SubmitTradeInput): Promi
     loggedNotion: false,
     riskDecision: input.riskDecision,
     exitPlan: input.exitPlan,
+    clientOrderId,
   };
 
   const audit = (toState: TradeState, message: string, fromState?: TradeState, details?: Record<string, unknown>) => {
@@ -248,7 +307,7 @@ export async function submitTradeThroughPipeline(input: SubmitTradeInput): Promi
   audit("BrokerSubmitted", "Broker submission started.", "PendingApproval");
 
   try {
-    const brokerOrder = await input.brokerSubmit();
+    const brokerOrder = await input.brokerSubmit(clientOrderId);
     baseTrade.brokerOrderId = brokerOrder.id;
     baseTrade.brokerStatus = brokerOrder.status;
     const mappedState = mapBrokerStatusToTradeState(brokerOrder.status);

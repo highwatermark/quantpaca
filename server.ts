@@ -312,8 +312,26 @@ async function executeTradeIntent(input: {
     brokerConfig,
     riskDecision,
     exitPlan,
-    brokerSubmit: () => placeAlpacaOrder(brokerConfig, input.request.symbol, riskDecision.adjustedQty || input.request.qty, input.request.side),
+    brokerSubmit: (clientOrderId) =>
+      placeAlpacaOrder(brokerConfig, input.request.symbol, riskDecision.adjustedQty || input.request.qty, input.request.side, clientOrderId),
   });
+
+  // Task 13 (idempotent orders): if this exact intent (by client_order_id) was
+  // already recorded locally -- e.g. a retry/double-submit that Alpaca's own
+  // client_order_id dedup collapsed into the SAME broker order -- reuse that
+  // earlier local trade's id so saveTradeIntent below overwrites it in place
+  // instead of inserting a second local record for one broker order.
+  if (result.trade.clientOrderId) {
+    try {
+      const existing = productionStore.findTradeIntentByClientOrderId(result.trade.clientOrderId);
+      if (existing && existing.id !== result.trade.id) {
+        result.trade.id = existing.id;
+      }
+    } catch (err) {
+      console.error("[client_order_id] Failed to look up an existing trade intent for dedup; recording this as a new local trade.", err);
+    }
+  }
+
   appendAuditEvents(input.db, result.auditEvents);
   productionStore.saveTradeIntent(result.trade);
   if (result.trade.riskDecision) productionStore.saveRiskDecision(result.trade.id, result.trade.riskDecision);
@@ -541,9 +559,48 @@ async function getAlpacaOpenOrders(brokerConfig: BrokerConfig = getBrokerConfig(
   }));
 }
 
-async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty: number, side: "buy" | "sell") {
+// Task 13: does an Alpaca error response indicate the order was rejected
+// specifically because client_order_id already exists (a duplicate/retry),
+// as opposed to some other rejection (insufficient buying power, bad symbol,
+// market closed, etc.)? Alpaca's documented duplicate response is a 422 (or
+// 409) whose body names client_order_id and says it must be unique/already
+// exists. Matched narrowly on both the status AND the wording so we don't
+// misclassify an unrelated 422 as "safe to resolve via the existing order."
+function isDuplicateClientOrderIdError(status: number, bodyText: string): boolean {
+  if (status !== 422 && status !== 409) return false;
+  const lower = bodyText.toLowerCase();
+  return (
+    lower.includes("client_order_id") &&
+    (lower.includes("unique") || lower.includes("already") || lower.includes("duplicate") || lower.includes("exists"))
+  );
+}
+
+// Task 13: resolve a duplicate client_order_id rejection to the order Alpaca
+// already created for it, via Alpaca's GET /orders:by_client_order_id. Returns
+// null (never throws) on any failure -- the caller falls back to failing the
+// submission closed (BrokerFailed) rather than fabricating a mapping.
+async function fetchExistingAlpacaOrderByClientOrderId(brokerConfig: BrokerConfig, clientOrderId: string) {
+  const headers = {
+    "APCA-API-KEY-ID": brokerConfig.apiKey || "",
+    "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
+    "Content-Type": "application/json",
+  };
+  try {
+    const res = await fetch(`${brokerConfig.baseUrl}/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`, { headers });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error("[client_order_id] Failed to fetch the existing order after a duplicate client_order_id rejection.", err);
+    return null;
+  }
+}
+
+async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty: number, side: "buy" | "sell", clientOrderId: string) {
   if (!brokerConfig.configured) {
-    return { id: "dry-run-" + Date.now(), qty: String(qty), status: "accepted" };
+    // Task 13: the dry-run path also carries the id, for consistency with the
+    // live path's response shape (and so tests/callers can assert on it
+    // uniformly regardless of whether a broker is configured).
+    return { id: "dry-run-" + Date.now(), qty: String(qty), status: "accepted", client_order_id: clientOrderId };
   }
 
   if (brokerConfig.tradingMode === "live" && !brokerConfig.liveTradingEnabled) {
@@ -565,10 +622,21 @@ async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty:
       side,
       type: "market",
       time_in_force: "day",
+      client_order_id: clientOrderId,
     }),
   });
   if (!orderRes.ok) {
     const errTxt = await orderRes.text();
+    // Task 13: Alpaca's behavior on a duplicate client_order_id is to return
+    // the EXISTING order, or a 422/409 depending on state. On the error path,
+    // resolve it to that existing order instead of surfacing a spurious
+    // BrokerFailed for an order that actually exists -- without this, an
+    // operator/automation seeing "failed" could retry with a fresh id and
+    // create a real second order, exactly what client_order_id exists to prevent.
+    if (isDuplicateClientOrderIdError(orderRes.status, errTxt)) {
+      const existing = await fetchExistingAlpacaOrderByClientOrderId(brokerConfig, clientOrderId);
+      if (existing) return existing;
+    }
     throw new Error(`Alpaca order rejected: ${errTxt}`);
   }
   return await orderRes.json();

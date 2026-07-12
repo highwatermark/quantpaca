@@ -24,6 +24,12 @@ export type ProductionStore = {
   latestRegimeAssessment(): RegimeAssessment | undefined;
   saveTradeIntent(trade: PipelineTrade): void;
   listTradeIntents(limit?: number): PipelineTrade[];
+  // Task 13 (idempotent orders): the local-trade half of the client_order_id ->
+  // broker order mapping. Lets a resubmission of the same intent (same
+  // client_order_id) find the trade record its earlier attempt already created,
+  // so the caller can overwrite that row in place instead of inserting a second
+  // local trade for what Alpaca itself will treat as one broker order.
+  findTradeIntentByClientOrderId(clientOrderId: string): PipelineTrade | undefined;
   saveRiskDecision(tradeId: string, decision: unknown): void;
   listRiskDecisions(limit?: number): unknown[];
   saveExitPlan(tradeId: string, exitPlan: unknown): void;
@@ -88,6 +94,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       timestamp TEXT NOT NULL,
       symbol TEXT NOT NULL,
       status TEXT NOT NULL,
+      client_order_id TEXT,
       payload_json TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS risk_decisions (
@@ -138,6 +145,16 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
   if (!hasHighWaterMarkColumn) {
     db.exec("ALTER TABLE exit_plans ADD COLUMN high_water_mark REAL");
   }
+
+  // Backfill-safe migration (Task 13, idempotent orders): trade_intents rows
+  // created before this column existed won't have it, and CREATE TABLE IF NOT
+  // EXISTS above is a no-op against them.
+  const tradeIntentsColumns = db.prepare("PRAGMA table_info(trade_intents)").all();
+  const hasClientOrderIdColumn = tradeIntentsColumns.some((col) => col.name === "client_order_id");
+  if (!hasClientOrderIdColumn) {
+    db.exec("ALTER TABLE trade_intents ADD COLUMN client_order_id TEXT");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_trade_intents_client_order_id ON trade_intents(client_order_id)");
 
   return {
     appendAuditEvents(events) {
@@ -194,11 +211,16 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       return rowToPayload<RegimeAssessment>(db.prepare("SELECT payload_json FROM regime_assessments ORDER BY timestamp DESC LIMIT 1").get());
     },
     saveTradeIntent(trade) {
-      db.prepare("INSERT OR REPLACE INTO trade_intents (id, timestamp, symbol, status, payload_json) VALUES (?, ?, ?, ?, ?)")
-        .run(trade.id, trade.timestamp, trade.symbol, trade.status, JSON.stringify(trade));
+      db.prepare("INSERT OR REPLACE INTO trade_intents (id, timestamp, symbol, status, client_order_id, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(trade.id, trade.timestamp, trade.symbol, trade.status, trade.clientOrderId || null, JSON.stringify(trade));
     },
     listTradeIntents(limit = 250) {
       return rowsToPayloads<PipelineTrade>(db.prepare("SELECT payload_json FROM trade_intents ORDER BY timestamp DESC LIMIT ?").all(limit));
+    },
+    findTradeIntentByClientOrderId(clientOrderId) {
+      return rowToPayload<PipelineTrade>(
+        db.prepare("SELECT payload_json FROM trade_intents WHERE client_order_id = ? ORDER BY timestamp DESC LIMIT 1").get(clientOrderId),
+      );
     },
     saveRiskDecision(tradeId, decision) {
       db.prepare("INSERT OR REPLACE INTO risk_decisions (id, timestamp, trade_id, payload_json) VALUES (?, ?, ?, ?)")
