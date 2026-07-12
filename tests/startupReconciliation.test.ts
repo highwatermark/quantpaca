@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   RECONCILIATION_RETRY_INTERVAL_MS,
   RECONCILIATION_MAX_RETRY_ATTEMPTS,
+  OPEN_ORDERS_FETCH_LIMIT,
   STARTUP_ORPHANS_APP_STATE_KEY,
   detectOrphanOrders,
   fetchOpenBrokerOrders,
@@ -60,6 +61,7 @@ function jsonResponse(body: unknown, status = 200) {
 test("named constants match the brief's binding values", () => {
   assert.equal(RECONCILIATION_RETRY_INTERVAL_MS, 5 * 60_000);
   assert.equal(RECONCILIATION_MAX_RETRY_ATTEMPTS, 12);
+  assert.equal(OPEN_ORDERS_FETCH_LIMIT, 500);
   assert.equal(typeof STARTUP_ORPHANS_APP_STATE_KEY, "string");
   assert.ok(STARTUP_ORPHANS_APP_STATE_KEY.length > 0);
 });
@@ -128,6 +130,55 @@ test("fetchOpenBrokerOrders: a network throw -> ok:false, never throws", async (
   const result = await fetchOpenBrokerOrders({ brokerConfig: BROKER_CONFIG, fetchImpl });
   assert.equal(result.ok, false);
   assert.match(result.errorMessage || "", /ECONNREFUSED/);
+});
+
+test("fetchOpenBrokerOrders: the request URL carries limit=500 (Alpaca defaults to a smaller page size; orders beyond it would be invisible to the orphan sweep)", async () => {
+  const requestedUrls: string[] = [];
+  const fetchImpl = (async (url: any) => {
+    requestedUrls.push(String(url));
+    return jsonResponse([]);
+  }) as unknown as typeof fetch;
+  const result = await fetchOpenBrokerOrders({ brokerConfig: BROKER_CONFIG, fetchImpl });
+  assert.equal(result.ok, true);
+  assert.equal(requestedUrls.length, 1);
+  assert.match(requestedUrls[0], /[?&]limit=500(&|$)/, `expected limit=${OPEN_ORDERS_FETCH_LIMIT} in the request URL, got: ${requestedUrls[0]}`);
+});
+
+test("fetchOpenBrokerOrders: a response at exactly the limit (500 orders) is treated as an INCOMPLETE sweep -> ok:false (fail closed: there may be unseen orders past the page)", async () => {
+  const atCapacity = Array.from({ length: OPEN_ORDERS_FETCH_LIMIT }, (_, i) => ({
+    id: `o-${i}`, client_order_id: `qp-${i}`, symbol: "ACME", qty: "1", side: "buy", status: "accepted",
+  }));
+  const fetchImpl = (async () => jsonResponse(atCapacity)) as unknown as typeof fetch;
+  const result = await fetchOpenBrokerOrders({ brokerConfig: BROKER_CONFIG, fetchImpl });
+  assert.equal(result.ok, false);
+  assert.match(result.errorMessage || "", /incomplete|limit/i);
+});
+
+test("runStartupReconciliation: an at-capacity open-orders page keeps tradingReady FALSE (BUYs blocked) and schedules a retry -- same path as a fetch failure", async () => {
+  __setStateForTest({ tradingReady: false, orphanOrders: [] });
+  const atCapacity = Array.from({ length: OPEN_ORDERS_FETCH_LIMIT }, (_, i) => ({
+    id: `o-${i}`, client_order_id: `qp-${i}`, symbol: "ACME", qty: "1", side: "buy", status: "accepted",
+  }));
+  const { deps, state } = makeOrchestratorDeps({
+    fetchImpl: (async (url: any) => {
+      const u = String(url);
+      if (u.includes("/orders?status=open")) return jsonResponse(atCapacity);
+      return jsonResponse({ message: "unhandled" }, 404);
+    }) as unknown as typeof fetch,
+    listTrades: () => [],
+  });
+
+  await runStartupReconciliation(deps);
+
+  assert.equal(isTradingReady(), false, "an at-capacity page must never flip tradingReady true");
+  const buyReason = buyGateRejectionReason("buy");
+  assert.ok(buyReason && /pending/i.test(buyReason));
+  assert.equal(buyGateRejectionReason("sell"), undefined);
+  assert.equal(state.timers.length, 1, "a retry must be scheduled, exactly like a fetch failure");
+  assert.ok(
+    state.logs.some((l) => /incomplete|limit/i.test(l)),
+    `expected a log line about the incomplete sweep, got: ${JSON.stringify(state.logs)}`,
+  );
 });
 
 // --- attemptStartupReconciliation (single attempt, I/O) ---

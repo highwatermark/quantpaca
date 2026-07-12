@@ -45,6 +45,18 @@ export const RECONCILIATION_RETRY_INTERVAL_MS = 5 * 60_000;
 // available) until the process is restarted. Named constant per the brief.
 export const RECONCILIATION_MAX_RETRY_ATTEMPTS = 12;
 
+// GET /v2/orders?status=open page size. Alpaca's `limit` parameter defaults
+// to a much smaller page (50) and caps at 500 -- without requesting the max
+// explicitly, open orders beyond page one would be INVISIBLE to the orphan
+// sweep, silently failing OPEN in the one mechanism whose job is catching
+// unknown broker state. Requesting 500 is necessary but not sufficient: a
+// response of exactly 500 orders means the account may have MORE open orders
+// past this page, so fetchOpenBrokerOrders below treats an at-capacity page
+// as an INCOMPLETE sweep (ok: false -- the same fail-closed path as a fetch
+// failure: BUYs stay blocked, retry on the 5-minute timer), never as a
+// trustworthy list. Named constant per the plan's binding rule.
+export const OPEN_ORDERS_FETCH_LIMIT = 500;
+
 // app_state (persistence.ts) key the persisted orphan list is stored under.
 // Migration-safe: app_state is a generic key-value table, so this needs no
 // schema change. The persisted copy is a record for admins/other routes to
@@ -206,11 +218,15 @@ export function detectOrphanOrders(openOrders: OrphanOrder[], localTrades: Pipel
   });
 }
 
-// GET /v2/orders?status=open. Never throws -- any network error, non-OK
-// response, or a response that isn't an array resolves to `ok: false` so the
-// caller can fail closed (see attemptStartupReconciliation below) instead of
-// treating a malformed/absent response as "zero open orders" (which would
-// silently hide real orphans).
+// GET /v2/orders?status=open&limit=OPEN_ORDERS_FETCH_LIMIT. Never throws --
+// any network error, non-OK response, or a response that isn't an array
+// resolves to `ok: false` so the caller can fail closed (see
+// attemptStartupReconciliation below) instead of treating a malformed/absent
+// response as "zero open orders" (which would silently hide real orphans).
+// A response of exactly OPEN_ORDERS_FETCH_LIMIT orders ALSO resolves to
+// `ok: false`: the page is at capacity, so there may be unseen open orders
+// past it, and an incomplete sweep must never be trusted as complete (see
+// the constant's doc comment above).
 export async function fetchOpenBrokerOrders(input: {
   brokerConfig: BrokerConfig;
   fetchImpl: typeof fetch;
@@ -221,10 +237,16 @@ export async function fetchOpenBrokerOrders(input: {
       "APCA-API-SECRET-KEY": input.brokerConfig.secretKey || "",
       "Content-Type": "application/json",
     };
-    const res = await input.fetchImpl(`${input.brokerConfig.baseUrl}/orders?status=open`, { headers });
+    const res = await input.fetchImpl(`${input.brokerConfig.baseUrl}/orders?status=open&limit=${OPEN_ORDERS_FETCH_LIMIT}`, { headers });
     if (!res.ok) return { ok: false, errorMessage: `GET /orders?status=open responded with ${res.status}` };
     const body = await res.json();
     if (!Array.isArray(body)) return { ok: false, errorMessage: "GET /orders?status=open did not return an array" };
+    if (body.length >= OPEN_ORDERS_FETCH_LIMIT) {
+      return {
+        ok: false,
+        errorMessage: `open-orders page is at the ${OPEN_ORDERS_FETCH_LIMIT}-order limit -- the sweep is incomplete (there may be unseen open orders past this page); failing closed`,
+      };
+    }
     return {
       ok: true,
       orders: body.map((order: any) => ({
