@@ -147,10 +147,32 @@ test("Task 13: resubmitting the same intent twice sends the identical client_ord
   // No double-record locally: exactly one trade_intents row maps to this
   // client_order_id, so Phase 2 reconciliation sees one local trade per broker order.
   const rawStore = createProductionStore(sqlitePath);
-  const matching = rawStore.listTradeIntents(500).filter((tr) => tr.clientOrderId === first.body.trade.clientOrderId);
+  const allIntents = rawStore.listTradeIntents(500);
+  const auditEvents = rawStore.listAuditEvents(1000);
   rawStore.close();
+  const matching = allIntents.filter((tr) => tr.clientOrderId === first.body.trade.clientOrderId);
   assert.equal(matching.length, 1, `expected exactly one local trade record, got: ${JSON.stringify(matching)}`);
   assert.equal(matching[0].brokerOrderId, first.body.trade.brokerOrderId);
+
+  // No orphaned audit trail either: BOTH submissions' audit events must carry an
+  // entity_id that exists in trade_intents. Without patching the pending events
+  // after the dedup id-reassignment, the resubmission's batch would reference a
+  // fresh never-persisted trade id that joins to nothing -- breaking the exact
+  // reconciliation mapping this task exists to record.
+  const intentIds = new Set(allIntents.map((tr) => tr.id));
+  const tradeScopedEvents = auditEvents.filter((e) => typeof e.entityId === "string" && e.entityId.startsWith("tr-"));
+  assert.ok(tradeScopedEvents.length >= 4, "expected trade-scoped audit events from both submissions (2+ per attempt)");
+  for (const event of tradeScopedEvents) {
+    assert.ok(
+      intentIds.has(event.entityId!),
+      `audit event ${event.id} references entity_id ${event.entityId}, which has no trade_intents row (orphaned by the dedup id-reassignment)`,
+    );
+  }
+  // Stronger: this test only ever submitted the one IDEMP intent (twice), so every
+  // trade-scoped event must be attributed to the single deduped trade id.
+  for (const event of tradeScopedEvents) {
+    assert.equal(event.entityId, matching[0].id, "every audit event from both submissions must join to the deduped trade");
+  }
 });
 
 test("Task 13: two genuinely different intents (different symbols) get different client_order_ids and both reach the broker as separate orders", async (t) => {

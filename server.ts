@@ -325,7 +325,16 @@ async function executeTradeIntent(input: {
     try {
       const existing = productionStore.findTradeIntentByClientOrderId(result.trade.clientOrderId);
       if (existing && existing.id !== result.trade.id) {
+        // The pipeline already built this attempt's audit events against the
+        // fresh (about-to-be-discarded) trade id -- re-point them at the
+        // deduped id BEFORE appendAuditEvents persists them, or every
+        // resubmission would leave orphaned audit_events rows whose entity_id
+        // joins to no trade_intents row.
+        const staleId = result.trade.id;
         result.trade.id = existing.id;
+        for (const event of result.auditEvents) {
+          if (event.entityId === staleId) event.entityId = existing.id;
+        }
       }
     } catch (err) {
       console.error("[client_order_id] Failed to look up an existing trade intent for dedup; recording this as a new local trade.", err);
@@ -1946,6 +1955,9 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     tradeVal.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgMsg);
     tradeVal.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, tradeVal);
 
+    // Intentionally NOT deduped by client_order_id: this legacy JSON trades log is an
+    // append-only per-attempt record (UI history, daily trade counting); the SQLite
+    // trade_intents store is the deduped source of truth for reconciliation (Task 13).
     db.trades.unshift(tradeVal);
 
     if (!getBrokerConfig().configured && tradeVal.status !== "BrokerFailed" && tradeVal.status !== "RiskRejected") {
