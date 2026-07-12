@@ -127,11 +127,11 @@ The engines are good; the monolithic `server.ts` bypasses them. Fix the wiring.
 ### 1.3 Regime engine gets real data
 - [x] **Build a market-data fetcher** for SPY & QQQ trend (e.g., 20d vs 50d), broad-market drawdown, and a volatility proxy (VIX or realized SPY vol), using the Alpaca market-data API already configured. Feed the result into `detectRegime(...)` each sync instead of `{}` (`server.ts:656,1208`). Persist each assessment.
   *Accept:* regime assessments in SQLite show non-"unclear" modes with real inputs recorded; staleness > 30 min falls back to conservative default (fail closed).
-- [ ] **Regime-change exit hook.** When regime transitions to `close_only`, the exit monitor evaluates `regimeChangeAction` on open plans.
+- [x] **Regime-change exit hook.** When regime transitions to `close_only`, the exit monitor evaluates `regimeChangeAction` on open plans.
   *Accept:* test simulating regime flip closes flagged positions.
 
 ### 1.4 Risk-gate corrections
-- [ ] **Latch the breaker.** Once tripped, `block_new_buys`/`close_only` persists until explicit admin reset (Telegram command + admin API route), regardless of equity recovery (`breakerEngine.ts`, state persisted via `saveBreakerState`).
+- [x] **Latch the breaker.** Once tripped, `block_new_buys`/`close_only` persists until explicit admin reset (Telegram command + admin API route), regardless of equity recovery (`breakerEngine.ts`, state persisted via `saveBreakerState`).
   *Accept:* test — equity dips past threshold then recovers; buys remain blocked until reset is called.
 - [ ] **Fix the portfolio exposure cap.** Replace the hardcoded `100` (`server.ts:1223`) with an env limit (`QUANTPACA_MAX_PORTFOLIO_EXPOSURE_PERCENT`, default 60), loaded once at boot like the others in `riskLimits.ts`.
   *Accept:* sizing rejects/shrinks when aggregate exposure would exceed the cap; parse test in `riskLimits.test.ts` style.

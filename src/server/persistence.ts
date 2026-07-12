@@ -45,6 +45,10 @@ export type ProductionStore = {
   updateHighWaterMark(tradeId: string, highWaterMark: number): void;
   saveReconciliationReport(report: ReconciliationReport): void;
   latestReconciliationReport(): ReconciliationReport | undefined;
+  // `state` also carries whatever the caller wants latched/round-tripped through
+  // latestBreakerState (Task 10: peakEquity high-water mark, and now `latch` --
+  // the persisted BreakerLatchState from src/server/breakerLatch.ts). Payload is
+  // opaque JSON here; no schema migration needed to add fields.
   saveBreakerState(state: { asOf: string; status: string }): void;
   latestBreakerState<T = unknown>(): T | undefined;
   saveCooldown(entry: { symbol: string; expiresAt: string; reason: string }): void;

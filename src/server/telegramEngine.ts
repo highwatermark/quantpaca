@@ -16,6 +16,7 @@ const commandRoles: Record<string, TelegramRole> = {
   "/resume": "operator",
   "/block_buys": "operator",
   "/close_all": "admin",
+  "/breaker_reset": "admin",
 };
 
 const roleRank: Record<TelegramRole, number> = {

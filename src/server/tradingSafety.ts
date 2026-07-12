@@ -28,7 +28,7 @@ export type TradeState =
 export type AuditEvent = {
   id: string;
   timestamp: string;
-  type: "trade_state" | "risk" | "broker" | "config" | "telegram";
+  type: "trade_state" | "risk" | "broker" | "config" | "telegram" | "breaker";
   actor: string;
   entityId?: string;
   fromState?: TradeState;

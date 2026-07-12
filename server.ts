@@ -29,7 +29,8 @@ import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, 
 import { createExitPlan } from "./src/server/exitEngine";
 import { evaluateOpenPositionExits } from "./src/server/exitMonitor";
 import { reviewRisk } from "./src/server/riskEngine";
-import { evaluateBreaker } from "./src/server/breakerEngine";
+import { evaluateBreaker, BreakerState } from "./src/server/breakerEngine";
+import { applyBreakerLatch, LatchEvent } from "./src/server/breakerLatch";
 import { validateStartupEnv } from "./src/server/startupChecks";
 import { installProcessGuards } from "./src/server/processGuards";
 import { loadRiskLimits, RiskLimits } from "./src/server/riskLimits";
@@ -155,6 +156,58 @@ function requireAdminCommand(req: express.Request, res: express.Response, next: 
   next();
 }
 
+// Task 10 ("Latch the breaker", docs/GO_LIVE_PLAN.md Phase 1.4): evaluateBreaker's
+// threshold math is untouched -- this only computes the same fresh evaluation the
+// pre-latch code always did. Split out so both the normal trade-intent path and the
+// admin reset path (which must force a fresh evaluation independent of the current
+// latch) share one definition of "what does the broker say right now".
+type PreviousBreakerRecord = { peakEquity: number | null; latch?: unknown };
+
+function evaluateFreshBreaker(portfolio: any, brokerConfig: BrokerConfig, previousPeakEquity: number | null): BreakerState {
+  return evaluateBreaker({
+    equity: portfolio.equity,
+    // Simulated portfolios have no prior-close equity; treating equity as last_equity
+    // zeroes the daily-loss check offline. A REAL broker account must supply last_equity —
+    // no fallback when brokerConfig.configured is true.
+    lastEquity: brokerConfig.configured ? portfolio.last_equity : (portfolio.last_equity ?? portfolio.equity),
+    previousPeakEquity,
+    baselineEquity: riskLimits.baselineEquity,
+    limits: {
+      maxDailyLossPercent: riskLimits.maxDailyLossPercent,
+      maxDrawdownFromPeakPercent: riskLimits.maxDrawdownFromPeakPercent,
+      maxDrawdownFromBaselinePercent: riskLimits.maxDrawdownFromBaselinePercent,
+    },
+  });
+}
+
+function breakerLatchAuditEvent(input: {
+  event: Exclude<LatchEvent, "none">;
+  corrupt: boolean;
+  latchedStatus: BreakerState["status"];
+  fresh: BreakerState;
+  actor: string;
+}): AuditEvent {
+  const label = input.event === "trip" ? "tripped" : "escalated";
+  return {
+    id: `ae-breaker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    type: "breaker",
+    actor: input.actor,
+    message: input.corrupt
+      ? `Breaker latch state was corrupt/unparsable; failing closed to block_new_buys.`
+      : `Breaker ${label} to ${input.latchedStatus}.`,
+    details: {
+      status: input.latchedStatus,
+      corrupt: input.corrupt,
+      equity: input.fresh.metrics.equity,
+      dailyLossPercent: input.fresh.metrics.dailyLossPercent,
+      drawdownFromPeakPercent: input.fresh.metrics.drawdownFromPeakPercent,
+      drawdownFromBaselinePercent: input.fresh.metrics.drawdownFromBaselinePercent,
+      reasons: input.fresh.reasons,
+    },
+  };
+}
+
 async function executeTradeIntent(input: {
   db: any;
   config: AppConfig;
@@ -169,22 +222,28 @@ async function executeTradeIntent(input: {
     openOrders: await getAlpacaOpenOrders(brokerConfig),
     source: brokerConfig.configured ? "alpaca" : "local_simulated_snapshot",
   });
-  const previousBreaker = productionStore.latestBreakerState<{ peakEquity: number | null }>();
-  const breakerState = evaluateBreaker({
-    equity: portfolio.equity,
-    // Simulated portfolios have no prior-close equity; treating equity as last_equity
-    // zeroes the daily-loss check offline. A REAL broker account must supply last_equity —
-    // no fallback when brokerConfig.configured is true.
-    lastEquity: brokerConfig.configured ? portfolio.last_equity : (portfolio.last_equity ?? portfolio.equity),
-    previousPeakEquity: previousBreaker?.peakEquity ?? null,
-    baselineEquity: riskLimits.baselineEquity,
-    limits: {
-      maxDailyLossPercent: riskLimits.maxDailyLossPercent,
-      maxDrawdownFromPeakPercent: riskLimits.maxDrawdownFromPeakPercent,
-      maxDrawdownFromBaselinePercent: riskLimits.maxDrawdownFromBaselinePercent,
-    },
-  });
-  productionStore.saveBreakerState(breakerState);
+  const previousBreaker = productionStore.latestBreakerState<PreviousBreakerRecord>();
+  const freshBreaker = evaluateFreshBreaker(portfolio, brokerConfig, previousBreaker?.peakEquity ?? null);
+  // Latch wraps the fresh evaluation (breakerEngine.ts's threshold semantics are
+  // never touched here): once tripped, block_new_buys/close_only persists across
+  // subsequent evaluations -- even ones a fresh computation would call "ok" -- until
+  // an explicit admin reset (POST /api/breaker/reset or the Telegram /breaker_reset
+  // command, both below).
+  const latchResult = applyBreakerLatch(freshBreaker, previousBreaker?.latch);
+  const breakerState = latchResult.effective;
+  const toPersist = { ...breakerState, latch: latchResult.latchState };
+  productionStore.saveBreakerState(toPersist);
+  if (latchResult.event !== "none") {
+    appendAuditEvents(input.db, [
+      breakerLatchAuditEvent({
+        event: latchResult.event,
+        corrupt: latchResult.corrupt,
+        latchedStatus: latchResult.latchState.latchedStatus,
+        fresh: freshBreaker,
+        actor: "breaker_engine",
+      }),
+    ]);
+  }
   const exitPlan = createExitPlan({
     symbol: input.request.symbol,
     side: input.request.side,
@@ -275,6 +334,54 @@ async function executeTradeIntent(input: {
     }
   }
   return result.trade;
+}
+
+// The two admin-gated reset paths required by Task 10 (POST /api/breaker/reset and
+// the Telegram /breaker_reset command, both below) share this: clear the latch
+// unconditionally, then re-evaluate fresh. Reset is not an override of reality --
+// applyBreakerLatch(fresh, null) starts from "no latch" exactly like a first-ever
+// evaluation, so if thresholds are STILL breached right now, it re-trips (and
+// re-latches) immediately. Caller supplies `actor` for the audit trail (e.g.
+// "admin_api" or "telegram:<userId>") and is responsible for NOT holding dbMutex
+// already -- this acquires it itself (broker calls must not happen while already
+// holding the lock; see handleTelegramCommand's read-only-reply comment below).
+async function performBreakerReset(actor: string): Promise<{ status: BreakerState["status"]; reTripped: boolean }> {
+  const release = await dbMutex.acquire();
+  try {
+    const db = readDB();
+    const brokerConfig = getBrokerConfig();
+    const portfolio = await getAlpacaPortfolio(brokerConfig);
+    const previousBreaker = productionStore.latestBreakerState<PreviousBreakerRecord>();
+    const freshBreaker = evaluateFreshBreaker(portfolio, brokerConfig, previousBreaker?.peakEquity ?? null);
+    const latchResult = applyBreakerLatch(freshBreaker, null);
+    const toPersist = { ...latchResult.effective, latch: latchResult.latchState };
+    productionStore.saveBreakerState(toPersist);
+
+    const reTripped = latchResult.latchState.latched;
+    const auditEvent: AuditEvent = {
+      id: `ae-breaker-reset-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "breaker",
+      actor,
+      message: reTripped
+        ? `Breaker reset by ${actor}; thresholds still breached, re-latched to ${latchResult.latchState.latchedStatus}.`
+        : `Breaker reset by ${actor}; latch cleared, status ok.`,
+      details: {
+        status: latchResult.effective.status,
+        reTripped,
+        equity: freshBreaker.metrics.equity,
+        dailyLossPercent: freshBreaker.metrics.dailyLossPercent,
+        drawdownFromPeakPercent: freshBreaker.metrics.drawdownFromPeakPercent,
+        drawdownFromBaselinePercent: freshBreaker.metrics.drawdownFromBaselinePercent,
+        reasons: freshBreaker.reasons,
+      },
+    };
+    appendAuditEvents(db, [auditEvent]);
+    writeDB(db);
+    return { status: latchResult.effective.status, reTripped };
+  } finally {
+    release();
+  }
 }
 
 function defaultDB() {
@@ -517,6 +624,13 @@ async function handleTelegramCommand(update: any) {
 
   const outbound: string[] = [];
   let needsReadOnlyReply = false;
+  // Set when /confirm just consumed a valid "breaker_reset" token -- the actual
+  // reset (performBreakerReset) calls the broker, so it must run after the db lock
+  // below is released, same reason /positions defers its broker read (see
+  // needsReadOnlyReply below). Unlike /close_all's confirm reply (a placeholder
+  // pointing at the admin API), /breaker_reset's Telegram confirmation is the
+  // second of the task's two required reset paths and must actually execute.
+  let confirmedBreakerReset = false;
 
   const release = await dbMutex.acquire();
   try {
@@ -544,13 +658,23 @@ async function handleTelegramCommand(update: any) {
           outbound.push(`Confirmation rejected: ${consumed.reason}.`);
         } else {
           pendingTelegramConfirmations.delete(tokenValue);
-          outbound.push(`Confirmed action: ${token.action}. Submit through the admin API to execute.`);
+          if (token.action === "breaker_reset") {
+            confirmedBreakerReset = true;
+          } else {
+            outbound.push(`Confirmed action: ${token.action}. Submit through the admin API to execute.`);
+          }
         }
       }
     } else if (command === "/close_all") {
       const token = createConfirmationToken({ userId, action: "close_all" });
       pendingTelegramConfirmations.set(token.token, token);
       outbound.push(`Close-all requires confirmation. Reply: /confirm ${token.token}`);
+    } else if (command === "/breaker_reset") {
+      // Strictest existing confirmation flow (mirrors /close_all exactly): admin
+      // role required (telegramEngine.ts commandRoles) plus a second /confirm step.
+      const token = createConfirmationToken({ userId, action: "breaker_reset" });
+      pendingTelegramConfirmations.set(token.token, token);
+      outbound.push(`Breaker reset requires confirmation. Reply: /confirm ${token.token}`);
     } else if (command === "/pause" || command === "/block_buys") {
       db.config.system.autoTrading = false;
       outbound.push("Auto trading paused. New buys are blocked.");
@@ -564,6 +688,13 @@ async function handleTelegramCommand(update: any) {
     writeDB(db);
   } finally {
     release();
+  }
+
+  if (confirmedBreakerReset) {
+    // Admin reset path 2 of 2 (Task 10). Runs after the lock above is released;
+    // performBreakerReset re-acquires dbMutex itself around the actual state change.
+    const result = await performBreakerReset(`telegram:${userId}`);
+    outbound.push(`Breaker reset executed. Status: ${result.status}${result.reTripped ? " (still breached — re-latched)" : ""}.`);
   }
 
   if (needsReadOnlyReply) {
@@ -738,6 +869,19 @@ app.get("/api/breaker/latest", (req, res) => {
   res.json(productionStore.latestBreakerState() || { status: "ok", reasons: ["no_evaluation_yet"], asOf: null });
 });
 
+// Admin reset path 1 of 2 (Task 10, docs/GO_LIVE_PLAN.md Phase 1.4). See
+// performBreakerReset above: clears the latch, then re-evaluates fresh -- if still
+// breached, it re-trips immediately rather than overriding reality.
+app.post("/api/breaker/reset", requireAdminCommand, async (req, res) => {
+  try {
+    const result = await performBreakerReset("admin_api");
+    res.json({ success: true, status: result.status, reTripped: result.reTripped });
+  } catch (err: any) {
+    console.error("Critical error in /api/breaker/reset:", err);
+    res.status(500).json({ error: "Breaker reset failed", details: err.message });
+  }
+});
+
 app.get("/api/portfolio/assessment", async (req, res) => {
   try {
     const portfolio = await getAlpacaPortfolio();
@@ -861,7 +1005,7 @@ app.get("/api/telegram/status", (req, res) => {
     configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
     adminsConfigured: Object.keys(roles).length,
     mode: process.env.TELEGRAM_RUNTIME || "long_polling_ready",
-    commands: ["/status", "/health", "/positions", "/orders", "/trades", "/sync", "/dry_run", "/pause", "/resume", "/block_buys", "/close_all", "/risk", "/regime"],
+    commands: ["/status", "/health", "/positions", "/orders", "/trades", "/sync", "/dry_run", "/pause", "/resume", "/block_buys", "/close_all", "/breaker_reset", "/risk", "/regime"],
   });
 });
 
