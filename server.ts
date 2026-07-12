@@ -19,6 +19,7 @@ import { createProductionStore } from "./src/server/persistence";
 import { createRawSignal } from "./src/server/signalEngine";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
 import { extractEmailScanTarget, EmailScanTarget } from "./src/server/emailIngestion";
+import { assembleScanTargets, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
 import { detectRegime } from "./src/server/regimeEngine";
 import { assessPortfolio } from "./src/server/portfolioEngine";
 import { reconcileBrokerState } from "./src/server/reconciliationEngine";
@@ -271,8 +272,10 @@ function writeDB(data: any) {
   }
 }
 
-// Global Claude client. Constructing without a key throws; both call sites
-// run inside try/catch blocks that fall back to simulated analysis.
+// Global Claude client. Both call sites in /api/sync run inside try/catch
+// blocks; a missing ANTHROPIC_API_KEY or a failed call is treated as a hard
+// failure of that source -- it contributes zero scan-targets/signals rather
+// than falling back to simulated analysis (see scanTargetAssembly.ts).
 const getClaudeClient = () => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -1027,24 +1030,23 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
       addLog("error", "Gmail sync connection error.", err.message);
     }
   } else {
-    addLog("sync", "No authorization token detected. Simulating recent Gmail Inbox scan for @ghost.io...");
+    addLog("sync", "No Gmail authorization token detected. Contributing zero email scan-targets this sync.");
   }
 
-  // If no live emails scanned, add high quality simulated one for demonstration.
-  // This is simulated demo content, not a real Gmail message, so there is no real
-  // send time to capture -- "now" is the honest timestamp for freshly-generated
-  // demo data. (Task 3 removes this hardcoded fallback entirely.)
+  // Fail closed: a fabricated thesis must never reach the trade pipeline. If Gmail
+  // was unavailable (no OAuth token above) or returned zero usable emails, log it,
+  // alert via Telegram if configured, and contribute zero email scan-targets --
+  // never substitute simulated/demo content for a real ingested message.
   if (emailsToScan.length === 0) {
-    emailsToScan.push({
-      source: "email",
-      title: "ZipTrader: Why MARA and Clean Energy are pulling back — Pullback Accumulation",
-      content: "MARA shares slid 10% on market Bitcoin volatility. Fundamentals remain stellar. Is it a trend reversal or simple whipsaw volatility? Our analysis points to macro liquidation. Fundamentals validated by steady hash rates.",
-      sourceTimestamp: new Date().toISOString(),
-    });
+    addLog("sync", "Gmail ingestion produced zero usable email scan-targets this sync.");
+    await sendTelegramAlert(
+      currentConfig.telegram,
+      "⚠️ <b>Gmail ingestion produced zero usable emails this sync.</b> No email-derived signals will be generated.",
+    );
   }
 
   // 2. Fetch YouTube News & Sentiment using Claude web search
-  let youtubeSentiment = "No recent video found in search.";
+  let youtubeResult: YoutubeSentimentResult;
   try {
     addLog("sync", "Querying Claude web search for recent ZipTrader YouTube video sentiment...");
     const anthropic = getClaudeClient();
@@ -1061,22 +1063,29 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         },
       ],
     });
-    youtubeSentiment = claudeText(queryRes) || "ZipTrader channel continues to emphasize accumulation patterns for PLTR and TSLA following volatility.";
-    addLog("sentiment", "ZipTrader YouTube Sentinel scan completed successfully.", youtubeSentiment.substring(0, 300) + "...");
+    const sentiment = claudeText(queryRes);
+    if (sentiment) {
+      youtubeResult = { ok: true, sentiment };
+      addLog("sentiment", "ZipTrader YouTube Sentinel scan completed successfully.", sentiment.substring(0, 300) + "...");
+    } else {
+      // Fail closed: an empty web-search result is not simulated content to fall
+      // back on -- it contributes zero YouTube scan-targets, same as a hard failure.
+      youtubeResult = { ok: false, reason: "Claude web search returned no content." };
+      addLog("sentiment", "YouTube sentiment scan returned no content; contributing zero YouTube scan-targets this sync.");
+    }
   } catch (err: any) {
     console.error("Claude web search error:", err);
-    youtubeSentiment = "ZipTrader channel sentiment: Bullish on growth tech pullbacks, emphasizing MARA and PLTR accumulation.";
-    addLog("sentiment", "YouTube sentiment simulated using default quantitative engine.");
+    // Fail closed: no ANTHROPIC_API_KEY or a failed web-search call must never pass
+    // an error string into analysis as if it were real sentiment.
+    youtubeResult = { ok: false, reason: err.message || "Claude web search failed." };
+    addLog("error", "YouTube sentiment scan failed; contributing zero YouTube scan-targets this sync.", err.message);
   }
 
   // 3. Process each scanned thesis with Claude
-  // The YouTube target keeps a "now" timestamp deliberately: youtubeSentiment is
-  // the output of a web search that just completed above, not an ingested
-  // document with its own real send time to recover.
-  const scanTargets = [
-    ...emailsToScan,
-    { source: "youtube", title: "ZipTrader Channel Feed Analyzed", content: youtubeSentiment, sourceTimestamp: new Date().toISOString() }
-  ];
+  // The YouTube target (when present) keeps a "now" timestamp deliberately: the
+  // sentiment is the output of a web search that just completed above, not an
+  // ingested document with its own real send time to recover.
+  const scanTargets = assembleScanTargets(emailsToScan, youtubeResult);
 
   const parsedAnalyses: StockAnalysis[] = [];
 
