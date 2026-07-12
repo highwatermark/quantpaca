@@ -1512,7 +1512,7 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
         emptyEmailReason =
           messages.length === 0
             ? "Gmail returned zero messages matching the tracked sender this sync."
-            : "Every message returned this sync failed extraction (see per-message log entries).";
+            : "No message returned this sync was usable (per-message detail fetch failed, or extraction rejected it -- see per-message log entries).";
 
         for (const msg of messages) {
           const detailRes = await fetch(
@@ -1575,18 +1575,28 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
       );
     }
     if (shouldSendThrottledAlert(lastAlertedAt, Date.now())) {
-      await sendTelegramAlert(
+      const alertDelivered = await sendTelegramAlert(
         currentConfig.telegram,
         `⚠️ <b>Gmail ingestion produced zero usable emails this sync.</b> ${emptyEmailReason} No email-derived signals will be generated.`,
       );
-      try {
-        productionStore.setAppState(EMPTY_SYNC_ALERT_STATE_KEY, new Date().toISOString());
-      } catch (throttleWriteErr: any) {
-        addLog(
-          "error",
-          "Empty-sync alert throttle state could not be persisted; the next sync may alert again even within the throttle window.",
-          throttleWriteErr?.message || String(throttleWriteErr),
-        );
+      // Only a DELIVERED alert advances the throttle stamp. sendTelegramAlert
+      // returns false both when Telegram isn't configured (silent no-op) and
+      // when the send itself fails -- stamping either case would suppress the
+      // first REAL alert for up to the full window (e.g. an operator enabling
+      // Telegram right after a no-op "attempt" would hear nothing for 6h),
+      // contradicting this control's fail-open-toward-alerting direction
+      // (alertThrottle.ts module comment). An undelivered attempt leaves the
+      // stamp untouched, so the next sync simply tries again.
+      if (alertDelivered) {
+        try {
+          productionStore.setAppState(EMPTY_SYNC_ALERT_STATE_KEY, new Date().toISOString());
+        } catch (throttleWriteErr: any) {
+          addLog(
+            "error",
+            "Empty-sync alert throttle state could not be persisted; the next sync may alert again even within the throttle window.",
+            throttleWriteErr?.message || String(throttleWriteErr),
+          );
+        }
       }
     }
   }

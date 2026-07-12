@@ -106,6 +106,16 @@ function enableTelegram() {
   fs.writeFileSync(dbJsonPath, JSON.stringify(raw, null, 2), "utf8");
 }
 
+// The default config shape (defaultDB() in server.ts): no botToken/chatId,
+// enabled false -- sendTelegramAlert silently no-ops (returns false) against
+// this, which is exactly the "Telegram not configured yet" state under test.
+function disableTelegram() {
+  const raw = fs.existsSync(dbJsonPath) ? JSON.parse(fs.readFileSync(dbJsonPath, "utf8")) : {};
+  raw.config = { ...(raw.config || {}), telegram: { botToken: "", chatId: "", enabled: false } };
+  fs.mkdirSync(path.dirname(dbJsonPath), { recursive: true });
+  fs.writeFileSync(dbJsonPath, JSON.stringify(raw, null, 2), "utf8");
+}
+
 async function runSync(port: number) {
   const res = await fetch(`http://127.0.0.1:${port}/api/sync`, {
     method: "POST",
@@ -176,4 +186,48 @@ test("empty-sync Telegram alert throttle: suppressed within the window, fires ag
 
   await runSync(port);
   assert.equal(sentTelegramMessages.length, 1, "expected the alert to fire again once the throttle window has elapsed");
+});
+
+test("empty-sync Telegram alert throttle: a no-op alert attempt (Telegram unconfigured) must not advance the throttle stamp -- enabling Telegram later alerts immediately", async (t) => {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  sentTelegramMessages.length = 0;
+
+  const { createProductionStore } = await import("../src/server/persistence");
+  const { EMPTY_SYNC_ALERT_STATE_KEY, EMPTY_SYNC_ALERT_WINDOW_MS } = await import("../src/server/alertThrottle");
+  const sqlitePath = path.join(dataDir, "quantpaca.sqlite");
+
+  // Start from a quiet period (stamp well past the window -- the alert is
+  // "due") with Telegram NOT configured: sendTelegramAlert will silently
+  // no-op (returns false) because botToken/chatId/enabled aren't set.
+  disableTelegram();
+  const backdated = new Date(Date.now() - (EMPTY_SYNC_ALERT_WINDOW_MS + 60_000)).toISOString();
+  const rawStoreSeed = createProductionStore(sqlitePath);
+  rawStoreSeed.setAppState(EMPTY_SYNC_ALERT_STATE_KEY, backdated);
+  rawStoreSeed.close();
+
+  await runSync(port);
+  assert.equal(sentTelegramMessages.length, 0, "Telegram is unconfigured -- nothing must reach api.telegram.org");
+
+  // The throttle stamp must NOT have advanced: nothing was actually
+  // delivered, and stamping a silent no-op would suppress the first REAL
+  // alert for up to 6 hours after the operator finally configures Telegram --
+  // contradicting this control's fail-open-toward-alerting direction
+  // (alertThrottle.ts module comment).
+  const rawStoreCheck = createProductionStore(sqlitePath);
+  const stampAfterNoop = rawStoreCheck.getAppState(EMPTY_SYNC_ALERT_STATE_KEY);
+  rawStoreCheck.close();
+  assert.equal(stampAfterNoop, backdated, "a silent no-op alert attempt must not advance the persisted throttle stamp");
+
+  // Operator configures Telegram within what would have been the 6h window:
+  // the very next empty-Gmail sync must alert immediately.
+  enableTelegram();
+  await runSync(port);
+  assert.equal(
+    sentTelegramMessages.length,
+    1,
+    "the first sync after Telegram is configured must alert immediately (no stamp was written by the earlier no-op)",
+  );
 });
