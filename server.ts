@@ -30,6 +30,7 @@ import { buildBracketLegs, BRACKET_TIME_IN_FORCE, PLAIN_TIME_IN_FORCE } from "./
 import { createRawSignal } from "./src/server/signalEngine";
 import { applyWhipsawGate, normalizeWhipsawVerdict } from "./src/server/whipsawGate";
 import { BearishMappingResult, evaluateBearishMapping, normalizeStance } from "./src/server/bearishMapping";
+import { CROSS_SOURCE_WINDOW_HOURS, evaluateCrossSource } from "./src/server/crossSourceConfirmation";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
 import { extractEmailScanTarget, extractFromHeader } from "./src/server/emailIngestion";
 import { assembleScanTargets, EmailScanTarget, YoutubeSentimentResult } from "./src/server/scanTargetAssembly";
@@ -412,6 +413,16 @@ async function executeTradeIntent(input: {
       cooldownLoadFailed = true;
     }
   }
+  // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, cross-source
+  // confirmation): additive risk input, same BUY-only shape as cooldownSymbols
+  // just above -- de-risking (a SELL) must always stay available, and a
+  // conflict is only ever meaningful for the bullish side's own trade intent
+  // (see bearishMapping.ts's do-not-buy/thesis-invalidation machinery, which
+  // this must never suppress). The sync decision loop is the only caller that
+  // ever sets request.crossSourceConflict; every other call site leaves it
+  // undefined, so this list is empty there.
+  const crossSourceConflictSymbols =
+    input.request.side === "buy" && input.request.crossSourceConflict ? [input.request.symbol] : [];
   // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, do-not-buy list): like
   // the cooldown just above, enforced HERE -- the shared order chokepoint --
   // so it guards EVERY buy path (sync automation, manual override), not just
@@ -518,6 +529,7 @@ async function executeTradeIntent(input: {
           maxOpenPositions: riskLimits.maxOpenPositions,
           minBuyingPower: riskLimits.minBuyingPower,
           cooldownSymbols,
+          crossSourceConflictSymbols,
         },
       });
   // Task 4: placeAlpacaOrder reports bracket-specific protection-degradation
@@ -2918,6 +2930,46 @@ For "stance", classify the source's own directional call on the ticker into exac
           timestamp: target.sourceTimestamp,
         };
 
+        // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, "Cross-source
+        // confirmation bonus"): computed BEFORE the raw signal is built, so a
+        // boost can be baked into `aiConfidence` before reviewSignal/sizing
+        // ever consumes it, and so the applied effect is recorded on the
+        // signal itself (`crossSource`, below) rather than only logged. A
+        // store read failure fails toward "no corroborating signals" (effect
+        // "none", the inert default) rather than fabricating a boost or
+        // blocking the signal outright -- still logged for visibility.
+        let crossSourceRecentSignals: ReturnType<typeof productionStore.recentAcceptedSignalsForSymbol> = [];
+        try {
+          const crossSourceSinceIso = new Date(Date.now() - CROSS_SOURCE_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+          crossSourceRecentSignals = productionStore.recentAcceptedSignalsForSymbol(item.symbol, crossSourceSinceIso);
+        } catch (err: any) {
+          addLog("error", `Cross-source confirmation lookup failed for ${item.symbol}; treating as no corroborating signals.`, err?.message || String(err));
+        }
+        const crossSourceResult = evaluateCrossSource({
+          symbol: item.symbol,
+          currentSource: target.source,
+          stance,
+          recentSignals: crossSourceRecentSignals,
+        });
+        let crossSourceConfidence = gated.aiConfidence;
+        if (crossSourceResult.effect === "boost") {
+          crossSourceConfidence = Math.max(0, Math.min(100, gated.aiConfidence * crossSourceResult.multiplier));
+          addLog(
+            "sentiment",
+            `Cross-source confirmation for ${item.symbol}: another bullish source agrees within ${CROSS_SOURCE_WINDOW_HOURS}h -- confidence boosted x${crossSourceResult.multiplier} (${gated.aiConfidence} -> ${crossSourceConfidence}).`,
+          );
+        } else if (crossSourceResult.effect === "conflict") {
+          addLog(
+            "sentiment",
+            `Cross-source conflict for ${item.symbol}: another source disagrees (opposite stance) within ${CROSS_SOURCE_WINDOW_HOURS}h.`,
+          );
+        }
+        // Per the plan, the conflict flag applies to the BULLISH side's trade
+        // intent only -- it must never suppress bearishMapping.ts's own
+        // do-not-buy/thesis-invalidation consequences for the bearish side
+        // (evaluated further below; untouched by this flag).
+        const crossSourceConflictForBuy = stance === "bullish" && crossSourceResult.effect === "conflict";
+
         const rawSignal = createRawSignal({
           // Phase 2 Task 8 (signal-source registry): an email target's
           // `source` is now the registry's own id (e.g. "ziptrader"), not a
@@ -2949,11 +3001,18 @@ For "stance", classify the source's own directional call on the ticker into exac
           dedupContent: target.kind === "email" ? target.content : undefined,
           url: target.kind === "youtube" ? "youtube://ziptrader" : `gmail://${target.source}`,
           // Confidence already carries the whipsaw haircut (or is unchanged for
-          // whipsaw/HOLD/NONE) -- this is what flows into sizing's confidenceMultiplier.
-          aiConfidence: gated.aiConfidence,
+          // whipsaw/HOLD/NONE), and now also the Task 11 cross-source boost
+          // (or is unchanged when the effect was "conflict"/"none") -- this is
+          // what flows into sizing's confidenceMultiplier.
+          aiConfidence: crossSourceConfidence,
           // Phase 2 Task 8: recorded-only, carried through from the source's
           // registry entry -- YouTube (not registry-governed) leaves it unset.
           trustTier: target.kind === "email" ? target.trustTier : undefined,
+          // Phase 2 Task 11: the authoritative stance and the cross-source
+          // effect computed for THIS signal, carried straight onto the
+          // persisted reviewed signal (domainTypes.ts).
+          stance,
+          crossSource: crossSourceResult,
         });
         // Phase 2 Task 8: per-source maxAgeHours (email) replaces the
         // universal 72h default for registry-governed sources -- YouTube
@@ -3207,6 +3266,9 @@ For "stance", classify the source's own directional call on the ticker into exac
                   estimatedPrice: price,
                   side: "buy",
                   reasoning: `ZipTrader thesis validated. Whipsaw check: ${item.whipsawCheck}. Fundamentals: ${item.reasoning}`,
+                  // Phase 2 Task 11: routes into reviewRisk's additive
+                  // crossSourceConflictSymbols input via executeTradeIntent.
+                  crossSourceConflict: crossSourceConflictForBuy,
                 },
                 maxNotional: maxPositionValue,
                 marketKnownClosed,

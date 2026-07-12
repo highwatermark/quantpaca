@@ -1,5 +1,6 @@
 import { AlpacaAccount, AlpacaPosition } from "../types";
 import { MarketRegimeInputs } from "./marketDataFetcher";
+import { CrossSourceResult, Stance } from "./crossSourceConfirmation";
 
 // Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4, signal-source registry):
 // email sources are no longer a single hardcoded "email" literal -- each
@@ -33,6 +34,23 @@ export type RawSignal = {
   // the signal-source registry set this (see sourceRegistry.ts). Recorded
   // only; not read by any gating logic in this task.
   trustTier?: TrustTier;
+  // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, cross-source
+  // confirmation): the source's own authoritative directional call, as
+  // determined by the Claude analysis schema's `stance` field (server.ts) --
+  // NOT the same as ReviewedSignal.classification below, which is a crude
+  // regex guess over `thesis` text and predates this field. Additive,
+  // optional -- callers outside the analysis path (tests, older callers)
+  // simply omit it, and reviewSignal defaults a persisted-but-unset value to
+  // "neutral" the same way normalizeStance does. This is what
+  // recentAcceptedSignalsForSymbol (persistence.ts) reads back to feed
+  // evaluateCrossSource (crossSourceConfirmation.ts).
+  stance?: Stance;
+  // Phase 2 Task 11: the cross-source effect (if any) that was computed for
+  // and applied to THIS signal at review time -- boost/conflict/none.
+  // Recorded for audit even when "none", so every persisted signal shows
+  // what the confirmation check actually decided, not just the interesting
+  // cases. Additive, optional.
+  crossSource?: CrossSourceResult;
 };
 
 export type ReviewedSignal = {
@@ -52,6 +70,11 @@ export type ReviewedSignal = {
   // Phase 2 Task 8: carried through from RawSignal.trustTier -- additive,
   // optional, recorded only (see comment above).
   trustTier?: TrustTier;
+  // Phase 2 Task 11: carried through from RawSignal.stance/crossSource --
+  // additive, optional, same "carried through, recorded only" convention as
+  // trustTier above. See RawSignal's doc comments for both fields.
+  stance?: Stance;
+  crossSource?: CrossSourceResult;
 };
 
 export type RegimeAssessment = {

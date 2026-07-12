@@ -73,6 +73,15 @@ export type TradeRequest = {
   estimatedPrice: number;
   reasoning: string;
   actor?: string;
+  // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, cross-source
+  // confirmation): set true only by the sync decision loop (server.ts), only
+  // for a BUY whose stance conflicted with a bearish signal from another
+  // source within the confirmation window (crossSourceConfirmation.ts).
+  // executeTradeIntent threads this into reviewRisk's additive
+  // crossSourceConflictSymbols input -- see riskEngine.ts. Every other call
+  // site (manual override, Telegram, stop-loss, emergency close) omits it,
+  // so those paths are unaffected.
+  crossSourceConflict?: boolean;
 };
 
 export type PipelineTrade = Trade & {

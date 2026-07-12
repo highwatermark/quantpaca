@@ -35,6 +35,13 @@ type RiskInput = {
     maxOpenPositions: number;
     minBuyingPower: number;
     cooldownSymbols?: string[];
+    // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, cross-source
+    // confirmation): additive input, same shape/style as cooldownSymbols
+    // above -- symbols whose bullish signal this cycle conflicted with a
+    // bearish signal from another source within the confirmation window
+    // (crossSourceConfirmation.ts). Checked as its own independent gate
+    // below; does not alter any existing check's semantics.
+    crossSourceConflictSymbols?: string[];
   };
 };
 
@@ -130,6 +137,11 @@ export function reviewRisk(input: RiskInput): RiskDecision {
   }
   if (input.limits.cooldownSymbols?.includes(input.intent.symbol)) {
     return { status: "requires_human_approval", reason: "Symbol is in cooldown after a rejected or failed trade." };
+  }
+  // Phase 2 Task 11: additive gate, same requires_human_approval shape as the
+  // cooldown check just above -- a conflict never auto-resolves.
+  if (input.limits.crossSourceConflictSymbols?.includes(input.intent.symbol)) {
+    return { status: "requires_human_approval", reason: "Symbol has a conflicting cross-source signal (another source disagrees) within the confirmation window." };
   }
   return { status: "approved", reason: "Centralized risk checks passed." };
 }

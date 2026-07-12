@@ -3,6 +3,8 @@ import path from "node:path";
 import { DatabaseSync as NodeDatabaseSync } from "node:sqlite";
 import { AuditEvent, BROKER_SUCCESS_TRADE_STATUSES, ExitPlan, PipelineTrade, TradeState } from "./tradingSafety";
 import { ReconciliationReport, RegimeAssessment, ReviewedSignal, SizedTradeIntent } from "./domainTypes";
+import { normalizeStance } from "./bearishMapping";
+import { CrossSourceSignal } from "./crossSourceConfirmation";
 
 type DatabaseSync = {
   exec(sql: string): void;
@@ -20,6 +22,22 @@ export type ProductionStore = {
   saveReviewedSignal(signal: ReviewedSignal, duplicateKey?: string): void;
   listReviewedSignals(limit?: number): ReviewedSignal[];
   loadRecentDuplicateKeys(limit?: number): Set<string>;
+  // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, cross-source
+  // confirmation): every ACCEPTED reviewed signal for `symbol` whose
+  // sourceTimestamp (the `timestamp` column -- see saveReviewedSignal, which
+  // stores signal.sourceTimestamp there, not a write-time stamp) is >=
+  // `sinceIso`. The caller (server.ts) is expected to pass
+  // now - CROSS_SOURCE_WINDOW_HOURS as `sinceIso` for an efficient, roughly
+  // bounded fetch; evaluateCrossSource (crossSourceConfirmation.ts) then
+  // re-applies the EXACT window boundary itself, so a generous `sinceIso`
+  // here is safe -- this method does not need to get the boundary precisely
+  // right. `stance` is defensively normalized the same way
+  // normalizeStance/bearishMapping.ts already does (fails closed to
+  // "neutral" for any row from before this field existed, or any malformed
+  // value) -- never trusted as pre-validated just because it round-tripped
+  // through this store. Bounded (LIMIT 500) rather than unbounded, same
+  // precedent as loadRecentDuplicateKeys above.
+  recentAcceptedSignalsForSymbol(symbol: string, sinceIso: string): CrossSourceSignal[];
   saveRegimeAssessment(regime: RegimeAssessment): void;
   latestRegimeAssessment(): RegimeAssessment | undefined;
   saveTradeIntent(trade: PipelineTrade): void;
@@ -296,6 +314,18 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         "SELECT duplicate_key FROM reviewed_signals WHERE duplicate_key IS NOT NULL ORDER BY timestamp DESC LIMIT ?",
       ).all(limit);
       return new Set(rows.map((row) => String(row.duplicate_key)));
+    },
+    recentAcceptedSignalsForSymbol(symbol, sinceIso) {
+      const rows = db.prepare(
+        "SELECT payload_json FROM reviewed_signals WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT 500",
+      ).all(sinceIso);
+      return rowsToPayloads<ReviewedSignal>(rows)
+        .filter((signal) => signal.symbol === symbol && signal.status === "accepted")
+        .map((signal) => ({
+          source: signal.source,
+          stance: normalizeStance(signal.stance),
+          sourceTimestamp: signal.sourceTimestamp,
+        }));
     },
     saveRegimeAssessment(regime) {
       db.prepare("INSERT OR REPLACE INTO regime_assessments (id, timestamp, payload_json) VALUES (?, ?, ?)")
