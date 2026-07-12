@@ -44,6 +44,37 @@ test("shutdown signal closes the server then exits 0 exactly once", () => {
   assert.deepEqual(calls.exitCodes, [0]);
 });
 
+test("shutdown signal stops the scheduler (clears its timer) before closing the server", () => {
+  const { calls, deps } = makeDeps();
+  let schedulerStopped = false;
+  let serverClosedAt = 0;
+  let stoppedAt = 0;
+  let counter = 0;
+  const handlers = createProcessGuardHandlers({
+    ...deps,
+    closeServer: (onClosed) => {
+      calls.closed = true;
+      serverClosedAt = ++counter;
+      onClosed();
+    },
+    stopScheduler: () => {
+      schedulerStopped = true;
+      stoppedAt = ++counter;
+    },
+  });
+  handlers.onShutdownSignal("SIGTERM");
+  assert.equal(schedulerStopped, true);
+  assert.ok(stoppedAt < serverClosedAt, "the scheduler must stop before the HTTP server is closed");
+});
+
+test("shutdown signal without a stopScheduler dep still shuts down normally (optional dep)", () => {
+  const { calls, deps } = makeDeps();
+  const handlers = createProcessGuardHandlers(deps);
+  handlers.onShutdownSignal("SIGTERM");
+  assert.equal(calls.closed, true);
+  assert.deepEqual(calls.exitCodes, [0]);
+});
+
 test("repeated shutdown signals are idempotent", () => {
   const { calls, deps } = makeDeps();
   const handlers = createProcessGuardHandlers(deps);

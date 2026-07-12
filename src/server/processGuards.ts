@@ -2,6 +2,12 @@ export interface ProcessGuardDeps {
   log: (message: string, error?: unknown) => void;
   exit: (code: number) => void;
   closeServer?: (onClosed: () => void) => void;
+  // Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): stops the autonomous
+  // sync scheduler (clears its armed timer) as the first step of graceful
+  // shutdown. Optional so every existing caller/test that predates the
+  // scheduler keeps working unchanged. A cycle already in flight is not
+  // interrupted -- it holds dbMutex and simply runs to completion.
+  stopScheduler?: () => void;
 }
 
 const SHUTDOWN_GRACE_MS = 5000;
@@ -21,6 +27,7 @@ export function createProcessGuardHandlers(deps: ProcessGuardDeps) {
       if (shuttingDown) return;
       shuttingDown = true;
       deps.log(`[shutdown] Received ${signal}; closing HTTP server.`);
+      deps.stopScheduler?.();
       let exited = false;
       const finish = () => {
         if (exited) return;
