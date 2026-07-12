@@ -10,6 +10,7 @@ import {
   AuditEvent,
   BrokerConfig,
   buildBrokerConfigFromEnv,
+  ExitPlan,
   redactConfigForClient,
   RiskDecision,
   stripPersistedSecrets,
@@ -17,6 +18,7 @@ import {
   TradeRequest,
 } from "./src/server/tradingSafety";
 import { createProductionStore } from "./src/server/persistence";
+import { buildBracketLegs, BRACKET_TIME_IN_FORCE, PLAIN_TIME_IN_FORCE } from "./src/server/bracketOrders";
 import { createRawSignal } from "./src/server/signalEngine";
 import { applyWhipsawGate, normalizeWhipsawVerdict } from "./src/server/whipsawGate";
 import { reviewAndPersistSignal } from "./src/server/signalReviewStep";
@@ -368,13 +370,28 @@ async function executeTradeIntent(input: {
           cooldownSymbols,
         },
       });
+  // Task 4: placeAlpacaOrder reports bracket-specific protection-degradation
+  // events (validation fail-open, 422-rejection retry) through this callback
+  // rather than through submitTradeThroughPipeline's own audit() -- it has no
+  // knowledge of the trade id/actor that owns this submission. Collected here
+  // and turned into real AuditEvents (with the trade's final id/actor) below,
+  // once `result` exists.
+  const bracketNotes: Array<{ message: string; details?: Record<string, unknown> }> = [];
   const result = await submitTradeThroughPipeline({
     request: input.request,
     brokerConfig,
     riskDecision,
     exitPlan,
     brokerSubmit: (clientOrderId) =>
-      placeAlpacaOrder(brokerConfig, input.request.symbol, riskDecision.adjustedQty || input.request.qty, input.request.side, clientOrderId),
+      placeAlpacaOrder(
+        brokerConfig,
+        input.request.symbol,
+        riskDecision.adjustedQty || input.request.qty,
+        input.request.side,
+        clientOrderId,
+        input.request.side === "buy" ? { entryEstimate: input.request.estimatedPrice, exitPlan } : undefined,
+        (note) => bracketNotes.push(note),
+      ),
   });
 
   // Task 13 (idempotent orders): if this exact intent (by client_order_id) was
@@ -400,6 +417,20 @@ async function executeTradeIntent(input: {
     } catch (err) {
       console.error("[client_order_id] Failed to look up an existing trade intent for dedup; recording this as a new local trade.", err);
     }
+  }
+
+  // Task 4: attach the collected bracket notes as real audit events, entityId
+  // now resolved to this trade's FINAL id (post dedup re-pointing above).
+  for (const note of bracketNotes) {
+    result.auditEvents.push({
+      id: `ae-bracket-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "broker",
+      actor: input.request.actor || input.request.source,
+      entityId: result.trade.id,
+      message: note.message,
+      details: note.details,
+    });
   }
 
   appendAuditEvents(input.db, result.auditEvents);
@@ -672,12 +703,107 @@ async function fetchExistingAlpacaOrderByClientOrderId(brokerConfig: BrokerConfi
   }
 }
 
-async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty: number, side: "buy" | "sell", clientOrderId: string) {
+// Task 4 (broker-native bracket orders): does an Alpaca error response
+// indicate the REJECTION was about the bracket shape of the order itself
+// (order_class/take_profit/stop_loss), as opposed to some unrelated
+// rejection (insufficient buying power, bad symbol, market closed, etc.)?
+// Matched narrowly (422 + wording) so an unrelated 422 isn't misclassified
+// as "safe to retry as a plain order" -- see submitTradeThroughPipeline's
+// "non-bracket failures keep existing behavior" requirement.
+function isBracketOrderRejection(status: number, bodyText: string): boolean {
+  if (status !== 422) return false;
+  const lower = bodyText.toLowerCase();
+  return lower.includes("bracket") || lower.includes("order_class");
+}
+
+// Task 4: cancels one open broker order (used to clear a position's live
+// bracket legs before the software exit monitor submits a liquidation sell --
+// see the MODULE 2 call site). Never throws: any failure (network error, a
+// non-2xx status other than "already gone") resolves to `{ ok: false }` so
+// the caller can fail closed (skip the software exit this cycle) instead of
+// risking a sell that Alpaca rejects because the shares are still held by an
+// open bracket leg. A 404 (the order already filled/was already canceled --
+// nothing left to cancel) is treated as success: there is no live leg left
+// to conflict with the sell.
+async function cancelAlpacaOrder(brokerConfig: BrokerConfig, orderId: string): Promise<{ ok: boolean; status?: number }> {
+  if (!brokerConfig.configured) return { ok: true };
+  const headers = {
+    "APCA-API-KEY-ID": brokerConfig.apiKey || "",
+    "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
+    "Content-Type": "application/json",
+  };
+  try {
+    const res = await fetch(`${brokerConfig.baseUrl}/orders/${encodeURIComponent(orderId)}`, { method: "DELETE", headers });
+    if (res.ok || res.status === 404) return { ok: true, status: res.status };
+    return { ok: false, status: res.status };
+  } catch (err) {
+    console.error(`[bracket-cancel] DELETE /orders/${orderId} failed.`, err);
+    return { ok: false };
+  }
+}
+
+// Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): submits a BUY as a broker-native
+// bracket order (order_class "bracket", carrying the exit plan's stop-loss
+// and take-profit) so protection survives process death, instead of relying
+// solely on the software exit monitor. `bracketContext` is only ever passed
+// for BUY intents (see executeTradeIntent below) -- SELL/liquidation orders
+// always stay plain (requirement 3: closing, not opening, positions).
+//
+// Fail-open policy (never blocks the entry, always discloses a protection
+// degradation via `onBracketEvent`):
+//   - bracket validation failure (degenerate/inverted plan, non-finite
+//     prices) -> falls back to a single plain order, never touching the
+//     broker with a bracket at all.
+//   - bracket REJECTED by Alpaca (422 naming bracket/order_class) -> retries
+//     ONCE as a plain order under a DIFFERENT client_order_id (`-p` suffix --
+//     this is a genuinely different order, not a resubmission of the same
+//     one, so it must not collide with Task 13's client_order_id dedup).
+//   - any other broker failure (bad symbol, insufficient buying power, a
+//     genuine duplicate client_order_id, ...) keeps existing behavior
+//     unchanged -- no bracket-specific handling kicks in.
+async function placeAlpacaOrder(
+  brokerConfig: BrokerConfig,
+  symbol: string,
+  qty: number,
+  side: "buy" | "sell",
+  clientOrderId: string,
+  bracketContext?: { entryEstimate: number; exitPlan?: ExitPlan },
+  onBracketEvent?: (event: { message: string; details?: Record<string, unknown> }) => void,
+) {
+  let bracketLegs: { takeProfitLimitPrice: number; stopLossStopPrice: number } | null = null;
+  if (side === "buy" && bracketContext?.exitPlan) {
+    const validated = buildBracketLegs({
+      side,
+      entryEstimate: bracketContext.entryEstimate,
+      stopLossPrice: bracketContext.exitPlan.initialStopLossPrice,
+      takeProfitPrice: bracketContext.exitPlan.takeProfitPrice,
+    });
+    if (validated.ok) {
+      bracketLegs = validated.legs;
+    } else {
+      onBracketEvent?.({
+        message: `Bracket order not used for ${symbol}: ${validated.reason} Falling back to a plain market order; protection is software-only (exit monitor) for this position.`,
+        details: { symbol, reason: validated.reason },
+      });
+    }
+  }
+
   if (!brokerConfig.configured) {
     // Task 13: the dry-run path also carries the id, for consistency with the
     // live path's response shape (and so tests/callers can assert on it
     // uniformly regardless of whether a broker is configured).
-    return { id: "dry-run-" + Date.now(), qty: String(qty), status: "accepted", client_order_id: clientOrderId };
+    const base = { id: "dry-run-" + Date.now(), qty: String(qty), status: "accepted", client_order_id: clientOrderId };
+    if (!bracketLegs) return base;
+    // Requirement 6: mirror the bracket structure (including a `legs` array)
+    // in the dry-run fake response, for test fidelity with the live path.
+    return {
+      ...base,
+      order_class: "bracket",
+      legs: [
+        { id: `${base.id}-leg-tp`, type: "limit", limit_price: String(bracketLegs.takeProfitLimitPrice) },
+        { id: `${base.id}-leg-sl`, type: "stop", stop_price: String(bracketLegs.stopLossStopPrice) },
+      ],
+    };
   }
 
   if (brokerConfig.tradingMode === "live" && !brokerConfig.liveTradingEnabled) {
@@ -690,20 +816,63 @@ async function placeAlpacaOrder(brokerConfig: BrokerConfig, symbol: string, qty:
     "Content-Type": "application/json",
   };
 
-  const orderRes = await fetch(`${brokerConfig.baseUrl}/orders`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
+  const submit = (id: string, useBracket: boolean) => {
+    const body: Record<string, unknown> = {
       symbol,
       qty: String(qty),
       side,
       type: "market",
-      time_in_force: "day",
-      client_order_id: clientOrderId,
-    }),
-  });
+      client_order_id: id,
+    };
+    if (useBracket && bracketLegs) {
+      // Alpaca requires the bracket's entry order and both child legs to
+      // share ONE time_in_force. "gtc" (not the plain-order default "day")
+      // is used for the WHOLE bracket so the legs survive overnight -- the
+      // one disclosed behavior change from the pre-Task-4 plain day order
+      // (see bracketOrders.ts's BRACKET_TIME_IN_FORCE doc comment).
+      body.time_in_force = BRACKET_TIME_IN_FORCE;
+      body.order_class = "bracket";
+      body.take_profit = { limit_price: String(bracketLegs.takeProfitLimitPrice) };
+      body.stop_loss = { stop_price: String(bracketLegs.stopLossStopPrice) };
+    } else {
+      body.time_in_force = PLAIN_TIME_IN_FORCE;
+    }
+    return fetch(`${brokerConfig.baseUrl}/orders`, { method: "POST", headers, body: JSON.stringify(body) });
+  };
+
+  const attemptedBracket = Boolean(bracketLegs);
+  const orderRes = await submit(clientOrderId, attemptedBracket);
+
   if (!orderRes.ok) {
     const errTxt = await orderRes.text();
+
+    if (attemptedBracket && isBracketOrderRejection(orderRes.status, errTxt)) {
+      const retryClientOrderId = `${clientOrderId}-p`;
+      onBracketEvent?.({
+        message: `Bracket order for ${symbol} was rejected by Alpaca (status ${orderRes.status}); retrying as a plain market order (client_order_id ${retryClientOrderId}) -- this is a DIFFERENT order from the rejected bracket. Protection is software-only (exit monitor) for this position.`,
+        details: { symbol, status: orderRes.status, brokerResponse: errTxt, rejectedClientOrderId: clientOrderId, retryClientOrderId },
+      });
+      const retryRes = await submit(retryClientOrderId, false);
+      if (!retryRes.ok) {
+        const retryErrTxt = await retryRes.text();
+        onBracketEvent?.({
+          message: `Plain-order retry for ${symbol} after a bracket rejection also failed.`,
+          details: { symbol, status: retryRes.status, brokerResponse: retryErrTxt, clientOrderId: retryClientOrderId },
+        });
+        if (isDuplicateClientOrderIdError(retryRes.status, retryErrTxt)) {
+          const existing = await fetchExistingAlpacaOrderByClientOrderId(brokerConfig, retryClientOrderId);
+          if (existing) return existing;
+        }
+        throw new Error(`Alpaca order rejected: ${retryErrTxt}`);
+      }
+      const retryOrder = await retryRes.json();
+      onBracketEvent?.({
+        message: `Plain-order retry for ${symbol} (client_order_id ${retryClientOrderId}) succeeded after the bracket order was rejected.`,
+        details: { symbol, clientOrderId: retryClientOrderId, brokerOrderId: (retryOrder as { id?: string })?.id },
+      });
+      return retryOrder;
+    }
+
     // Task 13: Alpaca's behavior on a duplicate client_order_id is to return
     // the EXISTING order, or a 422/409 depending on state. On the error path,
     // resolve it to that existing order instead of surfacing a spurious
@@ -1544,6 +1713,53 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
 
           const sellQty = Math.min(decision.qty, Math.floor(parseFloat(pos.qty)) || 0);
           if (sellQty <= 0) continue;
+
+          // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): if this BUY was placed as
+          // a broker-native bracket, its take_profit/stop_loss child legs are
+          // still open orders holding this symbol's shares -- a plain sell
+          // here would be rejected by Alpaca while they're live. Cancel them
+          // first. Fail CLOSED: if any cancel fails, the broker legs are this
+          // position's ONLY protection right now, so skip the software exit
+          // this cycle entirely (log + audit) rather than risk a rejected
+          // sell leaving the position both unsold and undocumented. No legs
+          // recorded (a plain order, or a dry-run/unconfigured broker) is a
+          // no-op here -- the sell proceeds exactly as before this task.
+          const cancelBrokerConfig = getBrokerConfig();
+          let legLookupFailed = false;
+          let legOrderIds: string[] = [];
+          if (cancelBrokerConfig.configured) {
+            try {
+              legOrderIds = productionStore.latestBuySideExitPlanForSymbol(decision.symbol)?.legOrderIds || [];
+            } catch (err: any) {
+              legLookupFailed = true;
+              console.error(`[bracket-cancel] Failed to look up bracket legs for ${decision.symbol}; skipping this software exit.`, err);
+            }
+          }
+          if (legLookupFailed) {
+            addLog("error", `Software exit for ${decision.symbol} skipped: failed to look up its bracket legs. Position may still be covered by a broker-native bracket.`);
+            continue;
+          }
+          if (legOrderIds.length > 0) {
+            let allCanceled = true;
+            for (const legId of legOrderIds) {
+              const cancelResult = await cancelAlpacaOrder(cancelBrokerConfig, legId);
+              if (!cancelResult.ok) {
+                allCanceled = false;
+                addLog("error", `Failed to cancel bracket leg ${legId} for ${decision.symbol}; skipping this software exit -- the broker-native bracket legs remain this position's active protection.`);
+                appendAuditEvents(db, [{
+                  id: `ae-bracket-cancel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                  timestamp: new Date().toISOString(),
+                  type: "broker",
+                  actor: "exit_monitor",
+                  message: `Failed to cancel bracket leg ${legId} for ${decision.symbol} before a software exit; the software exit was SKIPPED this cycle. The position remains protected by its broker-native bracket legs.`,
+                  details: { symbol: decision.symbol, legId, status: cancelResult.status },
+                }]);
+                break;
+              }
+            }
+            if (!allCanceled) continue;
+            addLog("trade", `Canceled ${legOrderIds.length} bracket leg(s) for ${decision.symbol} before the software exit sell.`);
+          }
 
           const liquidationTrade = await executeTradeIntent({
             db,

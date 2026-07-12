@@ -88,12 +88,24 @@ export type PipelineTrade = Trade & {
   // and forgotten -- so Phase 2 reconciliation can join this local trade back
   // to the broker order it produced.
   clientOrderId?: string;
+  // Task 4 (broker-native bracket orders, docs/GO_LIVE_PLAN.md Phase 2.2): the
+  // broker order ids of a bracket's take_profit/stop_loss child legs, when
+  // this trade was submitted as a bracket. Additive field on the existing
+  // trade_intents JSON payload -- no schema migration needed (see
+  // persistence.ts saveTradeIntent, which already stores the full trade as
+  // JSON). Undefined for plain (non-bracket) orders: SELLs, fallback plain
+  // orders after a degenerate-plan or bracket-rejection fail-open, and any
+  // trade that never reached the broker.
+  brokerLegOrderIds?: string[];
 };
 
 type BrokerOrderResponse = {
   id?: string;
   status?: string;
   filled_qty?: string;
+  // Alpaca's bracket-order response includes the take_profit/stop_loss child
+  // orders it created alongside the entry. Only present on a bracket order.
+  legs?: Array<{ id?: string }>;
 };
 
 type SubmitTradeInput = {
@@ -315,6 +327,16 @@ export async function submitTradeThroughPipeline(input: SubmitTradeInput): Promi
     const brokerOrder = await input.brokerSubmit(clientOrderId);
     baseTrade.brokerOrderId = brokerOrder.id;
     baseTrade.brokerStatus = brokerOrder.status;
+    // Task 4: record the bracket's child-leg order ids, if any, so the next
+    // task (order-status polling) and reconciliation can track them. Filters
+    // out any leg missing a usable string id rather than trusting the broker
+    // response blindly.
+    if (Array.isArray(brokerOrder.legs)) {
+      const legIds = brokerOrder.legs
+        .map((leg) => leg?.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0);
+      if (legIds.length > 0) baseTrade.brokerLegOrderIds = legIds;
+    }
     const mappedState = mapBrokerStatusToTradeState(brokerOrder.status);
     audit(mappedState, `Broker returned status ${brokerOrder.status || "unknown"}.`, "BrokerSubmitted", {
       brokerOrderId: brokerOrder.id,

@@ -43,7 +43,12 @@ export type ProductionStore = {
   // `tradeId` and `highWaterMark` support the trailing stop (Task 7): tradeId
   // lets the caller persist a ratcheted HWM back via updateHighWaterMark;
   // highWaterMark is the raw persisted value (undefined if never seeded/set).
-  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan; tradeId: string; highWaterMark?: number } | undefined;
+  // `legOrderIds` (Task 4, broker-native brackets): the owning BUY trade's
+  // persisted bracket leg order ids, if it was submitted as a bracket --
+  // lets the exit monitor cancel live broker legs before a software exit
+  // sell (see server.ts MODULE 2). Read straight off the same trade payload
+  // already joined in here; no extra query.
+  latestBuySideExitPlanForSymbol(symbol: string): { side: "buy" | "sell"; exitPlan: ExitPlan; tradeId: string; highWaterMark?: number; legOrderIds?: string[] } | undefined;
   // Ratchets the persisted high-water mark for the exit plan owned by `tradeId`.
   // Callers are expected to only invoke this with a value already confirmed to
   // be higher than the previous one (see exitMonitor.ts) -- this method itself
@@ -274,15 +279,19 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         LIMIT 50
       `).all(symbol);
       for (const row of rows) {
-        const tradePayload = JSON.parse(String(row.trade_payload)) as { side?: "buy" | "sell" };
+        const tradePayload = JSON.parse(String(row.trade_payload)) as { side?: "buy" | "sell"; brokerLegOrderIds?: unknown };
         if (tradePayload.side !== "buy") continue;
         const exitPayload = JSON.parse(String(row.exit_payload)) as { exitPlan?: ExitPlan };
         if (!exitPayload.exitPlan) continue;
+        const legOrderIds = Array.isArray(tradePayload.brokerLegOrderIds)
+          ? tradePayload.brokerLegOrderIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+          : undefined;
         return {
           side: "buy" as const,
           exitPlan: exitPayload.exitPlan,
           tradeId: String(row.trade_id),
           highWaterMark: typeof row.high_water_mark === "number" ? row.high_water_mark : undefined,
+          ...(legOrderIds && legOrderIds.length > 0 ? { legOrderIds } : {}),
         };
       }
       return undefined;
