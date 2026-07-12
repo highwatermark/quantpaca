@@ -148,15 +148,19 @@ async function runSync(port: number) {
   return body;
 }
 
-async function enableAutoTrading(port: number) {
+async function setAutoTrading(port: number, enabled: boolean) {
   const res = await fetch(`http://127.0.0.1:${port}/api/config`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-admin-token": ADMIN_TOKEN },
     body: JSON.stringify({
-      system: { autoTrading: true, runIntervalMins: 15, maxPositionSizePercent: 10, stopLossPercent: 5, targetProfitPercent: 15 },
+      system: { autoTrading: enabled, runIntervalMins: 15, maxPositionSizePercent: 10, stopLossPercent: 5, targetProfitPercent: 15 },
     }),
   });
   assert.equal(res.status, 200);
+}
+
+async function enableAutoTrading(port: number) {
+  await setAutoTrading(port, true);
 }
 
 const dbJsonPath = path.join(dataDir, "db.json");
@@ -545,6 +549,103 @@ test("stance defensive parse: an invalid/unrecognized stance value never trigger
   const exitTrade = trades.find((tr: any) => tr.symbol === "BURNP" && tr.side === "sell");
   assert.ok(exitTrade, "the ordinary (non-bearish-mapped) SELL decision path must still execute the exit");
   assert.ok(!/thesis_invalidation/.test(exitTrade.reasoning), "reasoning must not claim thesis_invalidation when stance failed closed to neutral");
+});
+
+// Phase 2 Task 10 review fix 2: bearish-mapping persistence is bookkeeping,
+// not trading -- it must NOT be gated on autoTrading. Dedup fires a signal
+// exactly once; if the write were skipped while autoTrading is off (the
+// default state while an operator reviews a new source), the record would be
+// permanently lost. Only the exit EXECUTION (the sell intent) stays behind
+// autoTrading.
+
+test("bearish records persist with autoTrading OFF (held): no trade this cycle, but the thesis_invalidations record survives and the exit monitor exits the position once autoTrading is enabled", async (t) => {
+  resetFixtures();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  // Seed the held position (manual override works regardless of autoTrading),
+  // THEN turn autoTrading off for the signal cycle.
+  await seedPosition(port, "BUROFF", 10, 40);
+  await setAutoTrading(port, false);
+
+  writeRegistry([BURRY_REGISTRY_ENTRY]);
+  const msgId = nextMsgId();
+  MESSAGES = { [msgId]: { from: "Michael Burry <michaeljburry@substack.com>", subject: "Short Thoughts NVDA", body: shortThoughtsBody("BUROFF"), internalDateMs: Date.now() - 1000 } };
+  QUERY_TO_IDS = { "from:michaeljburry@substack.com": [msgId] };
+  RESPONSES = {
+    BUROFF: {
+      symbol: "BUROFF",
+      growthScore: 80,
+      sentimentScore: 20,
+      riskProfile: "High",
+      reasoning: "Balance sheet deterioration confirmed; the long thesis no longer holds.",
+      whipsawCheck: "This is a verified fundamental breakdown, not a volatility shakeout.",
+      whipsawVerdict: "reversal",
+      stance: "bearish",
+      decision: "SELL",
+    },
+  };
+
+  await runSync(port);
+
+  // No trade of any kind was executed (autoTrading off gates all execution)...
+  const tradesAfterOff = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  assert.equal(tradesAfterOff.some((tr: any) => tr.symbol === "BUROFF" && tr.side === "sell"), false, "autoTrading off must gate the exit EXECUTION");
+
+  // ...but the thesis-invalidation record was persisted anyway (bookkeeping).
+  const store = createProductionStore(sqlitePath);
+  const invalidated = store.listActiveThesisInvalidatedSymbols(new Date().toISOString());
+  store.close();
+  assert.ok(invalidated.includes("BUROFF"), `the record must persist even with autoTrading off, active: ${JSON.stringify(invalidated)}`);
+
+  // Enable autoTrading; the next cycle's exit monitor (MODULE 2) picks up the
+  // unexpired invalidation -- no fresh signal needed (the email deduped away).
+  await setAutoTrading(port, true);
+  QUERY_TO_IDS = {};
+  const sync2 = await runSync(port);
+  const tradesAfterOn = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const exitTrade = tradesAfterOn.find((tr: any) => tr.symbol === "BUROFF" && tr.side === "sell");
+  assert.ok(exitTrade, `expected the exit monitor to close BUROFF from the persisted record, logs: ${JSON.stringify(sync2.logs?.map((l: any) => l.message))}`);
+  assert.match(exitTrade.reasoning, /thesis_invalidation/);
+});
+
+test("bearish records persist with autoTrading OFF (unheld): the do-not-buy entry is written, no trade", async (t) => {
+  resetFixtures();
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  await setAutoTrading(port, false);
+
+  writeRegistry([BURRY_REGISTRY_ENTRY]);
+  const msgId = nextMsgId();
+  MESSAGES = { [msgId]: { from: "Michael Burry <michaeljburry@substack.com>", subject: "Short Thoughts NVDA", body: shortThoughtsBody("BUROFU"), internalDateMs: Date.now() - 1000 } };
+  QUERY_TO_IDS = { "from:michaeljburry@substack.com": [msgId] };
+  RESPONSES = {
+    BUROFU: {
+      symbol: "BUROFU",
+      growthScore: 80,
+      sentimentScore: 20,
+      riskProfile: "High",
+      reasoning: "Balance sheet deterioration confirmed.",
+      whipsawCheck: "Verified fundamental breakdown.",
+      whipsawVerdict: "reversal",
+      stance: "bearish",
+      decision: "SELL",
+    },
+  };
+
+  await runSync(port);
+
+  const doNotBuyList = await (await fetch(`http://127.0.0.1:${port}/api/do-not-buy`)).json();
+  assert.ok(doNotBuyList.some((e: any) => e.symbol === "BUROFU"), `the do-not-buy entry must persist even with autoTrading off, got: ${JSON.stringify(doNotBuyList)}`);
+
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  assert.equal(trades.some((tr: any) => tr.symbol === "BUROFU"), false);
+
+  // Restore for any later test in this file.
+  await setAutoTrading(port, true);
 });
 
 test("registry default: a fresh registry ships michael-burry disabled -- no Gmail query is issued for it", async (t) => {

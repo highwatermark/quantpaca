@@ -412,6 +412,25 @@ async function executeTradeIntent(input: {
       cooldownLoadFailed = true;
     }
   }
+  // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, do-not-buy list): like
+  // the cooldown just above, enforced HERE -- the shared order chokepoint --
+  // so it guards EVERY buy path (sync automation, manual override), not just
+  // the sync decision loop's own early check. BUY-only, same de-risking
+  // asymmetry as the cooldown; a store read failure fails closed (the BUY is
+  // rejected rather than proceeding as if no entries exist). The deliberate
+  // escape hatch for a human who really wants the symbol is
+  // DELETE /api/do-not-buy/:symbol (admin, audited) -- remove the entry
+  // first; the check itself is never bypassed.
+  let doNotBuyEntry: { symbol: string; sourceId: string; reason: string; expiresAt: string } | undefined;
+  let doNotBuyLoadFailed = false;
+  if (input.request.side === "buy") {
+    try {
+      doNotBuyEntry = productionStore.listActiveDoNotBuy(new Date().toISOString()).find((e) => e.symbol === input.request.symbol);
+    } catch (err) {
+      console.error("[do-not-buy] Failed to load the do-not-buy list; failing closed on buy order.", err);
+      doNotBuyLoadFailed = true;
+    }
+  }
   // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2, startup reconciliation):
   // the order chokepoint for boot safety. Computed BEFORE the tradability
   // network call below (same "don't spend a network call on an order that's
@@ -448,6 +467,13 @@ async function executeTradeIntent(input: {
     ? { status: "rejected", reason: tradabilityRejectionReason }
     : cooldownLoadFailed
     ? { status: "rejected", reason: "Failed to load symbol cooldown state; failing closed on this buy order." }
+    : doNotBuyLoadFailed
+    ? { status: "rejected", reason: "Failed to load the do-not-buy list; failing closed on this buy order." }
+    : doNotBuyEntry
+    ? {
+        status: "rejected",
+        reason: `${input.request.symbol} is on the do-not-buy list until ${doNotBuyEntry.expiresAt} (source "${doNotBuyEntry.sourceId}": ${doNotBuyEntry.reason}). An admin can remove the entry via DELETE /api/do-not-buy/${input.request.symbol} to override.`,
+      }
     : reviewRisk({
         intent: {
           id: `intent-${Date.now()}`,
@@ -1672,6 +1698,38 @@ app.get("/api/do-not-buy", (req, res) => {
     res.json(productionStore.listActiveDoNotBuy(new Date().toISOString()));
   } catch (err: any) {
     res.status(500).json({ error: "Failed to read the do-not-buy list", details: err?.message || String(err) });
+  }
+});
+
+// Phase 2 Task 10 (review fix 1): the deliberate admin escape hatch for the
+// do-not-buy chokepoint in executeTradeIntent. A human who genuinely wants
+// to buy an avoided symbol removes its entry here first (audited); the
+// chokepoint check itself is never bypassed. Idempotent: deleting a symbol
+// with no entry is a 200 with removed: false.
+app.delete("/api/do-not-buy/:symbol", requireAdminCommand, (req, res) => {
+  const symbol = String(req.params.symbol || "").trim().toUpperCase();
+  if (!symbol) {
+    res.status(400).json({ error: "A non-empty symbol is required." });
+    return;
+  }
+  try {
+    const removed = productionStore.deleteDoNotBuy(symbol);
+    if (removed) {
+      productionStore.appendAuditEvents([
+        {
+          id: `ae-donotbuy-remove-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          type: "risk",
+          actor: "admin_api",
+          entityId: symbol,
+          message: `Admin removed ${symbol} from the do-not-buy list; BUY orders for it are no longer blocked by this entry.`,
+          details: { symbol },
+        },
+      ]);
+    }
+    res.json({ success: true, symbol, removed });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to remove the do-not-buy entry", details: err?.message || String(err) });
   }
 });
 
@@ -2914,98 +2972,103 @@ For "stance", classify the source's own directional call on the ticker into exac
 
         addLog("sentiment", `Analyzed ${item.symbol}: Growth ${item.growthScore}, Sentiment ${item.sentimentScore}%. Decision: ${item.decision}`);
 
-        // Phase 2 Task 10: a bearish SELL signal must be evaluated for its
-        // do-not-buy consequence even when the whipsaw gate downgraded it to
-        // HOLD (see bearishMapping.ts's precedence doc comment) -- so the
-        // portfolio fetch below is also entered on that case, not just an
-        // undowngraded BUY/SELL.
+        // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 --
+        // Michael Burry Substack): the long-only bearish-mapping layer.
+        // Recording is BOOKKEEPING, not trading -- so this block is
+        // deliberately NOT gated on autoTrading (review fix 2): signal dedup
+        // fires a given email exactly once, and autoTrading off is the
+        // default state while an operator reviews a newly-enabled source, so
+        // gating these writes on autoTrading would permanently lose the
+        // record. Only the exit EXECUTION (the sell intent, further below)
+        // stays behind autoTrading. A bearish SELL is also evaluated here
+        // even when the whipsaw gate downgraded it to HOLD (see
+        // bearishMapping.ts's precedence doc comment) -- `parsed.decision`
+        // (pre-gate) is deliberately used as `originalDecision`.
         const bearishSellCandidate = stance === "bearish" && parsed.decision === "SELL";
+        let bearishMappingResult: BearishMappingResult | undefined;
+        if (bearishSellCandidate) {
+          // The held-state check needs a portfolio snapshot even when
+          // autoTrading is off -- the one deliberate exception to "no broker
+          // calls when trading is off", since which list the symbol belongs
+          // on (thesis-invalidation vs. do-not-buy) depends on whether it is
+          // held. A fetch failure fails toward the CHEAP action: treat as
+          // unheld (do-not-buy) -- never toward marking a thesis invalidated
+          // (which would later force an exit) on unknown data.
+          let symbolHeldForMapping = false;
+          try {
+            const heldCheckPortfolio = await getAlpacaPortfolio();
+            const heldPos = (heldCheckPortfolio.positions || []).find((p: any) => p.symbol === item.symbol);
+            symbolHeldForMapping = !!heldPos && parseInt(heldPos.qty) > 0;
+          } catch (err: any) {
+            addLog("error", `Bearish mapping for ${item.symbol}: portfolio fetch for the held-state check failed; treating as unheld (do-not-buy -- the cheap action).`, err?.message || String(err));
+          }
+          bearishMappingResult = evaluateBearishMapping({
+            symbol: item.symbol,
+            sourceId: target.source,
+            originalDecision: parsed.decision,
+            stance: parsed.stance,
+            symbolHeld: symbolHeldForMapping,
+            whipsawDowngraded: gated.downgraded,
+          });
 
-        // 4. Automated orders placing based on Decision and Risk checks
-        if (currentConfig.system.autoTrading && (item.decision === "BUY" || item.decision === "SELL" || bearishSellCandidate)) {
-          // Verify current position size limit
-          const portfolio = await getAlpacaPortfolio();
-          const currentShares = portfolio.positions.find((p: any) => p.symbol === item.symbol);
-
-          // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 --
-          // Michael Burry Substack): the long-only bearish-mapping layer.
-          // Evaluated here (before any `continue` below might skip the rest
-          // of this iteration) so a do-not-buy/thesis-invalidation write is
-          // never silently dropped by a later portfolio-value or price-lookup
-          // failure. `parsed.decision` (pre-whipsaw-gate) is deliberately
-          // used as `originalDecision` -- see evaluateBearishMapping's doc
-          // comment for why a downgraded SELL must still be evaluated here.
-          let bearishMappingResult: BearishMappingResult | undefined;
-          if (bearishSellCandidate) {
-            const symbolHeld = !!currentShares && parseInt(currentShares.qty) > 0;
-            bearishMappingResult = evaluateBearishMapping({
-              symbol: item.symbol,
-              sourceId: target.source,
-              originalDecision: parsed.decision,
-              stance: parsed.stance,
-              symbolHeld,
-              whipsawDowngraded: gated.downgraded,
-            });
-
-            if (bearishMappingResult.kind === "thesis_invalidation") {
-              try {
-                productionStore.saveThesisInvalidation({
-                  symbol: bearishMappingResult.symbol,
-                  sourceId: bearishMappingResult.sourceId,
-                  reason: bearishMappingResult.reason,
-                  expiresAt: bearishMappingResult.expiresAt,
-                });
-                addLog(
-                  "trade",
-                  `Thesis invalidated for ${item.symbol} by source "${bearishMappingResult.sourceId}" (bearish stance, whipsaw-verified reversal). The exit executes via the SELL decision path this cycle; MODULE 2 re-evaluates this dimension on subsequent cycles until ${bearishMappingResult.expiresAt}.`,
-                );
-                appendAuditEvents(db, [{
-                  id: `ae-thesisinv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                  timestamp: new Date().toISOString(),
-                  type: "risk",
-                  actor: "bearish_mapping",
-                  entityId: item.symbol,
-                  message: `Thesis invalidated for ${item.symbol}: ${bearishMappingResult.reason}`,
-                  details: { symbol: item.symbol, sourceId: bearishMappingResult.sourceId, expiresAt: bearishMappingResult.expiresAt },
-                }]);
-              } catch (err: any) {
-                addLog("error", `Failed to persist thesis invalidation for ${item.symbol}; this cycle's SELL still executes via the normal decision path if applicable.`, err?.message || String(err));
-              }
-            } else if (bearishMappingResult.kind === "do_not_buy") {
-              try {
-                productionStore.saveDoNotBuy({
-                  symbol: bearishMappingResult.symbol,
-                  sourceId: bearishMappingResult.sourceId,
-                  reason: bearishMappingResult.reason,
-                  expiresAt: bearishMappingResult.expiresAt,
-                });
-                addLog(
-                  "trade",
-                  `${item.symbol} added to the do-not-buy list by source "${bearishMappingResult.sourceId}" (bearish stance on an unheld symbol) until ${bearishMappingResult.expiresAt}.`,
-                );
-                appendAuditEvents(db, [{
-                  id: `ae-donotbuy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                  timestamp: new Date().toISOString(),
-                  type: "risk",
-                  actor: "bearish_mapping",
-                  entityId: item.symbol,
-                  message: `${item.symbol} added to do-not-buy: ${bearishMappingResult.reason}`,
-                  details: { symbol: item.symbol, sourceId: bearishMappingResult.sourceId, expiresAt: bearishMappingResult.expiresAt },
-                }]);
-              } catch (err: any) {
-                addLog("error", `Failed to persist do-not-buy entry for ${item.symbol}.`, err?.message || String(err));
-              }
+          if (bearishMappingResult.kind === "thesis_invalidation") {
+            try {
+              productionStore.saveThesisInvalidation({
+                symbol: bearishMappingResult.symbol,
+                sourceId: bearishMappingResult.sourceId,
+                reason: bearishMappingResult.reason,
+                expiresAt: bearishMappingResult.expiresAt,
+              });
+              addLog(
+                "trade",
+                `Thesis invalidated for ${item.symbol} by source "${bearishMappingResult.sourceId}" (bearish stance, whipsaw-verified reversal). With autoTrading on, the exit executes via the SELL decision path this cycle; MODULE 2 re-evaluates this dimension on subsequent cycles until ${bearishMappingResult.expiresAt}.`,
+              );
+              appendAuditEvents(db, [{
+                id: `ae-thesisinv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                type: "risk",
+                actor: "bearish_mapping",
+                entityId: item.symbol,
+                message: `Thesis invalidated for ${item.symbol}: ${bearishMappingResult.reason}`,
+                details: { symbol: item.symbol, sourceId: bearishMappingResult.sourceId, expiresAt: bearishMappingResult.expiresAt },
+              }]);
+            } catch (err: any) {
+              addLog("error", `Failed to persist thesis invalidation for ${item.symbol}; this cycle's SELL still executes via the normal decision path if applicable.`, err?.message || String(err));
+            }
+          } else if (bearishMappingResult.kind === "do_not_buy") {
+            try {
+              productionStore.saveDoNotBuy({
+                symbol: bearishMappingResult.symbol,
+                sourceId: bearishMappingResult.sourceId,
+                reason: bearishMappingResult.reason,
+                expiresAt: bearishMappingResult.expiresAt,
+              });
+              addLog(
+                "trade",
+                `${item.symbol} added to the do-not-buy list by source "${bearishMappingResult.sourceId}" (bearish stance on an unheld symbol) until ${bearishMappingResult.expiresAt}.`,
+              );
+              appendAuditEvents(db, [{
+                id: `ae-donotbuy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                type: "risk",
+                actor: "bearish_mapping",
+                entityId: item.symbol,
+                message: `${item.symbol} added to do-not-buy: ${bearishMappingResult.reason}`,
+                details: { symbol: item.symbol, sourceId: bearishMappingResult.sourceId, expiresAt: bearishMappingResult.expiresAt },
+              }]);
+            } catch (err: any) {
+              addLog("error", `Failed to persist do-not-buy entry for ${item.symbol}.`, err?.message || String(err));
             }
           }
+        }
 
-          if (item.decision !== "BUY" && item.decision !== "SELL") {
-            // A whipsaw-downgraded bearish SELL (decision is HOLD post-gate)
-            // has nothing left to do this cycle beyond the bearish-mapping
-            // write above -- no risk engine evaluation, no price lookup.
-          } else {
+        // 4. Automated orders placing based on Decision and Risk checks
+        if (currentConfig.system.autoTrading && (item.decision === "BUY" || item.decision === "SELL")) {
           addLog("sync", `Risk Engine Evaluation for ticker ${item.symbol}...`);
 
           // Verify current position size limit
+          const portfolio = await getAlpacaPortfolio();
+          const currentShares = portfolio.positions.find((p: any) => p.symbol === item.symbol);
           const parsedPortfolioValue = Number(portfolio.portfolio_value);
           if (!Number.isFinite(parsedPortfolioValue) || parsedPortfolioValue <= 0) {
             addLog("error", `Order skipped for ${item.symbol}. Portfolio value is not a finite number; failing closed.`);
@@ -3256,7 +3319,6 @@ For "stance", classify the source's own directional call on the ticker into exac
             }
 
             addLog("trade", `Submitted SELL ${qty} shares of ${item.symbol}. State: ${newTrade.status}. Telegram: ${newTrade.notifiedTelegram ? 'Sent' : 'Disabled'}`);
-          }
           }
         }
       }

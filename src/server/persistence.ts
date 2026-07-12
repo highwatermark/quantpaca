@@ -110,13 +110,20 @@ export type ProductionStore = {
   saveThesisInvalidation(entry: { symbol: string; sourceId: string; reason: string; expiresAt: string }): void;
   listActiveThesisInvalidatedSymbols(nowIso: string): string[];
   // A bearish/short thesis on an UNHELD symbol adds it to this do-not-buy
-  // list instead (no trade intent created) -- enforced in the BUY decision
-  // path (server.ts, before sizing). Unlike the cooldown/thesis-invalidation
-  // lists above, callers need the full record (not just the symbol) to
-  // produce an audited rejection reason naming the source and expiry, and to
-  // power the admin-visibility read endpoint (GET /api/do-not-buy).
+  // list instead (no trade intent created) -- enforced at the shared order
+  // chokepoint (executeTradeIntent, server.ts, same place as the cooldown),
+  // so it guards EVERY buy path: sync automation and manual override alike.
+  // Unlike the cooldown/thesis-invalidation lists above, callers need the
+  // full record (not just the symbol) to produce an audited rejection reason
+  // naming the source and expiry, and to power the admin-visibility read
+  // endpoint (GET /api/do-not-buy).
   saveDoNotBuy(entry: { symbol: string; sourceId: string; reason: string; expiresAt: string }): void;
   listActiveDoNotBuy(nowIso: string): Array<{ symbol: string; sourceId: string; reason: string; expiresAt: string }>;
+  // The admin escape hatch's storage half (DELETE /api/do-not-buy/:symbol,
+  // server.ts): a human who genuinely wants to buy an avoided symbol removes
+  // its entry first -- the chokepoint check itself is never bypassed. Returns
+  // whether a row was actually deleted (false for a symbol with no entry).
+  deleteDoNotBuy(symbol: string): boolean;
   // Tiny generic key-value store (Phase 2 Task 1, Item B: docs/GO_LIVE_PLAN.md
   // "Phase 1 completion report" -> "Deferred to Phase 2") for small pieces of
   // cross-restart state that don't warrant a dedicated table -- e.g. the
@@ -436,6 +443,12 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
         reason: String(row.reason),
         expiresAt: String(row.expires_at),
       }));
+    },
+    deleteDoNotBuy(symbol) {
+      // node:sqlite's StatementSync.run resolves to { changes, lastInsertRowid };
+      // typed `unknown` in this file's minimal DatabaseSync facade, so narrow it here.
+      const result = db.prepare("DELETE FROM do_not_buy WHERE symbol = ?").run(symbol) as { changes?: number | bigint };
+      return Number(result?.changes ?? 0) > 0;
     },
     getAppState(key) {
       const row = db.prepare("SELECT value FROM app_state WHERE key = ?").get(key);

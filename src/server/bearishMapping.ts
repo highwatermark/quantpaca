@@ -70,11 +70,16 @@ export type BearishMappingResult =
  *   3. decision SELL + stance bearish + HELD: thesis-invalidation marking
  *      applies ONLY when the whipsaw gate did NOT downgrade this SELL (i.e.
  *      reversal was verified) -- a whipsaw-downgraded SELL does NOT
- *      invalidate the thesis and does NOT force an exit. Note: by
- *      construction, a non-downgraded SELL already implies the gate verified
- *      the reversal (whipsawGate.ts only ever downgrades a non-reversal
- *      SELL), so "gate approved" and "not downgraded" are the same fact
- *      here.
+ *      invalidate the thesis and does NOT force an exit. This is the CHOSEN
+ *      POLICY, not a derived equivalence: the task brief also floated "OR
+ *      the source's trust tier is high" as an alternative invalidation path,
+ *      and that alternative IS genuinely reachable (a high-trust source's
+ *      SELL can absolutely be whipsaw-downgraded -- the gate has no
+ *      awareness of trust tier). The accepted, conservative resolution is
+ *      that a downgrade blocks invalidation REGARDLESS of trust tier --
+ *      forcing an exit on an unverified reversal is expensive no matter how
+ *      trusted the source -- which is why trust tier deliberately does not
+ *      appear in this function's inputs at all.
  *   4. decision SELL + stance bearish + UNHELD: do-not-buy applies
  *      regardless of whipsawDowngraded -- avoiding a buy is cheap, forcing an
  *      exit is not, so the unheld case does not need reversal verification.
