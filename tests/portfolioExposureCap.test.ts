@@ -143,7 +143,7 @@ test("an automated BUY on a symbol already near the env-loaded portfolio exposur
   assert.ok(analysis, "expected an analysis to be recorded for EXPO");
   assert.equal(analysis.decision, "BUY");
 
-  const portfolioRes = await fetch(`http://127.0.0.1:${port}/api/portfolio`);
+  const portfolioRes = await fetch(`http://127.0.0.1:${port}/api/portfolio`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const portfolio = await portfolioRes.json();
   const equity = Number(portfolio.equity ?? portfolio.portfolio_value);
   assert.ok(Number.isFinite(equity) && equity > 0, `expected a finite equity, got: ${JSON.stringify(portfolio)}`);
@@ -176,7 +176,7 @@ test("an automated BUY on a symbol already near the env-loaded portfolio exposur
     `expected the new buy's notional (${newBuyNotional}) to be far below what the per-symbol/buying-power caps alone would allow (72000), proving the portfolio exposure cap bound the trade`,
   );
 
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const trades = await tradesRes.json();
   const automatedBuys = trades.filter((tr: any) => tr.symbol === SYMBOL && tr.side === "buy" && tr.source === "automation");
   if (automatedBuys.length > 0) {

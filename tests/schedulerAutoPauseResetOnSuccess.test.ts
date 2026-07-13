@@ -88,12 +88,12 @@ test("2 consecutive scheduled failures followed by a success resets the failure 
   await runScheduledSyncTickForTests();
   await runScheduledSyncTickForTests();
 
-  let config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  let config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, true, "2 failures alone must never pause trading");
 
   claudeShouldFail = false;
   await runScheduledSyncTickForTests();
-  config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, true, "a success on the 3rd tick must reset the counter, not pause");
 
   // Prove the counter actually reset (not just "hasn't reached 3 yet"): run 2
@@ -103,6 +103,6 @@ test("2 consecutive scheduled failures followed by a success resets the failure 
   claudeShouldFail = true;
   await runScheduledSyncTickForTests();
   await runScheduledSyncTickForTests();
-  config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, true, "2 failures after a reset must still not pause -- the earlier failures must not have carried over");
 });

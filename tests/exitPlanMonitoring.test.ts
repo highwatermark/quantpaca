@@ -154,7 +154,7 @@ test("take-profit: a plan with takeProfitPrice below the current price closes th
   rawStore.close();
 
   const sync = await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "TPRO" && tr.side === "sell");
   assert.ok(exitTrade, `expected a sell trade closing TPRO, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.match(exitTrade.reasoning, /take_profit/);
@@ -181,7 +181,7 @@ test("time exit: a plan with timeExitAt in the past closes the position", async 
   rawStore.close();
 
   await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "TIMEX" && tr.side === "sell");
   assert.ok(exitTrade, "expected a sell trade closing TIMEX on a past timeExitAt");
   assert.match(exitTrade.reasoning, /time_exit/);
@@ -209,7 +209,7 @@ test("plan stop-loss: a plan stop above the current price closes the position wi
   rawStore.close();
 
   await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "PSTOP" && tr.side === "sell");
   assert.ok(exitTrade, "expected a sell trade closing PSTOP on the plan's own stop-loss");
   assert.match(exitTrade.reasoning, /stop_loss/);
@@ -224,7 +224,7 @@ test("no-plan fallback: a position with no persisted plan still closes via the l
   injectUnplannedPosition("NOPLAN", 1, 94, -6);
 
   await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "NOPLAN" && tr.side === "sell");
   assert.ok(exitTrade, "expected the legacy stop-loss to close a planless position past -5%");
   assert.match(exitTrade.reasoning, /stop-loss/i);
@@ -253,7 +253,7 @@ test("not-triggered: a plan with all thresholds unmet does not close the positio
   setSimulatedMarketState("HOLDIT", 100, -1);
 
   await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "HOLDIT" && tr.side === "sell");
   assert.equal(exitTrade, undefined, "no exit should fire when no plan dimension is triggered");
 });
@@ -295,7 +295,7 @@ test("per-position fail-closed: a corrupt plan is skipped and covered by the leg
   setSimulatedMarketState("VALID", 130, 30);
 
   const sync = await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
 
   const corruptExit = trades.find((tr) => tr.symbol === "CORRUPT" && tr.side === "sell");
   assert.ok(corruptExit, "corrupt-plan symbol should still exit via the legacy fallback");
@@ -352,7 +352,7 @@ test("C1: a rejected trade's exit plan must not replace the live position's pers
   // (230). If the bogus plan had leaked in, no exit would fire here.
   setSimulatedMarketState("GUARDX", 116, 16);
   const sync = await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "GUARDX" && tr.side === "sell");
   assert.ok(exitTrade, `expected the ORIGINAL plan's take-profit to fire at 116, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.match(exitTrade.reasoning, /take_profit/);
@@ -384,7 +384,7 @@ test("trailing stop: price rises then retraces across two sync cycles -- the HWM
   // (120 is above the trailing threshold of 120 * 0.9 = 108).
   setSimulatedMarketState("TRAIL", 120, 20);
   await runSync(port);
-  const afterCycle1 = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const afterCycle1 = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.equal(
     afterCycle1.find((tr) => tr.symbol === "TRAIL" && tr.side === "sell"),
     undefined,
@@ -401,7 +401,7 @@ test("trailing stop: price rises then retraces across two sync cycles -- the HWM
   // Cycle 2: price retraces to 107 -- below 120 * 0.9 = 108 -- the trailing exit fires.
   setSimulatedMarketState("TRAIL", 107, 7);
   const sync = await runSync(port);
-  const afterCycle2 = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const afterCycle2 = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = afterCycle2.find((tr) => tr.symbol === "TRAIL" && tr.side === "sell");
   assert.ok(exitTrade, `expected a trailing-stop sell closing TRAIL on cycle 2, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.match(exitTrade.reasoning, /trailing_stop hit: HWM 120\.00, threshold 108\.00.*current 107\.00/);

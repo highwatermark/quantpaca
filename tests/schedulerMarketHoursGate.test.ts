@@ -188,10 +188,10 @@ test("market closed (is_open:false): a scheduled cycle places zero orders, makes
 
   assert.equal(anthropicCallCount, 0, "a market-closed scheduled cycle must make zero Claude API calls");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.deepEqual(trades, [], "a market-closed scheduled cycle must place zero orders");
 
-  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const messages: string[] = logs.map((l) => l.message);
   assert.ok(
     messages.some((m) => /market closed/i.test(m) && /skip/i.test(m)),
@@ -220,10 +220,10 @@ test("clock fetch failure is treated as closed (fail closed): same reduced-cycle
 
   assert.equal(anthropicCallCount, 0, "a clock-fetch-failure scheduled cycle must make zero Claude API calls (fail closed)");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.deepEqual(trades, [], "a clock-fetch-failure scheduled cycle must place zero orders");
 
-  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const messages: string[] = logs.map((l) => l.message);
   assert.ok(
     messages.some((m) => /clock check failed/i.test(m) && /closed/i.test(m)),
@@ -276,14 +276,14 @@ async function assertProtectiveSellProceedsWhileClosed(t: any, symbol: string) {
   openPositions = [losingPosition(symbol)];
   anthropicCallCount = 0;
 
-  const tradesBefore = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const tradesBefore = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const buysBefore = tradesBefore.filter((tr) => tr.side === "buy").length;
 
   await runScheduledSyncTickForTests();
 
   assert.equal(anthropicCallCount, 0, "the reduced cycle must still make zero Claude calls -- no BUY decision can form");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const protectiveSell = trades.find((tr) => tr.symbol === symbol && tr.side === "sell");
   assert.ok(protectiveSell, `expected a protective stop-loss SELL for ${symbol} despite the closed/unknown market, got: ${JSON.stringify(trades)}`);
   assert.equal(
@@ -295,7 +295,7 @@ async function assertProtectiveSellProceedsWhileClosed(t: any, symbol: string) {
   const buysAfter = trades.filter((tr) => tr.side === "buy").length;
   assert.equal(buysAfter, buysBefore, "no new BUY order may be placed during a closed/unknown-market scheduled cycle");
 
-  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const messages: string[] = logs.map((l) => l.message);
   assert.ok(
     messages.some((m) => /market closed/i.test(m) && /skip/i.test(m)),
@@ -330,7 +330,7 @@ test("market open (is_open:true): a scheduled cycle runs full scope -- Claude is
 
   assert.ok(anthropicCallCount > 0, "a market-open scheduled cycle must make Claude API calls");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const buy = trades.find((tr: any) => tr.symbol === "MHGT" && tr.side === "buy");
   assert.ok(buy, `expected a BUY trade for MHGT once the market is open, got: ${JSON.stringify(trades)}`);
   assert.equal(buy.status, "Accepted", `expected the BUY to actually reach the broker (not be rejected upstream), got: ${JSON.stringify(buy)}`);

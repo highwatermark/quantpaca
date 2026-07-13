@@ -287,7 +287,7 @@ async function resetBreakerIfLatched(port: number) {
 }
 
 async function auditMessages(port: number): Promise<string[]> {
-  const res = await fetch(`http://127.0.0.1:${port}/api/audit`);
+  const res = await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const events = (await res.json()) as any[];
   return events.map((e) => String(e.message));
 }
@@ -707,7 +707,7 @@ test("the poller also runs on a REDUCED (scheduled, market-closed) cycle -- orde
   clockIsOpen = false;
   await runScheduledSyncTickForTests();
 
-  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const logs = await (await fetch(`http://127.0.0.1:${port}/api/logs`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const messages: string[] = logs.map((l) => l.message);
   assert.ok(
     messages.some((m) => /market closed/i.test(m) && /skip/i.test(m)),

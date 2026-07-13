@@ -112,7 +112,7 @@ test("breaker latch: trip -> escalate -> recovery does not unlatch -> reset clea
   assert.equal(buyB.body.trade.status, "RiskRejected");
   assert.match(buyB.body.trade.riskDecision.reason, /block_new_buys/);
 
-  const auditAfterTrip = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const auditAfterTrip = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const tripEvent = auditAfterTrip.find((e) => e.type === "breaker" && /tripped|latch/i.test(e.message));
   assert.ok(tripEvent, `expected a breaker trip audit event, got: ${JSON.stringify(auditAfterTrip.slice(0, 5))}`);
   assert.ok(tripEvent.details?.equity !== undefined, "trip audit event should carry equity numbers");
@@ -125,7 +125,7 @@ test("breaker latch: trip -> escalate -> recovery does not unlatch -> reset clea
   assert.equal(buyC.body.trade.status, "RiskRejected");
   assert.match(buyC.body.trade.riskDecision.reason, /close_only/);
 
-  const auditAfterEscalate = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const auditAfterEscalate = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const escalateEvent = auditAfterEscalate.find((e) => e.type === "breaker" && /escalat/i.test(e.message));
   assert.ok(escalateEvent, `expected a breaker escalation audit event, got: ${JSON.stringify(auditAfterEscalate.slice(0, 5))}`);
 
@@ -152,7 +152,7 @@ test("breaker latch: trip -> escalate -> recovery does not unlatch -> reset clea
   const buyE = await placeOrder(port, { symbol: "LATCHE", qty: 1, side: "buy", price: 100 });
   assert.equal(buyE.body.trade.status, "Accepted", JSON.stringify(buyE.body.trade.riskDecision));
 
-  const auditAfterReset = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const auditAfterReset = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const resetEvent = auditAfterReset.find((e) => e.type === "breaker" && /reset/i.test(e.message) && e.actor === "admin_api");
   assert.ok(resetEvent, `expected a breaker reset audit event, got: ${JSON.stringify(auditAfterReset.slice(0, 5))}`);
 
@@ -204,7 +204,7 @@ test("breaker latch: corrupt persisted latch state fails closed to block_new_buy
   assert.equal(buy.body.trade.status, "RiskRejected", "corrupt latch state must fail closed, never silently approve");
   assert.match(buy.body.trade.riskDecision.reason, /block_new_buys/);
 
-  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const corruptEvent = audit.find((e) => e.type === "breaker" && /corrupt/i.test(JSON.stringify(e)));
   assert.ok(corruptEvent, `expected a logged corrupt-latch-state event, got: ${JSON.stringify(audit.slice(0, 5))}`);
 });

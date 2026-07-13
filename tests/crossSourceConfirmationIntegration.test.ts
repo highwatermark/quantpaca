@@ -254,7 +254,7 @@ test("acceptance: two enabled sources both bullish on the same symbol within 72h
   const analyses = body.analyses.filter((a: any) => a.symbol === "XBOOST");
   assert.equal(analyses.length, 2, `expected two separate analyses (one per source), got: ${JSON.stringify(body.analyses)}`);
 
-  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`);
+  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const reviewed = await reviewedRes.json();
   const signals = reviewed.filter((s: any) => s.symbol === "XBOOST").sort((a: any, b: any) => a.sourceTimestamp.localeCompare(b.sourceTimestamp));
   assert.equal(signals.length, 2, `expected two persisted reviewed signals, got: ${JSON.stringify(signals)}`);
@@ -315,7 +315,7 @@ test("acceptance: a bullish BUY that conflicts with an earlier bearish signal fr
   storeAfterFirst.close();
   assert.ok(invalidatedAfterFirst.includes("XCONFLICT"), "expected the bearish SELL to invalidate the thesis (Task 10)");
 
-  const tradesAfterFirst = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const tradesAfterFirst = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   const exitTrade = tradesAfterFirst.find((tr: any) => tr.symbol === "XCONFLICT" && tr.side === "sell");
   assert.ok(exitTrade, "expected the bearish signal's own thesis-invalidation exit to have executed normally");
   assert.match(exitTrade.reasoning, /thesis_invalidation/);
@@ -348,13 +348,13 @@ test("acceptance: a bullish BUY that conflicts with an earlier bearish signal fr
   assert.ok(bullAnalysis, "expected the bullish analysis to be recorded");
   assert.equal(bullAnalysis.decision, "BUY");
 
-  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`);
+  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const reviewed = await reviewedRes.json();
   const bullSignal = reviewed.find((s: any) => s.symbol === "XCONFLICT" && s.source === "cs-source-b");
   assert.ok(bullSignal, "expected a persisted reviewed signal for the bullish source");
   assert.deepEqual(bullSignal.crossSource, { effect: "conflict" }, "the applied conflict effect must be recorded on the persisted signal");
 
-  const tradesAfterSecond = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const tradesAfterSecond = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   const buyAttempt = tradesAfterSecond.find((tr: any) => tr.symbol === "XCONFLICT" && tr.side === "buy");
   assert.ok(buyAttempt, `expected a BUY trade attempt for XCONFLICT, got: ${JSON.stringify(tradesAfterSecond)}`);
   assert.equal(buyAttempt.status, "RiskRejected", "a conflicting BUY must never auto-resolve to an executed order");
@@ -400,7 +400,7 @@ test("a single enabled source with no corroboration never boosts or conflicts --
   };
 
   await runSync(port);
-  const reviewed = await (await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`)).json();
+  const reviewed = await (await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   const signal = reviewed.find((s: any) => s.symbol === "XSOLO");
   assert.ok(signal);
   assert.equal(signal.confidenceScore, 60, "raw confidence round((60+60)/2) = 60, unboosted");

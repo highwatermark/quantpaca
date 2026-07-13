@@ -78,22 +78,30 @@ export default function App() {
   // Load backend states on mount
   const fetchAllStates = async () => {
     try {
-      const configRes = await fetch("/api/config");
+      // Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): read endpoints now
+      // require a token (requireReadToken, server.ts). This dashboard reuses
+      // the SAME admin token already plumbed in for write routes below --
+      // an operator who has typed the admin token into Settings is already
+      // trusted for reads too, so there is no separate read-token field to
+      // maintain. (/api/health is the one exception -- it stays
+      // unauthenticated server-side, so sending the header here is harmless
+      // but unnecessary.)
+      const configRes = await fetch("/api/config", { headers: adminHeaders() });
       if (configRes.ok) {
         const confData = await configRes.json();
         setConfigs(confData);
       }
 
-      const analysesRes = await fetch("/api/analyses");
+      const analysesRes = await fetch("/api/analyses", { headers: adminHeaders() });
       if (analysesRes.ok) setAnalyses(await analysesRes.json());
 
-      const tradesRes = await fetch("/api/trades");
+      const tradesRes = await fetch("/api/trades", { headers: adminHeaders() });
       if (tradesRes.ok) setTrades(await tradesRes.json());
 
-      const logsRes = await fetch("/api/logs");
+      const logsRes = await fetch("/api/logs", { headers: adminHeaders() });
       if (logsRes.ok) setLogs(await logsRes.json());
 
-      const portRes = await fetch("/api/portfolio");
+      const portRes = await fetch("/api/portfolio", { headers: adminHeaders() });
       if (portRes.ok) {
         const pData = await portRes.json();
         setAccount(pData);
@@ -113,7 +121,7 @@ export default function App() {
         ["telegram", "/api/telegram/status"],
       ] as const;
       const entries = await Promise.all(reviewEndpoints.map(async ([key, url]) => {
-        const response = await fetch(url);
+        const response = await fetch(url, { headers: adminHeaders() });
         return [key, response.ok ? await response.json() : null];
       }));
       setReviewConsole(Object.fromEntries(entries));
@@ -231,7 +239,12 @@ export default function App() {
     }
   };
 
-  // Google Login / Logout handlers
+  // Google Login / Logout handlers. Phase 2 Task 13 (docs/GO_LIVE_PLAN.md
+  // Phase 2.5): loginWithGoogle no longer fabricates a working session --
+  // this is not configured in this deployment (no real OAuth client), so it
+  // always rejects. Surface that honestly instead of silently swallowing it
+  // (the previous behavior would leave an operator clicking "Connect" with
+  // no visible feedback at all).
   const handleGoogleLogin = async () => {
     try {
       const response = await loginWithGoogle();
@@ -241,6 +254,7 @@ export default function App() {
       fetchAllStates();
     } catch (err) {
       console.error(err);
+      alert(err instanceof Error ? err.message : "Google Sign-In failed.");
     }
   };
 

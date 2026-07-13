@@ -281,7 +281,7 @@ test("software exit with live broker legs: the exit monitor cancels the open bra
     assert.ok(deleteCalls.includes(legId), `expected DELETE /orders/${legId}, got DELETE calls: ${JSON.stringify(deleteCalls)}`);
   }
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "BRAK1" && tr.side === "sell");
   assert.ok(exitTrade, `expected a liquidation sell for BRAK1, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.equal(exitTrade.status, "Accepted", JSON.stringify(exitTrade));
@@ -325,7 +325,7 @@ test("cancel failure fails closed: when a leg cancel fails, the software exit is
 
   const sync = await runSync(port);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "BRAK2" && tr.side === "sell");
   assert.equal(exitTrade, undefined, "the software exit must be skipped this cycle when a leg cancel fails");
 
@@ -391,7 +391,7 @@ test("automation SELL decision on a bracket-protected position: the live legs ar
   assert.ok(sellPost, `expected the automation sell to reach the broker, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.equal(sellPost!.body.order_class, undefined, "liquidation sells must stay plain");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const sellTrade = trades.find((tr) => tr.symbol === "AUTOSELL" && tr.side === "sell");
   assert.ok(sellTrade, "expected the automation sell trade to be recorded");
   assert.equal(sellTrade.status, "Accepted", JSON.stringify(sellTrade));
@@ -433,7 +433,7 @@ test("automation SELL where a leg cancel fails: the sell is skipped this cycle (
   // No sell may reach the broker while the legs could not be cleared.
   const sellPost = postedOrders.find((o) => o.body.symbol === "AUTOFAIL" && o.body.side === "sell");
   assert.equal(sellPost, undefined, "the automation sell must be skipped when a leg cancel fails");
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.equal(
     trades.find((tr) => tr.symbol === "AUTOFAIL" && tr.side === "sell"),
     undefined,

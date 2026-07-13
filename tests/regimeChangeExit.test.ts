@@ -292,7 +292,7 @@ test("regime-change exit: a close_only regime (deep-drawdown bars) liquidates a 
   assert.equal(regime!.marketMode, "risk_off", `expected risk_off from the crash fixture, got ${JSON.stringify(regime)}`);
   assert.equal(regime!.tradePermission, "close_only");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "RGCLOSE" && tr.side === "sell");
   assert.ok(exitTrade, `expected a regime-change sell closing RGCLOSE, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.equal(exitTrade.status, "Accepted", JSON.stringify(exitTrade.riskDecision));
@@ -341,7 +341,7 @@ test("no regime exit: a benign regime (mild-rise bars) does not liquidate a posi
   assert.ok(regime, "expected a persisted regime assessment");
   assert.notEqual(regime!.tradePermission, "close_only", `expected a benign (non close_only) regime, got ${JSON.stringify(regime)}`);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "RGBENIGN" && tr.side === "sell");
   assert.equal(
     exitTrade,
@@ -393,7 +393,7 @@ test("fail-open for protection: a throwing regime-assessment store read degrades
 
   const sync = await runSync(port);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "RGDBFAIL" && tr.side === "sell");
   assert.ok(
     exitTrade,

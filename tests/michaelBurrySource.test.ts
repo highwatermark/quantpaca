@@ -269,7 +269,7 @@ test("acceptance: Short Thoughts (bearish, whipsaw-verified reversal) on a HELD 
   store.close();
   assert.ok(invalidated.includes("BURNH"), `expected a thesis_invalidations record for BURNH, active symbols: ${JSON.stringify(invalidated)}`);
 
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const trades = await tradesRes.json();
   const exitTrade = trades.find((tr: any) => tr.symbol === "BURNH" && tr.side === "sell");
   assert.ok(exitTrade, `expected a real sell trade closing BURNH, got: ${JSON.stringify(trades)}`);
@@ -308,14 +308,14 @@ test("acceptance: the same Short Thoughts fixture on an UNHELD symbol adds it to
   assert.ok(analysis, "the SELL decision must still be recorded honestly even though no position exists to close");
   assert.equal(analysis.decision, "SELL", "an unheld symbol must not silently mutate the recorded decision -- it's a no-op at the trade-execution step, not upstream");
 
-  const tradesAfterFirst = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const tradesAfterFirst = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(
     tradesAfterFirst.some((tr: any) => tr.symbol === "BURNU"),
     false,
     "no trade of any kind should exist for a symbol never held and never bought -- long-only, never a short",
   );
 
-  const doNotBuyRes = await fetch(`http://127.0.0.1:${port}/api/do-not-buy`);
+  const doNotBuyRes = await fetch(`http://127.0.0.1:${port}/api/do-not-buy`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   assert.equal(doNotBuyRes.status, 200);
   const doNotBuyList = await doNotBuyRes.json();
   const entry = doNotBuyList.find((e: any) => e.symbol === "BURNU");
@@ -342,7 +342,7 @@ test("acceptance: the same Short Thoughts fixture on an UNHELD symbol adds it to
   };
 
   const secondSync = await runSync(port);
-  const tradesAfterSecond = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const tradesAfterSecond = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(tradesAfterSecond.some((tr: any) => tr.symbol === "BURNU"), false, "the BUY must be rejected before any order is submitted");
 
   const logMessages: string[] = secondSync.logs.map((l: any) => l.message);
@@ -389,7 +389,7 @@ test("whipsaw-downgraded bearish SELL on a HELD symbol does NOT invalidate the t
   store.close();
   assert.ok(!invalidated.includes("BURNW"), "a whipsaw-downgraded SELL on a held symbol must NOT invalidate the thesis");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(trades.some((tr: any) => tr.symbol === "BURNW" && tr.side === "sell"), false, "no exit should be forced when the whipsaw gate downgraded the SELL");
 });
 
@@ -421,7 +421,7 @@ test("whipsaw-downgraded bearish SELL on an UNHELD symbol still adds it to do-no
 
   await runSync(port);
 
-  const doNotBuyRes = await fetch(`http://127.0.0.1:${port}/api/do-not-buy`);
+  const doNotBuyRes = await fetch(`http://127.0.0.1:${port}/api/do-not-buy`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const doNotBuyList = await doNotBuyRes.json();
   assert.ok(doNotBuyList.some((e: any) => e.symbol === "BURNX"), `expected BURNX on the do-not-buy list even though the whipsaw gate downgraded the SELL, got: ${JSON.stringify(doNotBuyList)}`);
 });
@@ -457,7 +457,7 @@ test("expiry: an unexpired do-not-buy entry blocks a BUY; an expired one does no
   };
 
   const sync = await runSync(port);
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
 
   assert.equal(trades.some((tr: any) => tr.symbol === "BURNBLOCK"), false, "the unexpired do-not-buy entry must block this BUY");
   assert.ok(trades.some((tr: any) => tr.symbol === "BURNSTALE" && tr.side === "buy"), `the expired do-not-buy entry must not block this BUY, trades: ${JSON.stringify(trades)}`);
@@ -497,7 +497,7 @@ test("BUY + bearish stance contradiction is forced to NONE with a loud log, and 
   assert.ok(analysis, "expected a BURNCX analysis to be recorded");
   assert.equal(analysis.decision, "NONE", "a BUY+bearish contradiction must be forced to NONE, defensively -- this system never opens shorts");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(trades.some((tr: any) => tr.symbol === "BURNCX"), false, "no trade should be submitted for a contradiction");
 
   const logMessages: string[] = body.logs.map((l: any) => l.message);
@@ -545,7 +545,7 @@ test("stance defensive parse: an invalid/unrecognized stance value never trigger
   store.close();
   assert.ok(!invalidated.includes("BURNP"), "neutral stance must never invalidate a thesis");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   const exitTrade = trades.find((tr: any) => tr.symbol === "BURNP" && tr.side === "sell");
   assert.ok(exitTrade, "the ordinary (non-bearish-mapped) SELL decision path must still execute the exit");
   assert.ok(!/thesis_invalidation/.test(exitTrade.reasoning), "reasoning must not claim thesis_invalidation when stance failed closed to neutral");
@@ -590,7 +590,7 @@ test("bearish records persist with autoTrading OFF (held): no trade this cycle, 
   await runSync(port);
 
   // No trade of any kind was executed (autoTrading off gates all execution)...
-  const tradesAfterOff = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const tradesAfterOff = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(tradesAfterOff.some((tr: any) => tr.symbol === "BUROFF" && tr.side === "sell"), false, "autoTrading off must gate the exit EXECUTION");
 
   // ...but the thesis-invalidation record was persisted anyway (bookkeeping).
@@ -604,7 +604,7 @@ test("bearish records persist with autoTrading OFF (held): no trade this cycle, 
   await setAutoTrading(port, true);
   QUERY_TO_IDS = {};
   const sync2 = await runSync(port);
-  const tradesAfterOn = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const tradesAfterOn = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   const exitTrade = tradesAfterOn.find((tr: any) => tr.symbol === "BUROFF" && tr.side === "sell");
   assert.ok(exitTrade, `expected the exit monitor to close BUROFF from the persisted record, logs: ${JSON.stringify(sync2.logs?.map((l: any) => l.message))}`);
   assert.match(exitTrade.reasoning, /thesis_invalidation/);
@@ -638,10 +638,10 @@ test("bearish records persist with autoTrading OFF (unheld): the do-not-buy entr
 
   await runSync(port);
 
-  const doNotBuyList = await (await fetch(`http://127.0.0.1:${port}/api/do-not-buy`)).json();
+  const doNotBuyList = await (await fetch(`http://127.0.0.1:${port}/api/do-not-buy`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.ok(doNotBuyList.some((e: any) => e.symbol === "BUROFU"), `the do-not-buy entry must persist even with autoTrading off, got: ${JSON.stringify(doNotBuyList)}`);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json();
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(trades.some((tr: any) => tr.symbol === "BUROFU"), false);
 
   // Restore for any later test in this file.

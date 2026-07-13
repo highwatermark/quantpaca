@@ -89,21 +89,21 @@ test("guardrail 7: the third consecutive failed scheduled cycle pauses trading -
   const pauseAlerts = () => sentTelegramMessages.filter((m) => /paused/i.test(m));
 
   await runScheduledSyncTickForTests();
-  let config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  let config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, true, "1 failure must not pause trading");
 
   await runScheduledSyncTickForTests();
-  config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, true, "2 failures must not pause trading");
   assert.equal(pauseAlerts().length, 0, "no pause alert before the 3rd consecutive failure");
 
   await runScheduledSyncTickForTests();
-  config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, false, "the 3rd consecutive failure must pause trading (autoTrading -> false, persisted)");
 
   assert.equal(pauseAlerts().length, 1, `expected exactly one pause alert attempt, got: ${JSON.stringify(sentTelegramMessages)}`);
 
-  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.ok(
     audit.some((e) => e.actor === "scheduler" && /auto-pause/i.test(e.message || "")),
     `expected an audit event recording the auto-pause, got: ${JSON.stringify(audit.map((e) => e.message))}`,
@@ -113,6 +113,6 @@ test("guardrail 7: the third consecutive failed scheduled cycle pauses trading -
   // pause alert, and autoTrading stays false until a human resumes.
   await runScheduledSyncTickForTests();
   assert.equal(pauseAlerts().length, 1, "the scheduler must not re-alert on ticks after the pause while still paused");
-  config = await (await fetch(`http://127.0.0.1:${port}/api/config`)).json();
+  config = await (await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json();
   assert.equal(config.system.autoTrading, false, "trading must stay paused until a human resumes");
 });

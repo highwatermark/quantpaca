@@ -240,7 +240,7 @@ test("a sync with real (fixture) market data persists a non-unclear regime asses
   // 0.8x -> 7200 -> floor(7200 / 100 price) = 72. Without the regime multiplier
   // this would be 90 -- the exact value proves the fetched regime, not just
   // "some" regime, drove the sizing.
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const buyTrade = trades.find((tr) => tr.symbol === "RONE" && tr.side === "buy");
   assert.ok(buyTrade, `expected a BUY trade for RONE, logs: ${JSON.stringify(body.logs?.map((l: any) => l.message))}`);
   assert.equal(buyTrade.status, "Accepted", JSON.stringify(buyTrade.riskDecision));

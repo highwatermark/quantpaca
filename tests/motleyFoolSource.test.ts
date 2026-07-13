@@ -140,7 +140,7 @@ async function runSync(port: number) {
 }
 
 async function getReviewedSignals(port: number) {
-  const res = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`);
+  const res = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   assert.equal(res.status, 200);
   return res.json();
 }
@@ -425,7 +425,7 @@ test("a Fool SELL on a held symbol (whipsaw verdict 'reversal') executes via the
   assert.ok(analysis, "expected a HELDQ analysis to be recorded");
   assert.equal(analysis.decision, "SELL");
 
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const trades = await tradesRes.json();
   assert.ok(
     trades.some((tr: any) => tr.symbol === "HELDQ" && tr.side === "sell"),
@@ -472,7 +472,7 @@ test("the same Fool SELL fixture on an UNHELD symbol is a no-op -- the SELL deci
   assert.ok(analysis, "the SELL decision must still be recorded honestly even though no position exists to close");
   assert.equal(analysis.decision, "SELL", "an unheld symbol must not silently mutate the recorded decision -- it's a no-op at the trade-execution step, not upstream");
 
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const trades = await tradesRes.json();
   assert.equal(trades.some((tr: any) => tr.symbol === "AWOLQ"), false, "no trade of any kind should exist for a symbol never held and never bought");
 });

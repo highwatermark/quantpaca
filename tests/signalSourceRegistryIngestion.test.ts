@@ -137,7 +137,7 @@ async function runSync(port: number) {
 }
 
 async function getReviewedSignals(port: number) {
-  const res = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`);
+  const res = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   assert.equal(res.status, 200);
   return res.json();
 }

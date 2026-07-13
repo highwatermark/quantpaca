@@ -186,11 +186,11 @@ async function runSync(port: number) {
 }
 
 async function reconciliationLatest(port: number) {
-  return (await (await fetch(`http://127.0.0.1:${port}/api/reconciliation/latest`)).json()) as any;
+  return (await (await fetch(`http://127.0.0.1:${port}/api/reconciliation/latest`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json()) as any;
 }
 
 async function breakerLatest(port: number) {
-  return (await (await fetch(`http://127.0.0.1:${port}/api/breaker/latest`)).json()) as any;
+  return (await (await fetch(`http://127.0.0.1:${port}/api/breaker/latest`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json()) as any;
 }
 
 async function resetBreaker(port: number) {
@@ -211,7 +211,7 @@ async function acknowledge(port: number, symbol: string, qty: number) {
 }
 
 async function auditEvents(port: number) {
-  return (await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json()) as any[];
+  return (await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json()) as any[];
 }
 
 // `/api/override/trade` sends its OWN "MANUAL OVERRIDE" Telegram notification

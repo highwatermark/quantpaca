@@ -34,7 +34,10 @@ export type AuditEvent = {
   // per-cycle BUY cap skips reuse "risk"/"config" like their existing
   // manual-override analogues -- "sync" is only for events that don't fit
   // any of the pre-existing categories).
-  type: "trade_state" | "risk" | "broker" | "config" | "telegram" | "breaker" | "sync";
+  // "backup" (Phase 2 Task 13, docs/GO_LIVE_PLAN.md Phase 2.5): SQLite backup
+  // failures (backupEngine.ts) -- backups never crash a cycle, so this is the
+  // only trace of a failed backup attempt besides the log line.
+  type: "trade_state" | "risk" | "broker" | "config" | "telegram" | "breaker" | "sync" | "backup";
   actor: string;
   entityId?: string;
   fromState?: TradeState;

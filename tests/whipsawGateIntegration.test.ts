@@ -142,7 +142,7 @@ test("a fixture SELL analysis with whipsawVerdict 'whipsaw' produces no sell tra
     `expected a sync log entry documenting the downgrade, got: ${JSON.stringify(logMessages)}`,
   );
 
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const trades = await tradesRes.json();
   assert.equal(trades.length, 1, "only the seed manual buy trade should exist -- no automated SELL trade was submitted");
   assert.ok(!trades.some((tr: any) => tr.side === "sell"), "the gate must have prevented a sell trade from reaching execution");
@@ -173,7 +173,7 @@ test("a fixture SELL analysis with whipsawVerdict 'reversal' proceeds as a real 
   assert.equal(analysis.decision, "SELL", "a verified reversal must not be downgraded");
   assert.equal(analysis.whipsawVerdict, "reversal");
 
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const trades = await tradesRes.json();
   assert.ok(
     trades.some((tr: any) => tr.symbol === "REVX" && tr.side === "sell"),
@@ -203,7 +203,7 @@ test("a fixture BUY analysis with whipsawVerdict 'reversal' halves the confidenc
   assert.equal(analysis.decision, "BUY");
   assert.equal(analysis.whipsawVerdict, "reversal");
 
-  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`);
+  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   assert.equal(reviewedRes.status, 200);
   const reviewed = await reviewedRes.json();
   const rvrsSignal = reviewed.find((s: any) => s.symbol === "RVRS");
@@ -235,7 +235,7 @@ test("a fixture BUY analysis with whipsawVerdict 'whipsaw' keeps full confidence
   assert.equal(analysis.decision, "BUY");
   assert.equal(analysis.whipsawVerdict, "whipsaw");
 
-  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`);
+  const reviewedRes = await fetch(`http://127.0.0.1:${port}/api/signals/reviewed`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const reviewed = await reviewedRes.json();
   const dipSignal = reviewed.find((s: any) => s.symbol === "DIPBUY");
   assert.ok(dipSignal);

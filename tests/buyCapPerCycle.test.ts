@@ -216,7 +216,7 @@ test("guardrail 8: a cycle with 3 BUY-decision signals places only MAX_BUYS_PER_
   const buyDecisions = body.analyses.filter((a: any) => a.decision === "BUY");
   assert.equal(buyDecisions.length, 3, `expected all 3 theses to be analyzed as BUY, got: ${JSON.stringify(body.analyses)}`);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const buyTrades = trades.filter((tr) => tr.side === "buy");
   assert.equal(buyTrades.length, 2, `expected exactly 2 BUY orders placed, got: ${JSON.stringify(trades)}`);
 
@@ -229,7 +229,7 @@ test("guardrail 8: a cycle with 3 BUY-decision signals places only MAX_BUYS_PER_
     `expected a logged per-cycle-cap skip for CONE, got: ${JSON.stringify(messages)}`,
   );
 
-  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.ok(
     audit.some((e) => e.type === "risk" && /CONE/.test(e.message || "") && /per-cycle buy cap/i.test(e.message || "")),
     `expected an audit event recording the capped CONE BUY, got: ${JSON.stringify(audit.map((e) => e.message))}`,

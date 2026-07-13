@@ -82,6 +82,9 @@ import {
   runStartupReconciliation,
   STARTUP_ORPHANS_APP_STATE_KEY,
 } from "./src/server/startupReconciliation";
+import { BackupDeps, runBackup, shouldRunScheduledBackup } from "./src/server/backupEngine";
+import { fetchWithTimeout } from "./src/server/httpDefaults";
+import { createRateLimitMiddleware } from "./src/server/rateLimiter";
 
 dotenv.config();
 
@@ -89,6 +92,13 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json());
+// Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): a simple in-memory
+// fixed-window limiter across all of /api/* (RATE_LIMIT_PER_MINUTE per IP;
+// /api/health is exempt -- see rateLimiter.ts). Mounted once, before every
+// route, so it applies uniformly to admin/read/unauthenticated routes alike.
+// This is an intentionally minimal control, not a substitute for a real
+// reverse-proxy rate limiter in production -- see docs/OPS_RUNBOOK.md.
+app.use("/api", createRateLimitMiddleware());
 
 const DATA_DIR = process.env.QUANTPACA_DATA_DIR || path.join(process.cwd(), "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
@@ -99,6 +109,10 @@ const productionStore = createProductionStore(path.join(DATA_DIR, "quantpaca.sql
 // not a deploy-time setting. sourceRegistry.ts creates it with the default
 // ZipTrader-only source on first read if it's absent (migration-safe).
 const SOURCE_REGISTRY_PATH = path.join(DATA_DIR, "signal-sources.json");
+// Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): SQLite backups land here,
+// same DATA_DIR convention as everything else -- survives container
+// replacement via the same volume mount documented in docs/OPS_RUNBOOK.md.
+const BACKUPS_DIR = path.join(DATA_DIR, "backups");
 
 // Simple queue-based lock to serialize all operations that read or write to DB
 class DBConcurrencyMutex {
@@ -212,6 +226,39 @@ function requireAdminCommand(req: express.Request, res: express.Response, next: 
   const providedToken = req.header("x-admin-token") || "";
   if (!tokensMatch(providedToken, expectedToken)) {
     res.status(401).json({ error: "Unauthorized command request." });
+    return;
+  }
+  next();
+}
+
+// Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): read-endpoint auth.
+// Accepts EITHER a dedicated read-only token (QUANTPACA_READ_TOKEN, a
+// lower-privilege credential meant for dashboards/monitors) OR the admin
+// token (an operator who already has admin access can read too). Mirrors
+// requireAdminCommand's shape: disabled (503) only when NEITHER token is
+// configured at all -- there would be nothing to check a provided token
+// against. When only the admin token is configured (QUANTPACA_READ_TOKEN
+// unset), read endpoints simply require that -- see startupChecks.ts's boot
+// warning recommending a dedicated read token be set.
+//
+// /api/health is deliberately NOT behind this middleware (Docker healthcheck
+// + uptime monitors need it unauthenticated) -- see its route below, and
+// createRateLimitMiddleware's matching exemption.
+function requireReadToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const adminToken = process.env.ADMIN_API_TOKEN || "";
+  const readToken = process.env.QUANTPACA_READ_TOKEN || "";
+  if (!adminToken && !readToken) {
+    res.status(503).json({
+      error: "Read routes are disabled until QUANTPACA_READ_TOKEN or ADMIN_API_TOKEN is configured.",
+    });
+    return;
+  }
+  const providedAdminToken = req.header("x-admin-token") || "";
+  const providedReadToken = req.header("x-read-token") || "";
+  const adminOk = Boolean(adminToken) && Boolean(providedAdminToken) && tokensMatch(providedAdminToken, adminToken);
+  const readOk = Boolean(readToken) && Boolean(providedReadToken) && tokensMatch(providedReadToken, readToken);
+  if (!adminOk && !readOk) {
+    res.status(401).json({ error: "Unauthorized read request." });
     return;
   }
   next();
@@ -770,6 +817,19 @@ function writeDB(data: any) {
   }
 }
 
+// Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): the Anthropic SDK manages
+// its own transport (it does not go through fetchWithTimeout above), so the
+// bounded-timeout requirement is met via the client's own `timeout` option
+// instead. The SDK's default is 10 MINUTES, meant for very long-running
+// completions -- far too long to be a useful bound for a sync cycle that
+// must still complete promptly. 30s balances that against thesis-analysis
+// calls that may use the web-search tool (slower than a bare completion).
+// maxRetries is left at the SDK default (2, with backoff) -- these calls are
+// pure reads of a stateless LLM response, not order placement, so retrying
+// carries none of the double-fire risk fetchWithTimeout's GET-only policy
+// guards against.
+const ANTHROPIC_CLIENT_TIMEOUT_MS = 30_000;
+
 // Global Claude client. Both call sites in /api/sync run inside try/catch
 // blocks; a missing ANTHROPIC_API_KEY or a failed call is treated as a hard
 // failure of that source -- it contributes zero scan-targets/signals rather
@@ -779,7 +839,7 @@ const getClaudeClient = () => {
   if (!apiKey) {
     console.warn("No ANTHROPIC_API_KEY environment variable found. Claude calls will fail.");
   }
-  return new Anthropic({ apiKey });
+  return new Anthropic({ apiKey, timeout: ANTHROPIC_CLIENT_TIMEOUT_MS });
 };
 
 const claudeText = (response: Anthropic.Message): string =>
@@ -808,11 +868,11 @@ async function getAlpacaPortfolio(brokerConfig: BrokerConfig = getBrokerConfig()
   };
 
   try {
-    const acctRes = await fetch(`${brokerConfig.baseUrl}/account`, { headers });
+    const acctRes = await fetchWithTimeout(`${brokerConfig.baseUrl}/account`, { headers });
     if (!acctRes.ok) throw new Error(`Alpaca Accounts API responded with ${acctRes.status}`);
     const account = await acctRes.json();
 
-    const posRes = await fetch(`${brokerConfig.baseUrl}/positions`, { headers });
+    const posRes = await fetchWithTimeout(`${brokerConfig.baseUrl}/positions`, { headers });
     const positions = posRes.ok ? await posRes.json() : [];
 
     return {
@@ -863,11 +923,11 @@ async function fetchAccountAndPositionsForReconciliation(
     "Content-Type": "application/json",
   };
   try {
-    const acctRes = await fetch(`${brokerConfig.baseUrl}/account`, { headers });
+    const acctRes = await fetchWithTimeout(`${brokerConfig.baseUrl}/account`, { headers });
     if (!acctRes.ok) return { ok: false, errorMessage: `GET /account responded with ${acctRes.status}` };
     const account = await acctRes.json();
 
-    const posRes = await fetch(`${brokerConfig.baseUrl}/positions`, { headers });
+    const posRes = await fetchWithTimeout(`${brokerConfig.baseUrl}/positions`, { headers });
     if (!posRes.ok) return { ok: false, errorMessage: `GET /positions responded with ${posRes.status}` };
     const rawPositions = await posRes.json();
     if (!Array.isArray(rawPositions)) return { ok: false, errorMessage: "GET /positions did not return an array" };
@@ -906,7 +966,7 @@ async function getAlpacaOpenOrders(brokerConfig: BrokerConfig = getBrokerConfig(
     "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
     "Content-Type": "application/json",
   };
-  const res = await fetch(`${brokerConfig.baseUrl}/orders?status=open`, { headers });
+  const res = await fetchWithTimeout(`${brokerConfig.baseUrl}/orders?status=open`, { headers });
   if (!res.ok) return [];
   const orders = await res.json();
   return (Array.isArray(orders) ? orders : []).map((order: any) => ({
@@ -946,7 +1006,7 @@ async function fetchExistingAlpacaOrderByClientOrderId(brokerConfig: BrokerConfi
     "Content-Type": "application/json",
   };
   try {
-    const res = await fetch(`${brokerConfig.baseUrl}/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`, { headers });
+    const res = await fetchWithTimeout(`${brokerConfig.baseUrl}/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`, { headers });
     if (!res.ok) return null;
     return await res.json();
   } catch (err) {
@@ -985,7 +1045,7 @@ async function cancelAlpacaOrder(brokerConfig: BrokerConfig, orderId: string): P
     "Content-Type": "application/json",
   };
   try {
-    const res = await fetch(`${brokerConfig.baseUrl}/orders/${encodeURIComponent(orderId)}`, { method: "DELETE", headers });
+    const res = await fetchWithTimeout(`${brokerConfig.baseUrl}/orders/${encodeURIComponent(orderId)}`, { method: "DELETE", headers });
     if (res.ok || res.status === 404) return { ok: true, status: res.status };
     return { ok: false, status: res.status };
   } catch (err) {
@@ -1234,7 +1294,10 @@ async function placeAlpacaOrder(
     } else {
       body.time_in_force = PLAIN_TIME_IN_FORCE;
     }
-    return fetch(`${brokerConfig.baseUrl}/orders`, { method: "POST", headers, body: JSON.stringify(body) });
+    // POST -- bounded timeout, NEVER retried (order submission must not
+    // double-fire; client_order_id dedup above is defense in depth, not
+    // relied upon here).
+    return fetchWithTimeout(`${brokerConfig.baseUrl}/orders`, { method: "POST", headers, body: JSON.stringify(body) });
   };
 
   const attemptedBracket = Boolean(bracketLegs);
@@ -1303,7 +1366,7 @@ async function checkMarketOpenForScheduledCycle(brokerConfig: BrokerConfig): Pro
     "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
   };
   try {
-    const res = await fetch(`${brokerConfig.baseUrl}/clock`, { headers });
+    const res = await fetchWithTimeout(`${brokerConfig.baseUrl}/clock`, { headers });
     if (!res.ok) {
       return { isOpen: false, log: `Market-hours clock check failed (HTTP ${res.status}); failing closed (treating the market as closed).` };
     }
@@ -1324,7 +1387,9 @@ async function checkMarketOpenForScheduledCycle(brokerConfig: BrokerConfig): Pro
 async function sendTelegramAlert(config: AppConfig["telegram"], message: string) {
   if (!config || !config.enabled || !config.botToken || !config.chatId) return false;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
+    // POST -- bounded timeout, never retried (a retried send could double-post
+    // the same alert to the chat).
+    const res = await fetchWithTimeout(`https://api.telegram.org/bot${config.botToken}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1346,7 +1411,9 @@ async function sendTelegramBotMessage(chatId: string, message: string) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) return false;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    // POST -- bounded timeout, never retried (same double-post concern as
+    // sendTelegramAlert above).
+    const res = await fetchWithTimeout(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
@@ -1472,7 +1539,19 @@ function startTelegramRuntime() {
   let offset = 0;
   setInterval(async () => {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?timeout=10&offset=${offset}`);
+      // GET, bounded timeout + 1 retry (fetchWithTimeout's default policy).
+      // The URL's own `timeout=10` is Telegram's long-poll hold time (it may
+      // legitimately keep the connection open up to 10s waiting for updates);
+      // our client-side timeout is set a bit longer (15s) than that so a
+      // normal long-poll response is never mistaken for a hang. A timeout (or
+      // any other failure) is caught below and logged -- the setInterval
+      // keeps ticking either way (Task 13: timeouts must never kill the poll
+      // loop).
+      const res = await fetchWithTimeout(
+        `https://api.telegram.org/bot${token}/getUpdates?timeout=10&offset=${offset}`,
+        {},
+        15_000,
+      );
       if (!res.ok) return;
       const data = await res.json();
       for (const update of data.result || []) {
@@ -1480,7 +1559,7 @@ function startTelegramRuntime() {
         await handleTelegramCommand(update);
       }
     } catch (err) {
-      console.error("Telegram polling failed:", err);
+      console.error("Telegram polling failed (timeout tolerated silently; the poll loop keeps running):", err);
     }
   }, 5000);
 }
@@ -1559,7 +1638,7 @@ async function saveToNotionDatabase(config: AppConfig["notion"], analysis: Stock
    ========================================================== */
 
 // Config Endpoints
-app.get("/api/config", (req, res) => {
+app.get("/api/config", requireReadToken, (req, res) => {
   const db = readDB();
   res.json(redactConfigForClient(db.config));
 });
@@ -1580,28 +1659,28 @@ app.post("/api/config", requireAdminCommand, async (req, res) => {
 });
 
 // Logs, Trades, Analyses
-app.get("/api/analyses", (req, res) => {
+app.get("/api/analyses", requireReadToken, (req, res) => {
   const db = readDB();
   res.json(db.analyses || []);
 });
 
-app.get("/api/trades", (req, res) => {
+app.get("/api/trades", requireReadToken, (req, res) => {
   const db = readDB();
   res.json(db.trades || []);
 });
 
-app.get("/api/logs", (req, res) => {
+app.get("/api/logs", requireReadToken, (req, res) => {
   const db = readDB();
   res.json(db.syncLogs || []);
 });
 
-app.get("/api/audit", (req, res) => {
+app.get("/api/audit", requireReadToken, (req, res) => {
   const db = readDB();
   const persisted = productionStore.listAuditEvents();
   res.json(persisted.length ? persisted : (db.auditEvents || []));
 });
 
-app.get("/api/regime/latest", (req, res) => {
+app.get("/api/regime/latest", requireReadToken, (req, res) => {
   const latest = productionStore.latestRegimeAssessment();
   if (latest) {
     res.json(latest);
@@ -1612,7 +1691,7 @@ app.get("/api/regime/latest", (req, res) => {
   res.json(conservative);
 });
 
-app.get("/api/breaker/latest", (req, res) => {
+app.get("/api/breaker/latest", requireReadToken, (req, res) => {
   res.json(productionStore.latestBreakerState() || { status: "ok", reasons: ["no_evaluation_yet"], asOf: null });
 });
 
@@ -1629,7 +1708,7 @@ app.post("/api/breaker/reset", requireAdminCommand, async (req, res) => {
   }
 });
 
-app.get("/api/portfolio/assessment", async (req, res) => {
+app.get("/api/portfolio/assessment", requireReadToken, async (req, res) => {
   try {
     const portfolio = await getAlpacaPortfolio();
     const assessment = assessPortfolio({
@@ -1644,7 +1723,7 @@ app.get("/api/portfolio/assessment", async (req, res) => {
   }
 });
 
-app.get("/api/signals/reviewed", (req, res) => {
+app.get("/api/signals/reviewed", requireReadToken, (req, res) => {
   const db = readDB();
   const persisted = productionStore.listReviewedSignals();
   if (persisted.length) {
@@ -1665,7 +1744,7 @@ app.get("/api/signals/reviewed", (req, res) => {
   })));
 });
 
-app.get("/api/trade-intents", (req, res) => {
+app.get("/api/trade-intents", requireReadToken, (req, res) => {
   const db = readDB();
   const persisted = productionStore.listTradeIntents();
   if (persisted.length) {
@@ -1686,7 +1765,7 @@ app.get("/api/trade-intents", (req, res) => {
   })));
 });
 
-app.get("/api/risk-decisions", (req, res) => {
+app.get("/api/risk-decisions", requireReadToken, (req, res) => {
   const db = readDB();
   const persisted = productionStore.listRiskDecisions();
   if (persisted.length) {
@@ -1700,7 +1779,7 @@ app.get("/api/risk-decisions", (req, res) => {
   })));
 });
 
-app.get("/api/exit-plans", (req, res) => {
+app.get("/api/exit-plans", requireReadToken, (req, res) => {
   const db = readDB();
   const persisted = productionStore.listExitPlans();
   if (persisted.length) {
@@ -1722,7 +1801,7 @@ app.get("/api/exit-plans", (req, res) => {
 // entries are already filtered by the store's listActiveDoNotBuy (fail-
 // closed to an empty list on a store read error, matching every other
 // fallible store read in this file).
-app.get("/api/do-not-buy", (req, res) => {
+app.get("/api/do-not-buy", requireReadToken, (req, res) => {
   try {
     res.json(productionStore.listActiveDoNotBuy(new Date().toISOString()));
   } catch (err: any) {
@@ -1762,7 +1841,7 @@ app.delete("/api/do-not-buy/:symbol", requireAdminCommand, (req, res) => {
   }
 });
 
-app.get("/api/reconciliation/latest", (req, res) => {
+app.get("/api/reconciliation/latest", requireReadToken, (req, res) => {
   const latest = productionStore.latestReconciliationReport();
   if (latest) {
     res.json(latest);
@@ -1874,7 +1953,7 @@ app.post("/api/reconciliation/acknowledge", requireAdminCommand, async (req, res
   }
 });
 
-app.get("/api/telegram/status", (req, res) => {
+app.get("/api/telegram/status", requireReadToken, (req, res) => {
   const roles = parseTelegramAdminRoles(process.env.TELEGRAM_ADMIN_ROLES);
   res.json({
     configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
@@ -1918,7 +1997,7 @@ app.get("/api/health", async (req, res) => {
   res.status(health.ok ? 200 : 502).json(health);
 });
 
-app.get("/api/portfolio", async (req, res) => {
+app.get("/api/portfolio", requireReadToken, async (req, res) => {
   try {
     const portfolio = await getAlpacaPortfolio();
     res.json(portfolio);
@@ -2616,7 +2695,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
 
     for (const source of enabledSources) {
       try {
-        const gmailRes = await fetch(
+        const gmailRes = await fetchWithTimeout(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(source.gmailQuery)}&maxResults=${GMAIL_MAX_RESULTS_PER_SOURCE}`,
           { headers: { Authorization: authHeader } }
         );
@@ -2633,7 +2712,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           );
 
           for (const msg of messages) {
-            const detailRes = await fetch(
+            const detailRes = await fetchWithTimeout(
               `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
               { headers: { Authorization: authHeader } }
             );
@@ -3159,7 +3238,7 @@ For "stance", classify the source's own directional call on the ticker into exac
             if (brokerConfig.configured) {
               // Market data lives on data.alpaca.markets, not the trading host.
               const dataBaseUrl = process.env.ALPACA_DATA_URL || "https://data.alpaca.markets";
-              const latestTrade = await fetch(`${dataBaseUrl}/v2/stocks/${item.symbol}/trades/latest`, {
+              const latestTrade = await fetchWithTimeout(`${dataBaseUrl}/v2/stocks/${item.symbol}/trades/latest`, {
                 headers: {
                   "APCA-API-KEY-ID": brokerConfig.apiKey || "",
                   "APCA-API-SECRET-KEY": brokerConfig.secretKey || "",
@@ -3872,6 +3951,15 @@ const scheduler = createScheduler({
       console.error("[heartbeat] Failed to persist the completed-cycle count / last-completed-at timestamp.", err);
     }
 
+    // Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): reuses the SAME
+    // completed-cycle counter as the heartbeat above (one counter, two
+    // independent cadences -- BACKUP_EVERY_N_CYCLES=48 vs HEARTBEAT_EVERY_N_CYCLES=12).
+    // Must run BEFORE the heartbeat's own early return below, or a non-heartbeat
+    // cycle would never reach it.
+    if (shouldRunScheduledBackup(count)) {
+      await runBackupIfDue("cycle");
+    }
+
     if (!shouldSendHeartbeat(count)) return;
 
     const regime = productionStore.latestRegimeAssessment();
@@ -4020,6 +4108,60 @@ async function runStartupReconciliationForTests(): Promise<void> {
   await performStartupReconciliation();
 }
 
+// Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): SQLite backups. All I/O
+// is injected (backupEngine.ts's runBackup is otherwise pure/fully unit
+// tested -- see tests/backupEngine.test.ts) so this object is the ONLY place
+// server.ts's real fs/productionStore/Telegram calls meet the backup logic.
+// Never throws (runBackup's own contract): both call sites below (boot, and
+// the Nth-completed-cycle hook in the scheduler wiring further down) can
+// `await` this directly.
+const backupDeps: BackupDeps = {
+  now: () => Date.now(),
+  ensureBackupsDir: () => fs.mkdirSync(BACKUPS_DIR, { recursive: true }),
+  backupSqliteTo: (filename) => productionStore.backupTo(path.join(BACKUPS_DIR, filename)),
+  dbJsonExists: () => fs.existsSync(DB_PATH),
+  copyDbJsonTo: (filename) => fs.copyFileSync(DB_PATH, path.join(BACKUPS_DIR, filename)),
+  listBackupsDir: () => {
+    try {
+      return fs.readdirSync(BACKUPS_DIR);
+    } catch (err: any) {
+      // ENOENT (backups dir doesn't exist yet, e.g. very first boot before
+      // ensureBackupsDir has ever run) is not a retention-pruning failure --
+      // there is simply nothing to prune yet.
+      if (err?.code === "ENOENT") return [];
+      throw err;
+    }
+  },
+  deleteBackupFile: (filename) => fs.unlinkSync(path.join(BACKUPS_DIR, filename)),
+  getAppState: (key) => productionStore.getAppState(key),
+  setAppState: (key, value) => productionStore.setAppState(key, value),
+  // Straight to the durable SQLite store, same "bypasses db.json/dbMutex"
+  // rationale performStartupReconciliation's appendAuditEvents dep above
+  // documents -- GET /api/audit already prefers productionStore.listAuditEvents().
+  appendAuditEvent: (message, details) =>
+    productionStore.appendAuditEvents([{
+      id: `ae-backup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "backup",
+      actor: "backup_engine",
+      message,
+      details,
+    }]),
+  sendAlert: (message) => sendTelegramAlert(readDB().config?.telegram, message),
+  log: (message) => console.log(message),
+};
+
+async function runBackupIfDue(reason: "boot" | "cycle"): Promise<void> {
+  await runBackup(reason, backupDeps);
+}
+
+// Test-visible manual trigger (same rationale as runStartupReconciliationForTests
+// above): runs exactly one backup attempt against the real store/filesystem,
+// without waiting for boot or 48 real scheduled cycles.
+async function runBackupForTests(reason: "boot" | "cycle" = "boot"): Promise<{ ok: boolean }> {
+  return runBackup(reason, backupDeps);
+}
+
 // Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5, guardrail 9): the boot-time
 // crash-loop check. Pure decision logic lives in src/server/crashLoopGuard.ts;
 // this owns the app_state reads/writes and the Telegram alert. Standalone
@@ -4160,6 +4302,11 @@ async function run() {
   // an unconfigured broker as "nothing to reconcile, ready immediately".
   await performStartupReconciliation();
 
+  // Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): once at boot, post-
+  // reconciliation -- see backupEngine.ts's doc comment for why this never
+  // blocks/crashes startup even on failure.
+  await runBackupIfDue("boot");
+
   const distPath = path.join(process.cwd(), "dist");
 
   if (process.env.NODE_ENV !== "production") {
@@ -4206,7 +4353,7 @@ async function run() {
   });
 }
 
-export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests, runStartupReconciliationForTests, runCrashLoopBootCheckForTests, runWatchdogCheckForTests };
+export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests, runStartupReconciliationForTests, runCrashLoopBootCheckForTests, runWatchdogCheckForTests, runBackupForTests };
 
 if (process.env.NODE_ENV !== "test") {
   run();

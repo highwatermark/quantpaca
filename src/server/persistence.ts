@@ -152,6 +152,15 @@ export type ProductionStore = {
   // as every other fallible store read in this file.
   getAppState(key: string): string | undefined;
   setAppState(key: string, value: string): void;
+  // Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): a consistent point-in-time
+  // snapshot of the WHOLE database via SQLite's own `VACUUM INTO` -- safe to run
+  // against a live, open connection (unlike a raw file copy, which could race a
+  // concurrent writer under WAL mode). `destPath` is always a full path the
+  // caller controls (backupEngine.ts's generated, ISO-stamped filename under
+  // data/backups/), never end-user input. Throws on failure (disk full, bad
+  // path, ...); the caller (backupEngine.ts's runBackup) is responsible for
+  // catching it -- this method itself does not swallow errors.
+  backupTo(destPath: string): void;
   close(): void;
 };
 
@@ -487,6 +496,14 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     setAppState(key, value) {
       db.prepare("INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)")
         .run(key, value, new Date().toISOString());
+    },
+    backupTo(destPath) {
+      // node:sqlite's exec() takes a raw SQL string (no parameter binding for
+      // VACUUM INTO's target). destPath is always our own generated filename
+      // (never end-user input -- see the interface doc comment above); the
+      // quote-escaping below is defense in depth, not the primary safety
+      // boundary.
+      db.exec(`VACUUM INTO '${destPath.replace(/'/g, "''")}'`);
     },
     close() {
       db.close();

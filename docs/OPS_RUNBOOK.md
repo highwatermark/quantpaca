@@ -5,6 +5,11 @@ operations. This is the operator-facing half; the code-facing reasoning lives
 in `src/server/crashLoopGuard.ts`, `src/server/heartbeat.ts`, and the wiring
 in `server.ts`.
 
+Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): SQLite backups, outbound
+HTTP timeouts, read-endpoint auth + rate limiting. Code-facing reasoning
+lives in `src/server/backupEngine.ts`, `src/server/httpDefaults.ts`,
+`src/server/rateLimiter.ts`, and the wiring in `server.ts`.
+
 ## Deploy / start
 
 ```bash
@@ -47,6 +52,69 @@ history, and the crash-loop/heartbeat state.
   scheduler. If autoTrading is ON and no scheduled cycle has completed in
   more than 2× the configured interval, Telegram gets "Scheduled cycle
   overdue" — once per gap, not repeatedly.
+
+## Backups
+
+- **Cadence:** once at boot (right after startup reconciliation completes),
+  then every 48th completed scheduled cycle (~half a day at the default
+  15-minute interval). Both triggers call the same `runBackup` logic
+  (`src/server/backupEngine.ts`).
+- **What's captured:** `data/backups/quantpaca-<ISO-stamp>.sqlite` via
+  SQLite's own `VACUUM INTO` (safe against a live, open WAL-mode connection —
+  not a raw file copy, which could race a concurrent writer).
+  `data/backups/db-<ISO-stamp>.json` rides alongside as a best-effort file
+  copy of `db.json` — **interim scope**: `db.json` is not yet a hard
+  dependency of backup success (a future task consolidates it into SQLite;
+  see the Phase 2.5 "Store consolidation" checkbox in `docs/GO_LIVE_PLAN.md`).
+  If the `db.json` copy fails, the SQLite backup still counts as a success —
+  only the SQLite snapshot is load-bearing today.
+- **Retention:** the newest 14 backup sets are kept; older ones are deleted
+  (bounded, logged). A set is both files sharing one timestamp — pruning
+  always removes the pair together.
+- **Failure handling:** a failed backup attempt is logged and recorded as an
+  audit event (`GET /api/audit`, `actor: backup_engine`) — it **never**
+  crashes or blocks a scheduled cycle. If backups have been failing
+  continuously for more than 24h, Telegram gets one alert for that failure
+  streak (not repeated every cycle); a subsequent success clears the streak,
+  so a later failure alerts fresh.
+- **Verify backups are happening:**
+  ```bash
+  ls -la ./data/backups/
+  sqlite3 ./data/backups/quantpaca-<latest-stamp>.sqlite "SELECT COUNT(*) FROM audit_events;"
+  ```
+
+### Restore drill
+
+Expected: after restoring a backup, the process boots cleanly, startup
+reconciliation runs, and `/api/health` reports OK.
+
+```bash
+docker compose stop                      # graceful stop (see "Normal operations" below)
+
+# Pick a backup (newest is usually correct):
+ls -t ./data/backups/quantpaca-*.sqlite | head -1
+
+cp ./data/quantpaca.sqlite ./data/quantpaca.sqlite.pre-restore.bak   # safety copy of the CURRENT db first
+cp ./data/backups/quantpaca-<chosen-stamp>.sqlite ./data/quantpaca.sqlite
+# If you are also restoring db.json (see the interim-scope note above):
+cp ./data/backups/db-<chosen-stamp>.json ./data/db.json
+
+docker compose up -d
+docker compose logs --since 2m quantpaca | grep -E "reconciliation|scheduler|backup"
+curl -s http://localhost:3000/api/health | jq .            # expect ok: true
+curl -s http://localhost:3000/api/health | jq .startupReconciliation
+```
+
+Verify the restored state looks right (adjust the token — see "Read-endpoint
+auth" below):
+
+```bash
+curl -s -H "x-admin-token: $ADMIN_API_TOKEN" http://localhost:3000/api/trades | jq length
+curl -s -H "x-admin-token: $ADMIN_API_TOKEN" http://localhost:3000/api/audit | jq length
+```
+
+If something looks wrong, you still have `./data/quantpaca.sqlite.pre-restore.bak`
+to roll back to.
 
 ## Drill: single-crash auto-restart (acceptance test)
 
@@ -142,6 +210,61 @@ Telegram outage during a gap re-alerts once Telegram recovers.
 Silence check: heartbeats stop when autoTrading is off — that is expected,
 not an incident (the watchdog is also autoTrading-gated).
 
+## Read-endpoint auth
+
+Every `GET /api/*` route requires a token EXCEPT `/api/health` (unauthenticated
+by design — Docker healthcheck + uptime monitors need it; its payload is kept
+sanitized, no equity/position/token fields, only booleans and counts).
+
+- Accepts either header: `x-admin-token: $ADMIN_API_TOKEN` (an operator with
+  admin access can read too) or `x-read-token: $QUANTPACA_READ_TOKEN` (a
+  lower-privilege credential for dashboards/monitors that should not be able
+  to place trades or change config).
+- If `QUANTPACA_READ_TOKEN` is unset, reads fall back to requiring
+  `ADMIN_API_TOKEN` — the server logs a boot warning recommending you set a
+  dedicated read token instead of handing out the admin one.
+- Same placeholder/short-value boot validation as `ADMIN_API_TOKEN`
+  (`src/server/startupChecks.ts`): the server refuses to boot if
+  `QUANTPACA_READ_TOKEN` is set to `"change-me"` or is under 16 characters.
+- The bundled dashboard (`src/App.tsx`) reuses the SAME admin token already
+  entered in Settings for its own read calls — there is no separate
+  read-token field in the UI. If you want to hand a monitoring tool
+  lower-privilege access, set `QUANTPACA_READ_TOKEN` and have that tool send
+  `x-read-token` directly (curl, a Grafana datasource, etc.) rather than
+  through the bundled dashboard.
+
+```bash
+curl -s -H "x-read-token: $QUANTPACA_READ_TOKEN" http://localhost:3000/api/trades | jq length
+curl -s http://localhost:3000/api/trades                 # -> 401, no token
+```
+
+## Rate limiting
+
+A simple in-memory fixed-window limiter caps every IP at 120 requests/minute
+across `/api/*` (`/api/health` exempt); beyond that, `429`. This is process-
+local, in-memory state — it resets on restart and does **not** coordinate
+across multiple replicas. **In a real (multi-instance, internet-facing)
+deployment, put a reverse proxy (nginx, Caddy, a cloud load balancer) in
+front of this app and rate-limit there too** — this limiter is a
+defense-in-depth backstop for a single-instance deployment, not a substitute
+for one.
+
+## Outbound HTTP timeouts
+
+Alpaca trading calls, Telegram (send + the `getUpdates` long-poll loop), and
+Gmail ingestion fetches all go through `src/server/httpDefaults.ts`'s
+`fetchWithTimeout` (10s bound). **GET requests get exactly one retry on
+failure; POST/PUT/PATCH/DELETE are never retried** — order submission and
+Telegram sends must not double-fire. A Telegram poll timeout is caught and
+logged; the poll loop itself keeps running (it does not need a restart to
+recover once Telegram is reachable again). The Anthropic SDK manages its own
+transport and is configured with a 30s client-level `timeout` instead
+(`ANTHROPIC_CLIENT_TIMEOUT_MS` in `server.ts`) — long enough for a
+web-search-assisted analysis call, short enough that a sync cycle can't hang
+indefinitely on it. `marketDataFetcher.ts` and `tradabilityGuard.ts` already
+had their own `AbortSignal.timeout(10s)` + fail-closed logic before this task
+and were left as-is (no churn) rather than migrated to the new helper.
+
 ## Verification status of these artifacts
 
 `docker build` / `docker compose config` were not runnable in the development
@@ -160,3 +283,14 @@ docker compose build          # full image build
 ```
 
 and then the two drills above.
+
+Task 13's backups/timeouts/read-auth/rate-limiting are covered by
+`tests/backupEngine.test.ts`, `tests/httpDefaults.test.ts`,
+`tests/rateLimiter.test.ts`, `tests/rateLimitIntegration.test.ts`,
+`tests/readEndpointAuth.test.ts`, `tests/startupChecks.test.ts`, and
+`tests/googleAuth.test.ts`. The restore drill above (an actual
+stop/swap/restart against a real Docker container) was not run in the
+development environment (same no-Docker-daemon constraint as Task 12); the
+underlying backup file (`VACUUM INTO` output) IS verified to be a valid,
+queryable SQLite database by the automated tests. An operator should run the
+restore drill for real before relying on it in production.

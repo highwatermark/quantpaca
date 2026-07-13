@@ -97,7 +97,7 @@ test("NODE_ENV=test: the scheduler loop never auto-starts, but the exported test
   // Nothing should have run automatically yet -- no real setTimeout chain was
   // ever armed (run(), which alone calls scheduler.start(), is gated off by
   // NODE_ENV=test at the bottom of server.ts).
-  const beforeLogs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const beforeLogs = await (await fetch(`http://127.0.0.1:${port}/api/logs`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.ok(
     !beforeLogs.some((l) => l.trigger === "scheduled"),
     `expected zero auto-started scheduled cycles before any manual tick, got: ${JSON.stringify(beforeLogs)}`,
@@ -106,7 +106,7 @@ test("NODE_ENV=test: the scheduler loop never auto-starts, but the exported test
   await runScheduledSyncTickForTests();
   await runScheduledSyncTickForTests();
 
-  const afterLogs = await (await fetch(`http://127.0.0.1:${port}/api/logs`)).json() as any[];
+  const afterLogs = await (await fetch(`http://127.0.0.1:${port}/api/logs`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const scheduledStartLogs = afterLogs.filter((l) => l.trigger === "scheduled" && /Starting automation loop/i.test(l.message));
   assert.equal(
     scheduledStartLogs.length,
@@ -115,7 +115,7 @@ test("NODE_ENV=test: the scheduler loop never auto-starts, but the exported test
   );
 
   // Trigger source is also recorded in audit events (not just sync logs).
-  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const scheduledCycleAudit = audit.filter((e) => e.type === "sync" && e.actor === "scheduler" && e.details?.trigger === "scheduled");
   assert.equal(
     scheduledCycleAudit.length,

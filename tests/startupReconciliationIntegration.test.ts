@@ -151,7 +151,7 @@ async function placeOrder(port: number, body: { symbol: string; qty: number; sid
 }
 
 async function health(port: number) {
-  return (await (await fetch(`http://127.0.0.1:${port}/api/health`)).json()) as any;
+  return (await (await fetch(`http://127.0.0.1:${port}/api/health`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json()) as any;
 }
 
 function findTrade(symbol: string) {

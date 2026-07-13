@@ -150,7 +150,7 @@ async function setConfig(port: number, overrides: { stopLossPercent?: number; ta
 }
 
 async function auditMessages(port: number): Promise<string[]> {
-  const res = await fetch(`http://127.0.0.1:${port}/api/audit`);
+  const res = await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   const events = (await res.json()) as any[];
   return events.map((e) => String(e.message));
 }

@@ -60,7 +60,7 @@ test("manual override BUY of a symbol on the do-not-buy list is RiskRejected wit
 
   // The rejection is audited through the same pipeline every other risk
   // rejection uses (submitTradeThroughPipeline's audit events).
-  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.ok(
     audit.some((e) => e.entityId === buy.body.trade.id && /do-not-buy/i.test(JSON.stringify(e))),
     "expected an audit event for the rejected trade referencing the do-not-buy block",
@@ -92,14 +92,14 @@ test("admin escape hatch: DELETE /api/do-not-buy/:symbol removes the entry (audi
   assert.equal(delBody.removed, true);
 
   // The removal itself is audited.
-  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`)).json() as any[];
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.ok(
     audit.some((e) => /UNAVOID/.test(e.message || "") && /do-not-buy/i.test(e.message || "") && /remov/i.test(e.message || "")),
     `expected an audit event recording the admin removal, got: ${JSON.stringify(audit.map((e: any) => e.message))}`,
   );
 
   // And the list no longer shows it.
-  const list = await (await fetch(`http://127.0.0.1:${port}/api/do-not-buy`)).json() as any[];
+  const list = await (await fetch(`http://127.0.0.1:${port}/api/do-not-buy`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   assert.equal(list.some((e) => e.symbol === "UNAVOID"), false);
 
   // A RiskRejected attempt never arms the cooldown (pre-existing behavior),
