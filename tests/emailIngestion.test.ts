@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { extractEmailScanTarget, GmailMessage } from "../src/server/emailIngestion";
+import { extractEmailScanTarget, extractFromHeader, GmailMessage } from "../src/server/emailIngestion";
 import { createRawSignal } from "../src/server/signalEngine";
 import { createProductionStore } from "../src/server/persistence";
 import { reviewAndPersistSignal } from "../src/server/signalReviewStep";
@@ -183,6 +183,31 @@ test("caps the body at 8000 characters and appends a truncation marker only when
   assert.equal(overCap.target.content.startsWith("b".repeat(8000)), true);
   assert.equal(overCap.target.content.endsWith("\n[truncated]"), true);
   assert.equal(overCap.bodyTruncated, true);
+});
+
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4, signal-source registry):
+// extractFromHeader is a new, additive export -- extractEmailScanTarget's
+// existing parsing (subject/body/timestamp) is unchanged; this just exposes
+// the raw From header value so the sender-allowlist/blocklist policy
+// (senderPolicy.ts) can be applied by the caller.
+test("extractFromHeader returns the raw From header value when present", () => {
+  const fixture = multiParagraphFixture();
+  fixture.payload!.headers!.push({ name: "From", value: "Charlie <charlie-from-ziptrader@ghost.io>" });
+
+  assert.equal(extractFromHeader(fixture), "Charlie <charlie-from-ziptrader@ghost.io>");
+});
+
+test("extractFromHeader is undefined when no From header exists", () => {
+  const fixture = multiParagraphFixture();
+
+  assert.equal(extractFromHeader(fixture), undefined);
+});
+
+test("extractFromHeader matches the header name case-insensitively", () => {
+  const fixture = multiParagraphFixture();
+  fixture.payload!.headers!.push({ name: "FROM", value: "someone@example.com" });
+
+  assert.equal(extractFromHeader(fixture), "someone@example.com");
 });
 
 test("integration: a real Gmail message dated more than 72h ago is rejected as stale through reviewAndPersistSignal", () => {

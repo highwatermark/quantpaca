@@ -35,7 +35,7 @@ globalThis.fetch = (async (input: any, init?: any) => {
   return realFetch(input, init);
 }) as typeof fetch;
 
-const { handleTelegramCommand, readDB } = await import("../server");
+const { handleTelegramCommand, productionStore } = await import("../server");
 
 function extractConfirmToken(message: string): string {
   const match = message.match(/\/confirm\s+([A-Z0-9]+)/);
@@ -50,12 +50,12 @@ test("telegram /breaker_reset from an unauthorized user is refused and performs 
     message: { text: "/breaker_reset", chat: { id: 99 }, from: { id: 99 } }, // 99 has no configured role
   });
 
-  const db = readDB();
-  const rejection = db.auditEvents.find((e: any) => e.type === "telegram" && e.details?.command === "/breaker_reset" && e.actor === "99");
+  const auditEvents = productionStore.listAuditEvents();
+  const rejection = auditEvents.find((e: any) => e.type === "telegram" && e.details?.command === "/breaker_reset" && e.actor === "99") as any;
   assert.ok(rejection, "expected a telegram audit event for the /breaker_reset attempt");
   assert.equal(rejection.details.auth.allowed, false);
 
-  const breakerAudit = db.auditEvents.find((e: any) => e.type === "breaker");
+  const breakerAudit = auditEvents.find((e: any) => e.type === "breaker");
   assert.equal(breakerAudit, undefined, "an unauthorized user must not trigger an actual breaker reset");
   assert.ok(sentMessages.some((m) => /rejected/i.test(m)), `expected a rejection reply, got: ${JSON.stringify(sentMessages)}`);
 });
@@ -68,9 +68,8 @@ test("telegram /breaker_reset from an authorized admin requires confirmation, th
     message: { text: "/breaker_reset", chat: { id: 42 }, from: { id: 42 } }, // 42 is admin per TELEGRAM_ADMIN_ROLES
   });
 
-  const dbAfterRequest = readDB();
   assert.equal(
-    dbAfterRequest.auditEvents.find((e: any) => e.type === "breaker"),
+    productionStore.listAuditEvents().find((e: any) => e.type === "breaker"),
     undefined,
     "must not reset before confirmation -- mirrors /close_all's two-step admin flow",
   );
@@ -86,9 +85,9 @@ test("telegram /breaker_reset from an authorized admin requires confirmation, th
     message: { text: `/confirm ${token}`, chat: { id: 42 }, from: { id: 42 } },
   });
 
-  const dbAfterConfirm = readDB();
-  const resetEvent = dbAfterConfirm.auditEvents.find((e: any) => e.type === "breaker" && e.actor === "telegram:42");
-  assert.ok(resetEvent, `expected a breaker reset audit event from telegram:42, got: ${JSON.stringify(dbAfterConfirm.auditEvents)}`);
+  const auditEventsAfterConfirm = productionStore.listAuditEvents();
+  const resetEvent = auditEventsAfterConfirm.find((e: any) => e.type === "breaker" && e.actor === "telegram:42");
+  assert.ok(resetEvent, `expected a breaker reset audit event from telegram:42, got: ${JSON.stringify(auditEventsAfterConfirm)}`);
   assert.ok(
     sentMessages.some((m) => /reset/i.test(m) && /executed|status/i.test(m)),
     `expected a reset-executed reply, got: ${JSON.stringify(sentMessages)}`,
@@ -105,10 +104,10 @@ test("telegram /confirm replaying the same breaker_reset token a second time is 
   const token = extractConfirmToken(sentMessages[sentMessages.length - 1]);
 
   await handleTelegramCommand({ update_id: 104, message: { text: `/confirm ${token}`, chat: { id: 42 }, from: { id: 42 } } });
-  const auditCountAfterFirst = readDB().auditEvents.filter((e: any) => e.type === "breaker").length;
+  const auditCountAfterFirst = productionStore.listAuditEvents().filter((e: any) => e.type === "breaker").length;
 
   await handleTelegramCommand({ update_id: 105, message: { text: `/confirm ${token}`, chat: { id: 42 }, from: { id: 42 } } });
-  const auditCountAfterReplay = readDB().auditEvents.filter((e: any) => e.type === "breaker").length;
+  const auditCountAfterReplay = productionStore.listAuditEvents().filter((e: any) => e.type === "breaker").length;
 
   assert.equal(auditCountAfterReplay, auditCountAfterFirst, "a replayed confirmation token must not trigger a second reset");
   // The token is removed from the pending-confirmations map as soon as it's

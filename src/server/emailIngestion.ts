@@ -93,6 +93,17 @@ function extractSubject(message: GmailMessage): string | undefined {
   return header?.value;
 }
 
+// Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4, signal-source registry):
+// additive export -- exposes the raw From header value (untouched, still in
+// whatever "Name <addr>" or bare-address form Gmail sent) so the caller can
+// run it through the sender-allowlist/blocklist policy (senderPolicy.ts)
+// before deciding whether to extract a scan target at all. Does not change
+// extractEmailScanTarget's existing behavior in any way.
+export function extractFromHeader(message: GmailMessage): string | undefined {
+  const header = message.payload?.headers?.find((h) => h.name?.toLowerCase() === "from");
+  return header?.value;
+}
+
 function extractSourceTimestamp(message: GmailMessage): string | null {
   return parseInternalDate(message.internalDate) ?? parseHeaderDate(message.payload?.headers);
 }

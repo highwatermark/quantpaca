@@ -61,7 +61,7 @@ async function assertZeroSignalsAndTrades(port: number, body: any) {
   assert.ok(!serialized.includes("Bullish on growth tech"), "canned bullish YouTube fallback must never reach the response");
 
   // Zero trades: with zero analyses there is nothing to size or submit an order for.
-  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`);
+  const tradesRes = await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } });
   assert.equal(tradesRes.status, 200);
   const trades = await tradesRes.json();
   assert.deepEqual(trades, []);

@@ -355,3 +355,44 @@ test("regime-change: missing/undefined regimePermission does not trigger a regim
   });
   assert.equal(result.planExits.length, 0);
 });
+
+// Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 -- Michael
+// Burry Substack): thesisInvalidatedSymbols is the plumbing that makes
+// evaluateExitPlan's thesis_invalidation dimension (already exercised
+// directly in tests/exitEngine.test.ts) live through this module for the
+// first time -- server.ts's MODULE 2 populates it from the persisted
+// thesis_invalidations table (src/server/persistence.ts).
+
+test("thesis invalidation: a symbol in thesisInvalidatedSymbols triggers a plan exit with thesis_invalidation reasoning, even with no other dimension near threshold", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "NVDA", qty: 5, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    thesisInvalidatedSymbols: new Set(["NVDA"]),
+    lookupPlan: planLookup({ NVDA: { side: "buy", exitPlan: basePlan({ thesisInvalidation: "NVDA short thesis from michael-burry." }) } }),
+  });
+  assert.equal(result.planExits.length, 1);
+  assert.equal(result.planExits[0].reason, "thesis_invalidation");
+  assert.match(result.planExits[0].reasoning, /thesis_invalidation triggered: NVDA short thesis from michael-burry\./);
+});
+
+test("thesis invalidation: a symbol NOT in thesisInvalidatedSymbols is unaffected", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "AAPL", qty: 5, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    thesisInvalidatedSymbols: new Set(["NVDA"]),
+    lookupPlan: planLookup({ AAPL: { side: "buy", exitPlan: basePlan() } }),
+  });
+  assert.equal(result.planExits.length, 0);
+});
+
+test("thesis invalidation: an omitted thesisInvalidatedSymbols (absent regime feed / no invalidations this cycle) never triggers -- fail closed toward not force-closing", () => {
+  const result = evaluateOpenPositionExits({
+    positions: [{ symbol: "MSFT", qty: 5, currentPrice: 100, unrealizedPlPercent: 0 }],
+    now: new Date(),
+    legacyStopLossPercent: 5,
+    lookupPlan: planLookup({ MSFT: { side: "buy", exitPlan: basePlan() } }),
+  });
+  assert.equal(result.planExits.length, 0);
+});

@@ -105,6 +105,18 @@ export function evaluateOpenPositionExits(input: {
   // so a liquidation's audit trail names the regime that caused it. Purely
   // descriptive -- never affects the trigger decision above.
   regimeMode?: string;
+  // Phase 2 Task 10 (docs/GO_LIVE_PLAN.md Phase 2.4, Priority 2 -- Michael
+  // Burry Substack): symbols with an active (unexpired), persisted
+  // thesis_invalidations record (src/server/persistence.ts, populated by the
+  // long-only bearish-mapping layer -- src/server/bearishMapping.ts) for THIS
+  // cycle. This is what makes evaluateExitPlan's `thesisInvalidated`
+  // dimension live for the first time since it was introduced in Phase 1 --
+  // before this, nothing ever set it to true. Omitted/undefined (e.g. the
+  // store read failed, or server.ts hasn't been extended to pass it) is the
+  // fail-closed default: no symbol is ever treated as invalidated, so a
+  // missing/degraded feed can never force-close a position, same asymmetry as
+  // regimePermission above.
+  thesisInvalidatedSymbols?: Set<string>;
 }): ExitEvaluationResult {
   const planExits: PlanExitDecision[] = [];
   const legacyExits: LegacyExitDecision[] = [];
@@ -172,6 +184,7 @@ export function evaluateOpenPositionExits(input: {
       now: input.now,
       regimePermission: regimePermissionForPlan,
       highWaterMark: effectiveHighWaterMark,
+      thesisInvalidated: input.thesisInvalidatedSymbols?.has(pos.symbol) ?? false,
     });
 
     if (evaluation.triggered) {

@@ -2,6 +2,22 @@ export interface ProcessGuardDeps {
   log: (message: string, error?: unknown) => void;
   exit: (code: number) => void;
   closeServer?: (onClosed: () => void) => void;
+  // Phase 2 Task 2 (docs/GO_LIVE_PLAN.md Phase 2.1): stops the autonomous
+  // sync scheduler (clears its armed timer) as the first step of graceful
+  // shutdown. Optional so every existing caller/test that predates the
+  // scheduler keeps working unchanged. A cycle already in flight is not
+  // interrupted -- it holds the appStore lock and simply runs to completion.
+  stopScheduler?: () => void;
+  // Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5, guardrail 9): records
+  // the clean-shutdown marker (src/server/crashLoopGuard.ts's
+  // CLEAN_SHUTDOWN_APP_STATE_KEY) so the NEXT boot's crash-loop check knows
+  // this shutdown was graceful (SIGTERM/SIGINT), not a crash -- a deliberate
+  // restart must never itself count toward the 3-boots-in-1-hour crash
+  // window. Optional for the same reason stopScheduler is: every existing
+  // caller/test that predates this keeps working unchanged. Deliberately
+  // NOT called from onUncaughtException/onUnhandledRejection -- those ARE
+  // crashes, and must keep counting toward the crash-loop window.
+  markCleanShutdown?: () => void;
 }
 
 const SHUTDOWN_GRACE_MS = 5000;
@@ -21,6 +37,8 @@ export function createProcessGuardHandlers(deps: ProcessGuardDeps) {
       if (shuttingDown) return;
       shuttingDown = true;
       deps.log(`[shutdown] Received ${signal}; closing HTTP server.`);
+      deps.markCleanShutdown?.();
+      deps.stopScheduler?.();
       let exited = false;
       const finish = () => {
         if (exited) return;

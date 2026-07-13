@@ -48,7 +48,10 @@ const riskBase = () => ({
     regimeChangeAction: "close" as const,
     emergencyAction: "market_sell" as const,
   },
-  metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 0 },
+  // accountEquity/dayTradeCount (Phase 2 Task 3, PDT guard): required-for-buy
+  // like dailyLoss, per the same fail-closed policy. Defaults are safely
+  // outside the PDT rule (equity >= $25k).
+  metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 0, accountEquity: 100000, dayTradeCount: 0 },
   limits: { maxDailyLoss: 500, maxDailyTradeCount: 10, maxOpenPositions: 10, minBuyingPower: 100 },
   // Added in Task 12: reviewRisk fails closed on a non-"ok" breaker for buys.
   breaker: { status: "ok" as const },
@@ -64,6 +67,9 @@ const RISK_NUMERIC_PATHS: Array<[string, (input: any, v: unknown) => void]> = [
   ["metrics.dailyLoss", (i, v) => (i.metrics.dailyLoss = v)],
   ["metrics.dailyTradeCount", (i, v) => (i.metrics.dailyTradeCount = v)],
   ["metrics.openPositionCount", (i, v) => (i.metrics.openPositionCount = v)],
+  // Same buy-required policy (Phase 2 Task 3).
+  ["metrics.accountEquity", (i, v) => (i.metrics.accountEquity = v)],
+  ["metrics.dayTradeCount", (i, v) => (i.metrics.dayTradeCount = v)],
   ["limits.maxDailyLoss", (i, v) => (i.limits.maxDailyLoss = v)],
   ["limits.maxDailyTradeCount", (i, v) => (i.limits.maxDailyTradeCount = v)],
   ["limits.maxOpenPositions", (i, v) => (i.limits.maxOpenPositions = v)],

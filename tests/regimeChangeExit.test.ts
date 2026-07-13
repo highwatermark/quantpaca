@@ -164,6 +164,15 @@ globalThis.fetch = (async (input: any, init?: any) => {
         headers: { "content-type": "application/json" },
       });
     }
+    if (url.includes("/assets/")) {
+      // Phase 2 Task 3 tradability guard: always tradable/active here -- not
+      // under test in this file.
+      const symbol = url.split("/assets/")[1];
+      return new Response(JSON.stringify({ symbol, tradable: true, status: "active" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     return new Response("unhandled paper-api.alpaca.markets path in test fixture", { status: 404 });
   }
 
@@ -219,17 +228,20 @@ async function runSync(port: number) {
   return body as any;
 }
 
-// Backdates the persisted regime assessment's asOf beyond REGIME_STALENESS_MS
-// so the next sync refetches instead of reusing the previous test's cached
-// assessment (pattern: regimeStaleness.test.ts). Needed because both tests in
-// this file share one server/store within the same process.
+// Backdates the persisted regime assessment's fetchedAt beyond
+// REGIME_STALENESS_MS so the next sync refetches instead of reusing the
+// previous test's cached assessment (pattern: regimeStaleness.test.ts).
+// Needed because both tests in this file share one server/store within the
+// same process. Phase 2 Task 1, Item A: the reuse decision keys on
+// `fetchedAt` (when the fetch happened), not `asOf` (the newest-bar
+// timestamp) -- see domainTypes.ts's RegimeAssessment.fetchedAt comment.
 function forceRegimeRefetchNextSync() {
   const rawStore = createProductionStore(sqlitePath);
   const latest = rawStore.latestRegimeAssessment();
   if (latest) {
     rawStore.saveRegimeAssessment({
       ...latest,
-      asOf: new Date(Date.now() - (REGIME_STALENESS_MS + 5 * 60 * 1000)).toISOString(),
+      fetchedAt: new Date(Date.now() - (REGIME_STALENESS_MS + 5 * 60 * 1000)).toISOString(),
     });
   }
   rawStore.close();
@@ -280,7 +292,7 @@ test("regime-change exit: a close_only regime (deep-drawdown bars) liquidates a 
   assert.equal(regime!.marketMode, "risk_off", `expected risk_off from the crash fixture, got ${JSON.stringify(regime)}`);
   assert.equal(regime!.tradePermission, "close_only");
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "RGCLOSE" && tr.side === "sell");
   assert.ok(exitTrade, `expected a regime-change sell closing RGCLOSE, logs: ${JSON.stringify(sync.logs?.map((l: any) => l.message))}`);
   assert.equal(exitTrade.status, "Accepted", JSON.stringify(exitTrade.riskDecision));
@@ -329,7 +341,7 @@ test("no regime exit: a benign regime (mild-rise bars) does not liquidate a posi
   assert.ok(regime, "expected a persisted regime assessment");
   assert.notEqual(regime!.tradePermission, "close_only", `expected a benign (non close_only) regime, got ${JSON.stringify(regime)}`);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "RGBENIGN" && tr.side === "sell");
   assert.equal(
     exitTrade,
@@ -381,7 +393,7 @@ test("fail-open for protection: a throwing regime-assessment store read degrades
 
   const sync = await runSync(port);
 
-  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`)).json() as any[];
+  const trades = await (await fetch(`http://127.0.0.1:${port}/api/trades`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
   const exitTrade = trades.find((tr) => tr.symbol === "RGDBFAIL" && tr.side === "sell");
   assert.ok(
     exitTrade,

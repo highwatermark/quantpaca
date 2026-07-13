@@ -217,7 +217,10 @@ test("risk engine blocks live mode, duplicates, missing exit plans, and daily li
     },
     exitPlan: createExitPlan({ symbol: "PLTR", side: "buy", entryPrice: 100 }),
     breaker: { status: "ok" },
-    metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 1 },
+    // accountEquity/dayTradeCount (Phase 2 Task 3, PDT guard): required-for-buy;
+    // defaults here are safely outside the PDT rule (equity >= $25k) since
+    // this test targets the live-mode block, not PDT.
+    metrics: { dailyLoss: 0, dailyTradeCount: 0, openPositionCount: 1, accountEquity: 100000, dayTradeCount: 0 },
     limits: { maxDailyLoss: 500, maxDailyTradeCount: 5, maxOpenPositions: 5, minBuyingPower: 1000 },
   });
 

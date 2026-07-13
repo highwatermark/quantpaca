@@ -149,28 +149,28 @@ and an exit plan evaluated in the loop (visible in audit events).
 ## Phase 2 — Operational spine + new signal sources (target: 1–2 weeks)
 
 ### 2.1 Autonomous loop
-- [ ] **Scheduler.** Wire `runIntervalMins` (default 15) to an internal interval that runs the sync pipeline when `autoTrading` is on; respect market hours via Alpaca `/clock` (skip order placement when closed). Manual `POST /api/sync` remains for on-demand runs.
+- [x] **Scheduler.** Wire `runIntervalMins` (default 15) to an internal interval that runs the sync pipeline when `autoTrading` is on; respect market hours via Alpaca `/clock` (skip order placement when closed). Manual `POST /api/sync` remains for on-demand runs.
   *Accept:* server left running executes ≥2 unattended cycles, visible in sync logs and audit events.
-- [ ] **Market-hours & tradability guard.** Before any order: check Alpaca clock is open and the asset is `tradable`/not halted.
+- [x] **Market-hours & tradability guard.** Before any order: check Alpaca clock is open and the asset is `tradable`/not halted.
   *Accept:* order attempt while market closed is rejected with an audited reason.
-- [ ] **PDT guard.** Enforce day-trade count against the 3-in-5 limit when equity < $25k (`daytrade_count` already read at `server.ts:322`).
+- [x] **PDT guard.** Enforce day-trade count against the 3-in-5 limit when equity < $25k (`daytrade_count` already read at `server.ts:322`).
   *Accept:* test — 4th would-be day trade is blocked.
-- [ ] **Auto-pause on repeated failure** (guardrail 7). 3 consecutive failed sync cycles → `autoTrading=false`, Telegram alert, stays paused until human resume. **Per-cycle BUY cap** (guardrail 8): max 2 new BUY orders per cycle.
+- [x] **Auto-pause on repeated failure** (guardrail 7). 3 consecutive failed sync cycles → `autoTrading=false`, Telegram alert, stays paused until human resume. **Per-cycle BUY cap** (guardrail 8): max 2 new BUY orders per cycle.
   *Accept:* tests — third consecutive simulated cycle failure pauses trading; a cycle with 3 BUY-decision signals places only 2 orders.
 
 ### 2.2 Order lifecycle
-- [ ] **Broker-native protective orders.** Submit entries as Alpaca bracket orders carrying the exit plan's stop-loss and take-profit, so protection survives process death. Keep the software exit monitor as a second layer.
-  *Accept:* paper order shows attached legs in the Alpaca order record.
-- [ ] **Order-status polling.** Poll non-terminal orders each cycle; update local trade state (filled/partial/canceled/rejected); act on partial fills (track remaining qty; cancel-or-complete policy).
+- [x] **Broker-native protective orders.** BUY entries with a valid (non-degenerate) exit plan submit as Alpaca bracket orders (`order_class: "bracket"`, tick-rounded `take_profit`/`stop_loss`) so protection survives process death (`placeAlpacaOrder`, `server.ts`; price validation/rounding in `src/server/bracketOrders.ts`). Disclosed behavior change: a bracket's entry + both legs share one `time_in_force` — "gtc" for the whole bracket, not the plain order's "day". Fail-open, always audited: a degenerate/invalid plan falls back to a plain order before ever hitting the broker; a bracket 422-rejected by Alpaca retries once as a plain order under a `-p`-suffixed `client_order_id` (a different order, disclosed). SELLs/liquidations always stay plain. Returned leg order ids are persisted on the trade (`brokerLegOrderIds`, additive JSON field — no migration). The software exit monitor stays fully active as the second layer; when it fires for a position with live broker legs, it cancels those legs first and fails closed (skips the exit, logs + audits) if any cancel fails, since the broker legs are that position's only protection in that moment.
+  *Accept:* paper order shows attached legs in the Alpaca order record. (Verified via mocked-Alpaca integration tests: `tests/bracketOrderIntegration.test.ts`, `tests/bracketOrderDryRun.test.ts`, `tests/bracketLegCancelOnExit.test.ts`, plus pure unit tests in `tests/bracketOrders.test.ts`.)
+- [x] **Order-status polling.** Poll non-terminal orders each cycle; update local trade state (filled/partial/canceled/rejected); act on partial fills (track remaining qty; cancel-or-complete policy).
   *Accept:* mock-Alpaca tests for fill, partial fill, rejection, and timeout → `UnknownBrokerState` (never invent a fill).
-- [ ] **Startup reconciliation.** On boot, reconcile open orders/positions against Alpaca before enabling trading.
-  *Accept:* test — an order accepted pre-crash is recovered into local state on restart.
+- [x] **Startup reconciliation.** On boot (skipped when the broker is unconfigured or `NODE_ENV=test`), before the scheduler starts or any order can be placed: poll every locally non-terminal trade/leg against Alpaca (reuses the Task 5 poller, `src/server/orderStatusPoller.ts`), then sweep `GET /v2/orders?status=open` for ORPHANS -- open broker orders with no matching local trade (by id, or by our `qp-`-prefixed `client_order_id`). Orphans are never auto-canceled (a human decides -- it might be a legitimate manual order); they block new BUYs until an admin reviews and clears them (`POST /api/reconciliation/orphans/clear`). A module-scoped `tradingReady` flag (`src/server/startupReconciliation.ts`) gates the chokepoint: the scheduler skips whole cycles while it's pending, and `executeTradeIntent` rejects BUYs (SELLs always exempt) until it flips true. Fail closed on a poll/orders-fetch failure: retries every 5 minutes, up to 12 attempts, then stays blocked and alerts Telegram.
+  *Accept:* test — an order accepted pre-crash is recovered into local state on restart (`tests/startupReconciliation.test.ts`, `tests/startupReconciliationIntegration.test.ts`).
 
 ### 2.3 Reconciliation that gates
-- [ ] **Scheduled position-level reconciliation.** Run each cycle; actually use the `brokerPositions` parameter (`reconciliationEngine.ts:24`) to detect share-count drift (manual trades, offline fills).
-  *Accept:* injected drift in a test produces a mismatch report.
-- [ ] **Mismatch halts buys.** Any unresolved mismatch sets `block_new_buys` (latched) and alerts Telegram.
-  *Accept:* test — drift blocks the next BUY until reconciled/reset.
+- [x] **Scheduled position-level reconciliation.** Every sync cycle (full and reduced, right after the Task 5 order-status poll), `computeExpectedPositions`/`comparePositions`/`buildPositionReconciliationReport` (`src/server/reconciliationEngine.ts`) sum broker-successful BUY fills minus SELL fills per symbol (preferring polled `filledQty`, falling back to `qty`; an unparsable row is skipped from the sum AND reported as its own `ledger_gap` mismatch) plus any admin-acknowledged baseline, then diff against Alpaca's live `/positions` (fetched via a dedicated `fetchAccountAndPositionsForReconciliation`, not the shared `getAlpacaPortfolio`, which silently treats a failed positions fetch as an empty list — unsafe for this gate). Three mismatch types: `unexpected_position`, `missing_position`, `quantity_drift` (tolerance: ±1 share or 2%, whichever is larger). A positions-fetch failure skips the comparison (logged, no report, latch untouched) — absence of data is never drift. Every report is persisted (`saveReconciliationReport`).
+  *Accept:* injected drift in a test produces a mismatch report (`tests/reconciliationEngine.test.ts`, `tests/positionReconciliationIntegration.test.ts`).
+- [x] **Mismatch halts buys.** Any mismatch escalates the EXISTING breaker latch (Task 10, `src/server/breakerLatch.ts`) to `block_new_buys` with an additive `reconciliation_mismatch` reason, on top of a real fresh drawdown evaluation (never fabricated equity/peakEquity) so the breaker's own high-water mark stays correct; audited with per-symbol details. Telegram alerts immediately on a new/different mismatch fingerprint, throttled to once per `EMPTY_SYNC_ALERT_WINDOW_MS` (Task 1's `shouldSendThrottledAlert`, reused) while the same mismatch persists. The latch is sticky — a later clean comparison does not auto-unlatch; the existing `POST /api/breaker/reset` (or Telegram `/breaker_reset`) clears it, and if the mismatch is still present at the NEXT comparison, that cycle re-latches. `POST /api/reconciliation/acknowledge` (admin) records a per-symbol accepted baseline (app_state) folded additively into future expected-position math, for known/intentional drift (e.g. a manually-held position); acknowledging alone does not unlatch — a human reset is still required.
+  *Accept:* test — drift blocks the next BUY until reconciled/reset, including reset-while-still-drifted re-latching and the acknowledge-then-reset recovery path (`tests/positionReconciliationIntegration.test.ts`).
 
 ### 2.4 New email signal sources
 Extend Gmail ingestion (`server.ts:984-1033`) from the single hardcoded ZipTrader query to
@@ -178,26 +178,27 @@ a **per-source registry** — each source declares its Gmail query, parser hints
 and how its decisions map to actions. Store `source` on every signal (schema already
 supports it) so Phase 3 attribution can compare sources.
 
-- [ ] **Source registry structure.** Config-driven list (env/JSON, not code) of `{ id, gmailQuery, senderAllowlist, trustTier, maxAgeHours, enabled }`. Sender allowlist is exact-match on From; anything else in the thread is ignored.
-- [ ] **Priority 1 — Motley Fool premium** (`from:fool@motley.fool.com`). Paid membership; explicit dated BUY recommendations (Epic Portfolio, Hidden Gems, Rule Breakers) **and explicit SELLs** ("5 Sells…", Penalty Box updates) — currently the system's only external source of exit signals. Parse recommendation emails only; **blocklist `fool@premiuminfo.fool.com`** (marketing teasers that must not reach Claude as theses).
+- [x] **Source registry structure.** Config-driven list (env/JSON, not code) of `{ id, gmailQuery, senderAllowlist, trustTier, maxAgeHours, enabled }`. Sender allowlist is exact-match on From; anything else in the thread is ignored.
+- [x] **Priority 1 — Motley Fool premium** (`from:fool@motley.fool.com`). Paid membership; explicit dated BUY recommendations (Epic Portfolio, Hidden Gems, Rule Breakers) **and explicit SELLs** ("5 Sells…", Penalty Box updates) — currently the system's only external source of exit signals. Parse recommendation emails only; **blocklist `fool@premiuminfo.fool.com`** (marketing teasers that must not reach Claude as theses).
   *Accept:* fixture Fool recommendation email yields a structured signal with `source: "motley-fool"`; fixture `premiuminfo` email yields nothing.
-- [ ] **Priority 2 — Michael Burry Substack** (`from:michaeljburry@substack.com`). "Trading Post" issues contain explicit buys/position adds; "Short Thoughts" contain bearish theses. **Mapping rule (long-only system):** bullish → BUY candidate; bearish/short thesis on a *held* symbol → thesis-invalidation exit; bearish on an *unheld* symbol → add to a do-not-buy list for N days (default 30). Do not open shorts.
+- [x] **Priority 2 — Michael Burry Substack** (`from:michaeljburry@substack.com`). "Trading Post" issues contain explicit buys/position adds; "Short Thoughts" contain bearish theses. **Mapping rule (long-only system):** bullish → BUY candidate; bearish/short thesis on a *held* symbol → thesis-invalidation exit; bearish on an *unheld* symbol → add to a do-not-buy list for N days (default 30). Do not open shorts.
   *Accept:* fixture "Short Thoughts NVDA" email while holding NVDA triggers exit evaluation; while not holding, NVDA lands on the avoid list and a subsequent BUY signal for it is rejected.
-- [ ] **Cross-source confirmation bonus.** When ≥2 enabled sources are bullish on the same symbol within 72h, boost `confidenceScore` (bounded); conflicting directions → `requires_human_approval`.
+- [x] **Cross-source confirmation bonus.** When ≥2 enabled sources are bullish on the same symbol within 72h, boost `confidenceScore` (bounded); conflicting directions → `requires_human_approval`.
   *Accept:* unit tests for agreement boost and conflict flag.
-- [ ] **Trade-confirmation blocklist.** Explicitly exclude brokerage notification senders (`noreply@robinhood.com`, `Titan@investordelivery.com`) so broadened queries can never parse account emails as theses.
+- [x] **Trade-confirmation blocklist.** Explicitly exclude brokerage notification senders (`noreply@robinhood.com`, `Titan@investordelivery.com`) so broadened queries can never parse account emails as theses.
   *Accept:* fixture confirmation email produces zero signals.
 
 *Deferred (do not build now):* Yellowbrick Road (candidate firehose — needs heavier filtering), Lead-Lag Report (regime input, not trade source — revisit after 1.3), ARK commentary.
 
 ### 2.5 Ops hardening
-- [ ] **Supervisor.** Dockerfile + restart policy (or systemd unit). Crash → auto-restart → startup reconciliation (2.2) → resume. **Crash-loop limit** (guardrail 9): after 3 restarts within 1 hour, stay down and alert instead of thrashing.
-  *Accept:* `kill -9` the process; it restarts and resumes the loop without manual action. Three rapid kills → stays down + alert.
-- [ ] **Heartbeat.** Telegram (or equivalent) heartbeat every N cycles + alert if a scheduled cycle is missed by >2× interval.
-- [ ] **SQLite backups.** Periodic `VACUUM INTO`/copy to a backups dir with retention; document restore.
-  *Accept:* backup file exists after a cycle; restore drill documented in `docs/`.
-- [ ] **Outbound HTTP timeouts** on all fetches (Alpaca, Telegram, Anthropic) with bounded retry; **rate limiting + auth on read endpoints**; retire or fix the mock Google OAuth (`src/services/googleAuth.ts:19`) — remove the integration if unused.
-- [ ] **Store consolidation.** Migrate remaining `db.json` operational state (config, sync logs) into SQLite; `db.json` becomes legacy/read-only.
+- [x] **Supervisor.** Dockerfile + restart policy (or systemd unit). Crash → auto-restart → startup reconciliation (2.2) → resume. **Crash-loop limit** (guardrail 9): after 3 restarts within 1 hour, stay down and alert instead of thrashing.
+  *Accept:* `kill -9` the process; it restarts and resumes the loop without manual action. Three rapid kills → stays down + alert. (Dockerfile + docker-compose.yml + `src/server/crashLoopGuard.ts`; the kill -9 drills are operator-run — exact commands in `docs/OPS_RUNBOOK.md`.)
+- [x] **Heartbeat.** Telegram (or equivalent) heartbeat every N cycles + alert if a scheduled cycle is missed by >2× interval. (`src/server/heartbeat.ts` + scheduler watchdog timer; N=12, ~3h at the default 15-min interval.)
+- [x] **SQLite backups.** Periodic `VACUUM INTO`/copy to a backups dir with retention; document restore.
+  *Accept:* backup file exists after a cycle; restore drill documented in `docs/`. (`src/server/backupEngine.ts` + server.ts wiring: once at boot post-reconciliation, then every 48th completed scheduled cycle (~half-day at 15min); retains newest 14, prunes older; failures log+audit and never block a cycle; a >24h failure streak alerts once via Telegram. Restore drill: `docs/OPS_RUNBOOK.md`.)
+- [x] **Outbound HTTP timeouts** on all fetches (Alpaca, Telegram, Anthropic) with bounded retry; **rate limiting + auth on read endpoints**; retire or fix the mock Google OAuth (`src/services/googleAuth.ts:19`) — remove the integration if unused. (`src/server/httpDefaults.ts` (fetchWithTimeout: 10s timeout, ONE retry for GET only, POST/PUT/PATCH/DELETE never retried) applied to Alpaca/Telegram/Gmail fetches; Anthropic SDK given its own `timeout` client option (30s). `src/server/rateLimiter.ts` (120 req/min/IP on `/api/*`, `/api/health` exempt). `requireReadToken` middleware (server.ts) gates all other GET routes, accepting the admin token or a new `QUANTPACA_READ_TOKEN`; boot-validated in `startupChecks.ts`. googleAuth.ts's mock token replaced with an honest "not configured" rejection — Gmail/Sheets `authHeader` forwarding turned out to be real (not dead) wiring, so the module was fixed, not deleted.)
+- [x] **Store consolidation.** Migrate remaining `db.json` operational state (config, sync logs) into SQLite; `db.json` becomes legacy/read-only.
+  *Accept:* db.json is no longer read/written at runtime; a one-time, idempotent, marker-gated boot migration copies config/sync logs (newest 5,000)/analyses/legacy trades/simulated portfolio into new SQLite tables (`config`, `sync_logs`, `analyses`, `ui_trades`, `simulated_portfolio` — `src/server/persistence.ts`) before startup reconciliation runs; legacy `auditEvents` duplication is retired (SQLite `audit_events` was already the record). readDB()/writeDB() are replaced by a `Store` facade (`src/server/appStore.ts`) preserving the same config read-modify-write mutex serialization; a grep-assertion test proves no db.json write path remains anywhere in the codebase. db.json is never deleted (conservative — frozen legacy state, documented via a sibling `db.json.MIGRATED` marker file); Task 13's backups drop the db.json sibling copy once the migration marker is set. Restore-drill rollback note added to `docs/OPS_RUNBOOK.md`.
 
 **Phase 2 exit criteria:** system runs unattended for 5 consecutive market days in paper
 mode — scheduler firing, orders bracketed, statuses polled, reconciliation green, heartbeats
@@ -316,3 +317,72 @@ mapping (regime-change source is live as of Task 9).
 final review. Options: (a) merge locally, (b) open a PR for your own review first,
 (c) hold. The executor stopped here per guardrail 1 — Phase 2 begins only after your
 sign-off.
+
+---
+
+## Phase 2 completion report (2026-07-13, branch `phase2-operational-spine`, HEAD `9757f2c`)
+
+**Status: all 14 Phase 2 checkboxes complete.** 36 commits, 185 → 572 tests, lint + full
+suite independently verified green at HEAD. Same process as Phase 1: fresh implementer
+per task, adversarial spec+quality review, fix/re-review loops (8 of 14 tasks needed fix
+rounds — the reviews caught real defects each time), then a whole-branch final review
+whose fix wave closed 2 Criticals and 4 Importants no per-task review could see.
+Final verdict: **"Ready to merge: Yes."**
+
+**What the final review caught (cross-task):** every broker-side bracket exit would have
+permanently latched the reconciliation breaker (leg fills now write a synthetic SELL
+ledger entry and complete the exit plan); sell paths canceled protective legs before a
+risk gate could still reject the sell (all four sell paths now pre-flight sell-fatal
+gates BEFORE touching legs, and liquidation alerts are status-aware — never claim a
+close that didn't reach the broker); lowercase symbols bypassed every buy gate (one
+normalization at the chokepoint); broker hard-down never fed the auto-pause (now it
+does); UnknownBrokerState untested (now pinned).
+
+**Schema/persistence disclosures (guardrail 5):** new tables `symbol_cooldowns`-era
+plus this phase: `thesis_invalidations`, `do_not_buy`, `config`, `sync_logs`,
+`analyses`, `ui_trades`, `simulated_portfolio`; app_state keys (scheduler failure
+counter, throttle stamps, restart history, orphan list, acknowledged baselines,
+migration marker); one-time transactional db.json→SQLite migration (db.json frozen,
+never deleted; `.MIGRATED` sibling marker). New env var: `QUANTPACA_READ_TOKEN`
+(read-endpoint auth; boot-validated; unset → admin token required for reads + boot
+warning). New files: `Dockerfile`, `docker-compose.yml`, `data/signal-sources.json`
+(registry), `docs/OPS_RUNBOOK.md` (drills: crash-loop, restore, kill -9). No new npm
+dependencies.
+
+**Disclosed behavior changes:** bracket orders use `time_in_force: gtc` for the whole
+bracket (entry was day); crash-loop guard counts the initial boot, so it stays down
+after 2 rapid kills, not 3 — stricter than guardrail 9's prose, safety-conservative
+(runbook notes it); UI list reads capped at newest 10,000 (named constant).
+
+**Decisions requiring explicit human sign-off before the 5-day run:**
+1. *Sell-side risk-gate policy:* daily-loss / daily-trade-count / buying-power gates
+   can still reject a PROTECTIVE exit sell (pre-existing semantics, untouched per
+   guardrail 3). The system now handles it honestly (legs stay in place, honest skip
+   audit) — but decide: should risk-reducing sells ever be blocked by these gates?
+2. *Email autonomy (blocker for part of the exit criteria):* scheduled cycles have no
+   Gmail credential — ALL email sources (ZipTrader/Fool/Burry) are inert on unattended
+   cycles; only YouTube sentiment runs autonomously. Needs a server-side Gmail refresh
+   token (follow-up task + your OAuth consent) before "all new sources producing
+   attributed signals" can be satisfied unattended.
+3. *Enabling Motley Fool / Burry:* both ship `enabled: false` in
+   data/signal-sources.json. Before flipping them on, the ZipTrader-flavored base
+   analysis prompt should be made source-generic (tracked follow-up M4).
+4. *Overnight broker maintenance* (>45 min) can now trip auto-pause since broker
+   failures count toward guardrail 7 (per spec) — accept, or scope connectivity
+   failures to market-open cycles.
+
+**Known follow-ups (non-blocking, ledgered):** partial-leg-fill-then-cancel leaves
+filled shares unledgered → drift alarm (fails toward the alarm, correct direction);
+plus the per-task Minors in .superpowers/sdd/progress.md.
+
+**Phase 2 exit criteria status:** all code-verifiable criteria are met by tests
+(scheduler cycles, bracketed orders, polling, reconciliation gating, heartbeats,
+auto-restart machinery). The binding criterion — **5 consecutive unattended market
+days in paper mode** — is wall-clock validation only you can start: deploy via
+`docker compose up -d` (see docs/OPS_RUNBOOK.md), enable autoTrading, and let it run.
+Recommend resolving sign-off item 2 first so email signals participate.
+
+**Branch decision needed:** merge `phase2-operational-spine` to `main` (final review:
+Yes), or PR first. Note: the Phase 1 merge commit on local `main` is still unpushed to
+origin (push was blocked pending your approval). The executor stopped here per
+guardrail 1 — Phase 3 begins only after your sign-off AND the 5-day run.

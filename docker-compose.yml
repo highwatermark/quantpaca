@@ -1,0 +1,36 @@
+# Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5): the supervisor.
+# Operator drills (kill -9 acceptance, crash-loop verification, recovery
+# from stay-down) live in docs/OPS_RUNBOOK.md.
+services:
+  quantpaca:
+    build: .
+    container_name: quantpaca
+    # `on-failure` restarts the container on ANY non-zero exit (crash ->
+    # auto-restart -> startup reconciliation -> resume) and leaves it down
+    # after a zero exit. That second half is load-bearing: the in-process
+    # crash-loop limit (guardrail 9: 3 boots within 1 hour -> alert + stay
+    # down; src/server/crashLoopGuard.ts) deliberately exits 0 so this policy
+    # does NOT bring it back. Do not change this to `always` or
+    # `unless-stopped` -- both restart clean exits too, which would turn
+    # "stay down" into an infinite boot/alert/exit loop. And the crash-loop
+    # branch must not exit non-zero: on-failure has no per-code mapping, so
+    # any non-zero "distinct" code would be restarted like any other crash.
+    restart: on-failure
+    ports:
+      - "3000:3000"
+    # Secrets/config come from the gitignored .env on the host (same file
+    # `npm run dev` uses via dotenv; see .env.example for the full list).
+    # No new env vars were introduced for the supervisor/heartbeat -- all
+    # Task 12 thresholds are named constants in code, per the plan.
+    env_file:
+      - .env
+    # SQLite (quantpaca.sqlite incl. app_state: restart_history, heartbeat
+    # counters), db.json, and signal-sources.json must survive container
+    # replacement -- the crash-loop window and the clean-shutdown marker are
+    # meaningless if every new container starts with amnesia.
+    volumes:
+      - ./data:/app/data
+    # Give the graceful-shutdown path (processGuards.ts: SIGTERM -> stamp
+    # clean-shutdown marker -> stop scheduler -> close HTTP, 5s grace) room
+    # to finish before Docker escalates to SIGKILL.
+    stop_grace_period: 15s

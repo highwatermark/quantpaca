@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { RawSignal, ReviewedSignal, SignalSource } from "./domainTypes";
+import { RawSignal, ReviewedSignal, SignalSource, TrustTier } from "./domainTypes";
 import { validateSymbol } from "./tradingSafety";
+import { CrossSourceResult, Stance } from "./crossSourceConfirmation";
 
 type RawSignalInput = {
   source: SignalSource;
@@ -8,6 +9,11 @@ type RawSignalInput = {
   sourceTimestamp: string;
   symbol: string;
   thesis: string;
+  // Phase 2 Task 8 (signal-source registry): carried straight through onto
+  // the RawSignal (and, via reviewSignal below, the persisted ReviewedSignal).
+  // Optional -- callers outside the registry-governed email path (YouTube,
+  // tests) simply omit it.
+  trustTier?: TrustTier;
   // Fingerprinted for the dedup key (via normalizedThesisHash) INSTEAD of `thesis`
   // when supplied. Exists because `thesis` can be an LLM's free-text re-analysis
   // of a source, and that wording can drift between separate analyses of the
@@ -21,6 +27,17 @@ type RawSignalInput = {
   dedupContent?: string;
   url?: string;
   aiConfidence?: number;
+  // Phase 2 Task 11 (docs/GO_LIVE_PLAN.md Phase 2.4, cross-source
+  // confirmation): threaded straight through onto RawSignal/ReviewedSignal --
+  // see domainTypes.ts's field-level comments. Optional -- callers that don't
+  // carry a real stance (older tests, non-analysis callers) simply omit it.
+  stance?: Stance;
+  // The cross-source effect computed for THIS signal at review time, if the
+  // caller already evaluated it (server.ts does, before building the raw
+  // signal, so the boosted aiConfidence above and this recorded effect stay
+  // consistent with each other). Optional -- omitted by any caller that
+  // hasn't run the cross-source check.
+  crossSource?: CrossSourceResult;
 };
 
 type ReviewOptions = {
@@ -42,6 +59,9 @@ export function createRawSignal(input: RawSignalInput): RawSignal {
     normalizedThesisHash: hash(normalizeThesis(dedupContent)),
     url: input.url,
     aiConfidence: input.aiConfidence,
+    trustTier: input.trustTier,
+    stance: input.stance,
+    crossSource: input.crossSource,
   };
 }
 
@@ -86,6 +106,9 @@ export function reviewSignal(rawSignal: RawSignal, options: ReviewOptions = {}):
     invalidationConditions: buildInvalidationConditions(rawSignal.thesis),
     evidence: rawSignal.url ? [rawSignal.url] : [],
     status: "accepted",
+    trustTier: rawSignal.trustTier,
+    stance: rawSignal.stance,
+    crossSource: rawSignal.crossSource,
   };
 
   if (!symbolValidation.valid || !rawSignal.sourceId || !rawSignal.thesis) {
