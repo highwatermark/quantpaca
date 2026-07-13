@@ -3653,7 +3653,17 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
   const release = await appStore.acquire();
   try {
-    const { symbol, side } = req.body;
+    const { side } = req.body;
+    // Finding I1 follow-up: normalize once, at the top of the route, so EVERY
+    // local consumer of `symbol` below -- the cap-room lookup, the bracket-leg
+    // cancel (which joins on the UPPERCASE symbol trade_intents stores), the
+    // log lines, and the dry-run simulated-portfolio bookkeeping -- sees the
+    // same canonical form executeTradeIntent/submitTradeThroughPipeline
+    // persist. Same validateSymbol normalization as the executeTradeIntent
+    // chokepoint (no forked logic); an invalid symbol falls through raw so
+    // the pipeline's existing "invalid symbol" RiskRejected path still fires.
+    const symbolNormalization = validateSymbol(req.body.symbol);
+    const symbol = symbolNormalization.normalized || String(req.body.symbol ?? "");
     const authHeader = req.headers.authorization || null;
 
     const currentConfig: AppConfig = appStore.getConfig();
@@ -3758,6 +3768,41 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     // (the legs remain the protection) and the response says so honestly
     // instead of claiming success for an order that never went out.
     if (side === "sell") {
+      // Phase 2 final review, finding C2 (manual override path): pre-flight
+      // the sell-fatal risk gates BEFORE canceling this position's live
+      // bracket legs -- same rationale and helper as the exit monitor /
+      // automation SELL / emergency close-all. Without this, a manual sell
+      // that reviewRisk would reject anyway (daily loss / daily trade count /
+      // buying-power reserve) could still have its ONLY protection (the
+      // broker legs) canceled first, leaving the position naked.
+      const manualSellBrokerConfig = getBrokerConfig();
+      const manualSellPortfolio = await getAlpacaPortfolio(manualSellBrokerConfig);
+      const manualSellPreflight = sellRiskPreflight({
+        qty,
+        price,
+        portfolio: manualSellPortfolio,
+        brokerConfig: manualSellBrokerConfig,
+      });
+      if (manualSellPreflight.rejected) {
+        const skipMessage = `Manual override SELL for ${symbol} skipped: sell would be rejected by risk gate (${manualSellPreflight.reason}); broker legs remain this position's active protection.`;
+        addLog("error", skipMessage);
+        appendAuditEvents([{
+          id: `ae-sell-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          type: "risk",
+          actor: "manual_override",
+          message: skipMessage,
+          details: { symbol, qty, reason: manualSellPreflight.reason },
+        }]);
+        res.status(422).json({
+          success: false,
+          error: "Manual trade override rejected",
+          details: `The sell would be rejected by a risk gate (${manualSellPreflight.reason}), so this position's live bracket leg(s) were NOT canceled and the sell was NOT submitted. The position remains protected by its broker-native bracket order.`,
+          reason: manualSellPreflight.reason,
+        });
+        return;
+      }
+
       const legCancel = await cancelBracketLegsBeforeSell({ symbol, actor: "manual_override" });
       if (!legCancel.ok) {
         addLog("error", `Manual override SELL for ${symbol} skipped: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);

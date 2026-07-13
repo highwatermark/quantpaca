@@ -165,6 +165,48 @@ test("an expired do-not-buy entry does not block a manual BUY at the chokepoint"
   assert.equal(buy.body.trade.status, "Accepted");
 });
 
+// Finding I1 follow-up: /api/override/trade now normalizes the symbol at the
+// top of the route, so the dry-run simulated-portfolio bookkeeping (which
+// used to read the RAW req.body.symbol) books positions under the same
+// canonical uppercase key the persisted trade record carries -- a lowercase
+// buy/sell pair must round-trip through ONE simulated position, not create a
+// lowercase orphan the sell then can't find.
+test("dry-run bookkeeping: a lowercase buy books the simulated position under the canonical UPPERCASE symbol, and a lowercase sell removes it", async (t) => {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  const buy = await placeOrder(port, { symbol: "mixcase", qty: 1, side: "buy", price: 10 });
+  assert.equal(buy.body.trade.status, "Accepted", JSON.stringify(buy.body.trade));
+  assert.equal(buy.body.trade.symbol, "MIXCASE", "the persisted trade must carry the canonical symbol");
+
+  let store = createProductionStore(sqlitePath);
+  let sim = store.getSimulatedPortfolio();
+  store.close();
+  const positions = (sim?.positions || []) as Array<{ symbol?: string }>;
+  assert.ok(
+    positions.some((p) => p.symbol === "MIXCASE"),
+    `expected a simulated position keyed MIXCASE, got: ${JSON.stringify(positions.map((p) => p.symbol))}`,
+  );
+  assert.equal(
+    positions.some((p) => p.symbol === "mixcase"),
+    false,
+    "no lowercase orphan position may be created",
+  );
+
+  const sell = await placeOrder(port, { symbol: "mixcase", qty: 1, side: "sell", price: 10 });
+  assert.equal(sell.body.trade.status, "Accepted", JSON.stringify(sell.body.trade));
+
+  store = createProductionStore(sqlitePath);
+  sim = store.getSimulatedPortfolio();
+  store.close();
+  assert.equal(
+    ((sim?.positions || []) as Array<{ symbol?: string }>).some((p) => p.symbol === "MIXCASE"),
+    false,
+    "the lowercase sell must find and remove the canonical MIXCASE simulated position",
+  );
+});
+
 test("a SELL for a symbol on the do-not-buy list is never blocked by it -- de-risking always stays available", async (t) => {
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;

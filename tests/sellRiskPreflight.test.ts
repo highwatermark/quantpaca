@@ -402,3 +402,40 @@ test("3) daily trade cap reached: the triggered exit's pre-flight fires BEFORE a
     `expected an audited pre-flight-skip event, got: ${JSON.stringify(messages)}`,
   );
 });
+
+test("4) manual override SELL at the daily trade cap: the pre-flight fires BEFORE any leg cancel -- no DELETE, honest non-success response naming the gate, audited", async () => {
+  // Depends on the accumulated state of tests 1-3 (documented in the module
+  // comment): the daily trade count is at the cap (5), and PFCAP's bracket
+  // legs from test 3 are STILL live (its pre-flight skipped the cancel). A
+  // manual override sell of that same bracketed position must be stopped by
+  // the same pre-flight -- the original C2 finding explicitly listed the
+  // manual override sell among the affected paths.
+  deleteCalls = [];
+  postedOrders = [];
+
+  const res = await fetch(`http://127.0.0.1:${port}/api/override/trade`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-admin-token": ADMIN_TOKEN },
+    body: JSON.stringify({ symbol: "PFCAP", qty: 1, side: "sell", price: 80 }),
+  });
+  const body = (await res.json()) as any;
+
+  // No leg DELETE may ever be issued when the sell would be rejected anyway.
+  assert.equal(deleteCalls.length, 0, `expected NO DELETE calls (pre-flight must skip before any cancel), got: ${JSON.stringify(deleteCalls)}`);
+  const sellPost = postedOrders.find((o) => o.body.symbol === "PFCAP" && o.body.side === "sell");
+  assert.equal(sellPost, undefined, "no sell may reach the broker when the pre-flight rejects it");
+
+  // Honest non-success response naming the gate.
+  assert.equal(res.status, 422, `expected an honest non-2xx response, got ${res.status}: ${JSON.stringify(body)}`);
+  assert.equal(body.success, false);
+  assert.match(String(body.details || ""), /risk gate/i);
+  assert.match(String(body.reason || body.details || ""), /daily trade count/i, `expected the gate to be named, got: ${JSON.stringify(body)}`);
+  assert.match(String(body.details || ""), /NOT canceled/i, "the response must state the legs were left in place");
+
+  // Audited.
+  const messages = await auditMessages(port);
+  assert.ok(
+    messages.some((m) => /Manual override SELL for PFCAP/i.test(m) && /risk gate/i.test(m)),
+    `expected an audited manual-sell pre-flight-skip event, got: ${JSON.stringify(messages)}`,
+  );
+});
