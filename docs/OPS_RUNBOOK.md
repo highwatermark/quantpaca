@@ -243,7 +243,10 @@ curl -s http://localhost:3000/api/trades                 # -> 401, no token
 A simple in-memory fixed-window limiter caps every IP at 120 requests/minute
 across `/api/*` (`/api/health` exempt); beyond that, `429`. This is process-
 local, in-memory state — it resets on restart and does **not** coordinate
-across multiple replicas. **In a real (multi-instance, internet-facing)
+across multiple replicas. Memory is bounded: entries for IPs not seen for
+more than two windows are swept out (amortized, at most one sweep per
+window), so a months-long process does not keep a permanent entry per
+distinct client IP ever seen. **In a real (multi-instance, internet-facing)
 deployment, put a reverse proxy (nginx, Caddy, a cloud load balancer) in
 front of this app and rate-limit there too** — this limiter is a
 defense-in-depth backstop for a single-instance deployment, not a substitute
@@ -251,9 +254,9 @@ for one.
 
 ## Outbound HTTP timeouts
 
-Alpaca trading calls, Telegram (send + the `getUpdates` long-poll loop), and
-Gmail ingestion fetches all go through `src/server/httpDefaults.ts`'s
-`fetchWithTimeout` (10s bound). **GET requests get exactly one retry on
+Alpaca trading calls, Telegram (send + the `getUpdates` long-poll loop),
+Gmail ingestion fetches, and the Notion/Google Sheets export POSTs all go
+through `src/server/httpDefaults.ts`'s `fetchWithTimeout` (10s bound). **GET requests get exactly one retry on
 failure; POST/PUT/PATCH/DELETE are never retried** — order submission and
 Telegram sends must not double-fire. A Telegram poll timeout is caught and
 logged; the poll loop itself keeps running (it does not need a restart to

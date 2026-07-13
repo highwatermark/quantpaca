@@ -61,3 +61,58 @@ test("respects a custom limit/window", () => {
   assert.equal(checkRateLimit(state, "k", 200, 2, 1000).allowed, false);
   assert.equal(checkRateLimit(state, "k", 1000, 2, 1000).allowed, true, "window rolled over");
 });
+
+// --- Stale-entry eviction (unbounded-memory fix): the per-IP map must not
+// grow forever across a months-long process lifetime. Entries whose window
+// expired more than one full window ago are evicted by the amortized sweep
+// inside checkRateLimit itself (injected clock -- no real waiting).
+
+test("entries for stale IPs are evicted after their window passes", () => {
+  const state = createRateLimiterState();
+  const windowMs = 1000;
+
+  // 50 distinct IPs all seen at t=0.
+  for (let i = 0; i < 50; i++) {
+    checkRateLimit(state, `10.0.0.${i}`, 0, 5, windowMs);
+  }
+  assert.equal(state.entries.size, 50);
+
+  // Advance past 2x the window (their windows expired more than one full
+  // window ago) -- the next check from any key sweeps them out.
+  const later = 2 * windowMs + 1;
+  checkRateLimit(state, "fresh-ip", later, 5, windowMs);
+  assert.equal(state.entries.size, 1, "all 50 stale entries evicted; only the fresh key remains");
+  assert.ok(state.entries.has("fresh-ip"));
+});
+
+test("entries still inside (or within one window of) their window are NOT evicted by the sweep", () => {
+  const state = createRateLimiterState();
+  const windowMs = 1000;
+
+  checkRateLimit(state, "recent-ip", 0, 5, windowMs);
+  // Half a window later: recent-ip's window is still live -- a sweep
+  // triggered by another key must not evict it.
+  checkRateLimit(state, "other-ip", windowMs / 2, 5, windowMs);
+  assert.equal(state.entries.size, 2, "a live entry survives the sweep");
+
+  // recent-ip's count also survives (the entry was kept, not reset).
+  for (let i = 0; i < 4; i++) checkRateLimit(state, "recent-ip", windowMs / 2, 5, windowMs);
+  assert.equal(checkRateLimit(state, "recent-ip", windowMs / 2, 5, windowMs).allowed, false, "5 earlier hits still counted");
+});
+
+test("the sweep is amortized: throttled to at most one per window, then evicts everything stale", () => {
+  const state = createRateLimiterState();
+  const windowMs = 1000;
+
+  checkRateLimit(state, "stale-ip", 0, 5, windowMs);
+
+  // A check shortly after t=0 does not sweep (lastPruneMs throttles) --
+  // stale-ip is still inside its own window anyway.
+  checkRateLimit(state, "b", 10, 5, windowMs);
+  assert.equal(state.entries.size, 2);
+
+  // Well past staleness AND past the prune throttle: swept.
+  checkRateLimit(state, "c", 3 * windowMs, 5, windowMs);
+  assert.equal(state.entries.size, 1, "stale-ip and b evicted once the throttled sweep runs");
+  assert.ok(state.entries.has("c"));
+});

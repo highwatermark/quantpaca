@@ -1568,7 +1568,11 @@ function startTelegramRuntime() {
 async function appendTradeToSheets(config: AppConfig["google"], authHeader: string | null, trade: Trade) {
   if (!config || !config.enabled || !config.spreadsheetId || !authHeader) return false;
   try {
-    const res = await fetch(
+    // POST -- bounded timeout, never retried (fetchWithTimeout's non-GET
+    // policy; a retry could append the same trade row twice). Task 13 review
+    // expansion: this export call previously had no timeout and could hang a
+    // sync cycle indefinitely.
+    const res = await fetchWithTimeout(
       `https://sheets.googleapis.com/v4/spreadsheets/${config.spreadsheetId}/values/A1:I1:append?valueInputOption=USER_ENTERED`,
       {
         method: "POST",
@@ -1602,7 +1606,10 @@ async function appendTradeToSheets(config: AppConfig["google"], authHeader: stri
 async function saveToNotionDatabase(config: AppConfig["notion"], analysis: StockAnalysis) {
   if (!config || !config.token || !config.databaseId) return false;
   try {
-    const res = await fetch(`https://api.notion.com/v1/pages`, {
+    // POST -- bounded timeout, never retried (a retry could create a
+    // duplicate Notion page). Same Task 13 review expansion as
+    // appendTradeToSheets above.
+    const res = await fetchWithTimeout(`https://api.notion.com/v1/pages`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.token}`,

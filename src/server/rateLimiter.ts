@@ -11,16 +11,39 @@ export const RATE_LIMIT_PER_MINUTE = 120;
 export const RATE_LIMIT_WINDOW_MS = 60_000;
 
 type WindowEntry = { windowStartMs: number; count: number };
-export type RateLimiterState = Map<string, WindowEntry>;
+// `entries` is the per-key (per-IP) window state; `lastPruneMs` throttles the
+// stale-entry sweep below to at most one pass per window, keeping the
+// amortized per-request cost O(1) even under a flood of distinct IPs.
+export type RateLimiterState = { entries: Map<string, WindowEntry>; lastPruneMs: number };
 
 export function createRateLimiterState(): RateLimiterState {
-  return new Map();
+  return { entries: new Map(), lastPruneMs: Number.NEGATIVE_INFINITY };
+}
+
+// Unbounded-memory fix (Task 13 review): this app runs for months, and every
+// distinct client IP used to keep a permanent Map entry for the process
+// lifetime. An entry whose window expired more than one FULL window ago
+// (i.e. older than 2x windowMs) can never influence any future decision --
+// checkRateLimit resets any entry past 1x windowMs on its next hit anyway --
+// so it is pure garbage and safe to evict. Swept opportunistically from
+// inside checkRateLimit, throttled via lastPruneMs to one O(n) pass per
+// window; between sweeps stale entries may linger up to ~one extra window,
+// which is bounded and harmless.
+function pruneStaleEntries(state: RateLimiterState, nowMs: number, windowMs: number): void {
+  if (nowMs - state.lastPruneMs < windowMs) return;
+  state.lastPruneMs = nowMs;
+  for (const [key, entry] of state.entries) {
+    if (nowMs - entry.windowStartMs >= 2 * windowMs) {
+      state.entries.delete(key);
+    }
+  }
 }
 
 /**
  * Fixed-window limiter: `key` (an IP address in production) gets `limit`
  * requests per `windowMs`; the window resets (count back to 1) once `nowMs`
- * has moved past the current window's start. Mutates `state` in place.
+ * has moved past the current window's start. Mutates `state` in place, and
+ * opportunistically evicts long-stale keys (see pruneStaleEntries).
  */
 export function checkRateLimit(
   state: RateLimiterState,
@@ -29,9 +52,10 @@ export function checkRateLimit(
   limit: number = RATE_LIMIT_PER_MINUTE,
   windowMs: number = RATE_LIMIT_WINDOW_MS,
 ): { allowed: boolean; remaining: number } {
-  const entry = state.get(key);
+  pruneStaleEntries(state, nowMs, windowMs);
+  const entry = state.entries.get(key);
   if (!entry || nowMs - entry.windowStartMs >= windowMs) {
-    state.set(key, { windowStartMs: nowMs, count: 1 });
+    state.entries.set(key, { windowStartMs: nowMs, count: 1 });
     return { allowed: true, remaining: Math.max(0, limit - 1) };
   }
   if (entry.count >= limit) {
