@@ -42,7 +42,7 @@ import { buildPositionReconciliationReport, reconcileBrokerState } from "./src/s
 import { authorizeTelegramCommand, ConfirmationToken, consumeConfirmationToken, createConfirmationToken, parseTelegramAdminRoles } from "./src/server/telegramEngine";
 import { createExitPlan } from "./src/server/exitEngine";
 import { evaluateOpenPositionExits } from "./src/server/exitMonitor";
-import { reviewRisk } from "./src/server/riskEngine";
+import { evaluateSellFatalRiskGates, reviewRisk } from "./src/server/riskEngine";
 import { evaluateBreaker, BreakerState } from "./src/server/breakerEngine";
 import { applyBreakerLatch, LatchEvent } from "./src/server/breakerLatch";
 import { validateStartupEnv } from "./src/server/startupChecks";
@@ -1003,6 +1003,64 @@ async function cancelAlpacaOrder(brokerConfig: BrokerConfig, orderId: string): P
 //    the re-poll shows the leg is actually terminal already, the sell
 //    proceeds (nothing left to cancel); if it's still live (or the re-poll
 //    itself fails), this fails closed exactly as before Task 5.
+// Phase 2 final review, finding C2: before an automated sell path cancels a
+// position's live bracket legs, check whether the sell itself would actually
+// be REJECTED by the risk gates that still apply to a SELL -- daily loss,
+// daily trade count, buying-power reserve (riskEngine.ts's
+// evaluateSellFatalRiskGates -- the exact same comparisons reviewRisk itself
+// runs, zero forked math). Before this check existed, cancelBracketLegsBeforeSell
+// would clear the position's ONLY protection and THEN executeTradeIntent's
+// reviewRisk call could still reject the sell for one of these reasons,
+// leaving a naked, unprotected position (the broker legs gone, no new sell in
+// their place). This mirrors reviewRisk's own dailyLoss/accountEquity
+// fallback formulas (see executeTradeIntent above) rather than re-deriving
+// them independently, using whatever `portfolio` the caller already fetched
+// this cycle (no extra network round trip). Deliberately narrower than a full
+// reviewRisk dry run: the breaker/PDT/cooldown/cross-source/symbol-validity/
+// exit-plan gates are either buy-only or effectively unreachable for a sell
+// of a position this system already holds -- see riskEngine.ts's doc comment
+// on evaluateSellFatalRiskGates for the full reasoning.
+function sellRiskPreflight(input: {
+  qty: number;
+  price: number;
+  portfolio: { equity?: unknown; last_equity?: unknown; buying_power?: unknown };
+  brokerConfig: BrokerConfig;
+}): { rejected: boolean; reason?: string } {
+  const equityParsed = parseFiniteNumber(input.portfolio.equity, "equity");
+  let dailyLoss: number | undefined;
+  if (equityParsed.ok && equityParsed.value > 0) {
+    // Same fallback rule as executeTradeIntent's own dailyLoss derivation: a
+    // REAL broker must supply last_equity; the simulated/dry-run portfolio
+    // treats equity as prior close (daily loss 0).
+    const lastEquityForDaily = input.brokerConfig.configured
+      ? Number(input.portfolio.last_equity)
+      : Number(input.portfolio.last_equity ?? input.portfolio.equity);
+    if (Number.isFinite(lastEquityForDaily)) dailyLoss = equityParsed.value - lastEquityForDaily;
+  }
+  const dailyTradeCount = appStore
+    .listTrades()
+    .filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length;
+  // Same "never NaN, falls back to 0" semantics as portfolioEngine.ts's
+  // assessPortfolio (the shape reviewRisk's own portfolio.buyingPower comes
+  // from) -- an unparsable buying_power must fail this gate CLOSED (0 minus
+  // any positive notional is negative, so a real notional still trips the
+  // reserve check), never crash or silently skip it.
+  const buyingPowerRaw = Number(input.portfolio.buying_power || 0);
+  const buyingPower = Number.isFinite(buyingPowerRaw) ? buyingPowerRaw : 0;
+
+  return evaluateSellFatalRiskGates({
+    dailyLoss,
+    dailyTradeCount,
+    buyingPower,
+    notional: input.qty * input.price,
+    limits: {
+      maxDailyLoss: riskLimits.maxDailyLoss,
+      maxDailyTradeCount: riskLimits.maxDailyTradeCount,
+      minBuyingPower: riskLimits.minBuyingPower,
+    },
+  });
+}
+
 async function cancelBracketLegsBeforeSell(input: {
   symbol: string;
   // For the audit trail: which sell path is asking (e.g. "exit_monitor",
@@ -2473,6 +2531,33 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           const sellQty = Math.min(decision.qty, Math.floor(parseFloat(pos.qty)) || 0);
           if (sellQty <= 0) continue;
 
+          // Phase 2 final review, finding C2: pre-flight the sell-fatal risk
+          // gates BEFORE ever canceling this position's live bracket legs.
+          // Without this, a sell that reviewRisk would reject anyway (daily
+          // loss cap / daily trade count cap / buying-power reserve) could
+          // still have already had its ONLY protection (the broker legs)
+          // canceled first, leaving the position naked. Skip the cancel (and
+          // the sell) entirely when this fires -- the legs stay in place.
+          const exitPreflight = sellRiskPreflight({
+            qty: sellQty,
+            price: parseFloat(pos.current_price) || 0,
+            portfolio,
+            brokerConfig: getBrokerConfig(),
+          });
+          if (exitPreflight.rejected) {
+            const skipMessage = `Software exit for ${decision.symbol} skipped: sell would be rejected by risk gate (${exitPreflight.reason}); broker legs remain this position's active protection.`;
+            addLog("error", skipMessage);
+            appendAuditEvents([{
+              id: `ae-sell-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: new Date().toISOString(),
+              type: "risk",
+              actor: "exit_monitor",
+              message: skipMessage,
+              details: { symbol: decision.symbol, qty: sellQty, reason: exitPreflight.reason },
+            }]);
+            continue;
+          }
+
           // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): clear this symbol's live
           // bracket legs before the liquidation sell (see the shared helper
           // for the full rationale). Fail closed: a lookup/cancel failure
@@ -2506,7 +2591,17 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             side: "sell",
           });
 
-          const tgAlertMsg = `🚨 <b>${decision.kind === "plan_exit" ? "EXIT PLAN TRIGGERED" : "STOP LOSS EXECUTION WARNING"}</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Reason:</b> ${decision.reasoning}\nAutomatically liquidated ${sellQty} shares to shield capital assets from further dropdowns.`;
+          // Phase 2 final review, finding C2 (part b): the alert/log must only
+          // ever claim "liquidated" when the sell actually reached the broker
+          // successfully (BROKER_SUCCESS_TRADE_STATUSES) -- a RiskRejected or
+          // BrokerFailed trade here means the legs were already canceled (or
+          // this position never had legs) and the position is now genuinely
+          // unprotected; an honest failure alert is what gets a human looking
+          // at it, not a false "shielded" claim.
+          const liquidationSucceeded = BROKER_SUCCESS_TRADE_STATUSES.has(liquidationTrade.status);
+          const tgAlertMsg = liquidationSucceeded
+            ? `🚨 <b>${decision.kind === "plan_exit" ? "EXIT PLAN TRIGGERED" : "STOP LOSS EXECUTION WARNING"}</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Reason:</b> ${decision.reasoning}\nAutomatically liquidated ${sellQty} shares to shield capital assets from further dropdowns.`
+            : `🚨 <b>${decision.kind === "plan_exit" ? "EXIT PLAN" : "STOP LOSS"} SELL FAILED</b>\n<b>Ticker:</b> ${pos.symbol}\n<b>Reason:</b> ${decision.reasoning}\nThe liquidation sell for ${sellQty} shares did NOT reach the broker successfully (status: ${liquidationTrade.status}${liquidationTrade.riskDecision?.reason ? `, reason: ${liquidationTrade.riskDecision.reason}` : ""}). The position may be unprotected -- manual review required.`;
           liquidationTrade.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgAlertMsg);
           liquidationTrade.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, liquidationTrade);
           liquidationTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, {
@@ -2535,7 +2630,12 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             appStore.setSimulatedPortfolio(simulatedPortfolio);
           }
 
-          addLog("trade", `Liquidated ${sellQty} shares of ${pos.symbol} (${decision.kind === "plan_exit" ? "exit plan" : "legacy stop loss"} trigger).`);
+          addLog(
+            liquidationSucceeded ? "trade" : "error",
+            liquidationSucceeded
+              ? `Liquidated ${sellQty} shares of ${pos.symbol} (${decision.kind === "plan_exit" ? "exit plan" : "legacy stop loss"} trigger).`
+              : `Liquidation sell FAILED for ${pos.symbol} (${decision.kind === "plan_exit" ? "exit plan" : "legacy stop loss"} trigger): status ${liquidationTrade.status}${liquidationTrade.riskDecision?.reason ? ` (${liquidationTrade.riskDecision.reason})` : ""}. Manual review required.`,
+          );
         }
       } catch (riskManagerErr: any) {
         addLog("error", "Portfolio risk evaluator hit error", riskManagerErr.message);
@@ -3355,6 +3455,32 @@ For "stance", classify the source's own directional call on the ticker into exac
             const qty = parseInt(currentShares.qty);
             addLog("sync", `Submitting sell recommendation intent to close position of ${qty} shares for ${item.symbol}...`);
 
+            // Phase 2 final review, finding C2: pre-flight the sell-fatal risk
+            // gates BEFORE canceling this symbol's live bracket legs -- same
+            // rationale as MODULE 2's own preflight above. A sell that
+            // reviewRisk would reject anyway (daily loss / daily trade count /
+            // buying power) must never have its only protection (the legs)
+            // canceled first.
+            const automationSellPreflight = sellRiskPreflight({
+              qty,
+              price,
+              portfolio,
+              brokerConfig: getBrokerConfig(),
+            });
+            if (automationSellPreflight.rejected) {
+              const skipMessage = `Automation SELL for ${item.symbol} skipped this cycle: sell would be rejected by risk gate (${automationSellPreflight.reason}); broker legs remain this position's active protection.`;
+              addLog("error", skipMessage);
+              appendAuditEvents([{
+                id: `ae-sell-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                timestamp: new Date().toISOString(),
+                type: "risk",
+                actor: "automation",
+                message: skipMessage,
+                details: { symbol: item.symbol, qty, reason: automationSellPreflight.reason },
+              }]);
+              continue;
+            }
+
             // Task 4 (docs/GO_LIVE_PLAN.md Phase 2.2): the automation
             // SELL-decision path is a sell call site like any other -- clear
             // this symbol's live bracket legs first (shared helper; same
@@ -3710,6 +3836,38 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
         results.push({ symbol: pos.symbol, sold: false, status: "Skipped", reason: "no deterministic current price was available" });
         continue;
       }
+      // Phase 2 final review, finding C2: pre-flight the sell-fatal risk gates
+      // BEFORE canceling this symbol's live bracket legs -- same rationale as
+      // MODULE 2/the automation sell path. Even the panic button must not
+      // cancel a position's only protection ahead of a sell reviewRisk would
+      // reject anyway (e.g. the daily trade count cap reached partway through
+      // a multi-position close-all).
+      const emergencyPreflight = sellRiskPreflight({
+        qty: parseInt(pos.qty),
+        price: currentPrice,
+        portfolio,
+        brokerConfig: getBrokerConfig(),
+      });
+      if (emergencyPreflight.rejected) {
+        const skipMessage = `Emergency close skipped for ${pos.symbol}: sell would be rejected by risk gate (${emergencyPreflight.reason}); broker legs remain this position's active protection.`;
+        appStore.addLog({
+          id: "l-" + Math.random().toString(36).substr(2, 9),
+          timestamp,
+          type: "error",
+          message: skipMessage,
+        });
+        appendAuditEvents([{
+          id: `ae-sell-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: new Date().toISOString(),
+          type: "risk",
+          actor: "emergency_close",
+          message: skipMessage,
+          details: { symbol: pos.symbol, qty: parseInt(pos.qty), reason: emergencyPreflight.reason },
+        }]);
+        results.push({ symbol: pos.symbol, sold: false, status: "Skipped", reason: emergencyPreflight.reason });
+        continue;
+      }
+
       // Task 4: clear live bracket legs before the sell (shared helper; same
       // fail-closed semantics as the exit monitor). A cancel failure skips
       // THIS symbol only -- its legs remain the protection -- and the rest of

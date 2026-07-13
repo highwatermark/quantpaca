@@ -45,6 +45,65 @@ type RiskInput = {
   };
 };
 
+// Phase 2 final review, finding C2: the three reviewRisk gates that can
+// reject a SELL (daily loss, daily trade count, buying-power reserve --
+// every other gate below is either buy-only by construction, e.g. the
+// breaker/PDT/cooldown/cross-source checks, or effectively unreachable for a
+// sell of an already-open position, e.g. symbol/exit-plan validity,
+// open-position-count's hasPosition escape). Factored out of reviewRisk's
+// body (called from there below, not duplicated) so a caller that needs to
+// know "would a SELL be rejected right now" -- server.ts's sell call sites,
+// which must decide this BEFORE canceling a position's live bracket legs, or
+// a cancel-then-reject sequence leaves the position naked -- can ask the
+// exact same question reviewRisk itself answers, with zero forked math.
+// Each function mirrors exactly one of reviewRisk's existing inline checks;
+// splitting them (rather than one combined "sell preflight" function) keeps
+// reviewRisk's own call order/short-circuit-reason precedence byte-for-byte
+// unchanged -- this refactor must not alter riskEngine gate semantics.
+export function checkDailyLossGate(dailyLoss: number | undefined, maxDailyLoss: number): { rejected: boolean; reason?: string } {
+  if (dailyLoss !== undefined && dailyLoss <= -Math.abs(maxDailyLoss)) {
+    return { rejected: true, reason: "Maximum daily loss reached." };
+  }
+  return { rejected: false };
+}
+
+export function checkDailyTradeCountGate(dailyTradeCount: number, maxDailyTradeCount: number): { rejected: boolean; reason?: string } {
+  if (dailyTradeCount >= maxDailyTradeCount) {
+    return { rejected: true, reason: "Maximum daily trade count reached." };
+  }
+  return { rejected: false };
+}
+
+export function checkBuyingPowerGate(buyingPower: number, notional: number, minBuyingPower: number): { rejected: boolean; reason?: string } {
+  if (buyingPower - notional < minBuyingPower) {
+    return { rejected: true, reason: "Insufficient buying power after required reserve." };
+  }
+  return { rejected: false };
+}
+
+export type SellFatalGateInput = {
+  dailyLoss?: number;
+  dailyTradeCount: number;
+  buyingPower: number;
+  notional: number;
+  limits: { maxDailyLoss: number; maxDailyTradeCount: number; minBuyingPower: number };
+};
+
+// Runs the three sell-applicable gates above, in the SAME order reviewRisk
+// evaluates them (daily loss -> daily trade count -> buying power), returning
+// the first rejection. This is the pre-flight entry point server.ts's sell
+// call sites use before canceling bracket legs -- see the module doc comment
+// above.
+export function evaluateSellFatalRiskGates(input: SellFatalGateInput): { rejected: boolean; reason?: string } {
+  const dailyLossCheck = checkDailyLossGate(input.dailyLoss, input.limits.maxDailyLoss);
+  if (dailyLossCheck.rejected) return dailyLossCheck;
+  const tradeCountCheck = checkDailyTradeCountGate(input.dailyTradeCount, input.limits.maxDailyTradeCount);
+  if (tradeCountCheck.rejected) return tradeCountCheck;
+  const buyingPowerCheck = checkBuyingPowerGate(input.buyingPower, input.notional, input.limits.minBuyingPower);
+  if (buyingPowerCheck.rejected) return buyingPowerCheck;
+  return { rejected: false };
+}
+
 export function reviewRisk(input: RiskInput): RiskDecision {
   // Fail-closed numeric boundary: every number used in a comparison below must
   // parse as finite here first. An unparsable value rejects the trade — it never
@@ -104,12 +163,13 @@ export function reviewRisk(input: RiskInput): RiskDecision {
   if (num("intent.qty") <= 0 || num("intent.notional") <= 0) {
     return { status: "rejected", reason: "Sized trade intent has no executable quantity." };
   }
-  if (parsed.has("metrics.dailyLoss") && num("metrics.dailyLoss") <= -Math.abs(num("limits.maxDailyLoss"))) {
-    return { status: "rejected", reason: "Maximum daily loss reached." };
-  }
-  if (num("metrics.dailyTradeCount") >= num("limits.maxDailyTradeCount")) {
-    return { status: "rejected", reason: "Maximum daily trade count reached." };
-  }
+  const dailyLossCheck = checkDailyLossGate(
+    parsed.has("metrics.dailyLoss") ? num("metrics.dailyLoss") : undefined,
+    num("limits.maxDailyLoss"),
+  );
+  if (dailyLossCheck.rejected) return { status: "rejected", reason: dailyLossCheck.reason! };
+  const tradeCountCheck = checkDailyTradeCountGate(num("metrics.dailyTradeCount"), num("limits.maxDailyTradeCount"));
+  if (tradeCountCheck.rejected) return { status: "rejected", reason: tradeCountCheck.reason! };
   // PDT guard (Phase 2 Task 3): a BUY is what OPENS the possibility of a
   // same-day SELL becoming the 4th day trade, so intervening on the BUY side
   // is the conservative, simple enforcement point. SELLs are never blocked by
@@ -129,9 +189,8 @@ export function reviewRisk(input: RiskInput): RiskDecision {
   if (num("metrics.openPositionCount") >= num("limits.maxOpenPositions") && !hasPosition(input.portfolio, input.intent.symbol)) {
     return { status: "rejected", reason: "Maximum open positions reached." };
   }
-  if (num("portfolio.buyingPower") - num("intent.notional") < num("limits.minBuyingPower")) {
-    return { status: "rejected", reason: "Insufficient buying power after required reserve." };
-  }
+  const buyingPowerCheck = checkBuyingPowerGate(num("portfolio.buyingPower"), num("intent.notional"), num("limits.minBuyingPower"));
+  if (buyingPowerCheck.rejected) return { status: "rejected", reason: buyingPowerCheck.reason! };
   if (input.portfolio.openOrders.some((order) => order.symbol === input.intent.symbol && order.side === input.intent.side && !isTerminal(order.status))) {
     return { status: "rejected", reason: "Duplicate open order protection triggered." };
   }

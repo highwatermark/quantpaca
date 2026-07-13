@@ -26,6 +26,15 @@ let postedOrders: Array<{ clientOrderId: string; body: any }>;
 let deleteCalls: string[];
 let deleteShouldFailFor: Set<string>;
 let orderCounter: number;
+// M2 review fix: a single ordered log of every DELETE and POST /orders call,
+// in the exact sequence the mock broker received them -- interleaved, not two
+// separate arrays. The old ordering assertion only ever checked that a sell
+// POST's index existed within `postedOrders` (a SELL-only array) >= 0, which
+// is trivially true for any successful sell regardless of whether the leg
+// DELETEs actually happened first; it could never fail. This is what lets a
+// test assert a REAL interleaving: every leg DELETE's index in this combined
+// log precedes the sell POST's index.
+let requestLog: Array<{ type: "DELETE" | "POST"; orderId?: string; symbol?: string; side?: string }>;
 
 function resetMockBroker() {
   positionsFixture = [];
@@ -33,6 +42,7 @@ function resetMockBroker() {
   deleteCalls = [];
   deleteShouldFailFor = new Set();
   orderCounter = 0;
+  requestLog = [];
 }
 resetMockBroker();
 
@@ -144,6 +154,7 @@ globalThis.fetch = (async (input: any, init?: any) => {
     if (url.includes("/orders") && init?.method === "DELETE") {
       const orderId = url.split("/orders/")[1]?.split("?")[0];
       deleteCalls.push(String(orderId));
+      requestLog.push({ type: "DELETE", orderId: String(orderId) });
       if (deleteShouldFailFor.has(String(orderId))) {
         return new Response(JSON.stringify({ message: "order not cancelable" }), { status: 422 });
       }
@@ -156,6 +167,7 @@ globalThis.fetch = (async (input: any, init?: any) => {
       const body = JSON.parse(String(init.body || "{}"));
       const clientOrderId = String(body.client_order_id || "");
       postedOrders.push({ clientOrderId, body });
+      requestLog.push({ type: "POST", symbol: body.symbol, side: body.side });
       orderCounter += 1;
       const order: Record<string, unknown> = {
         id: `bro-${orderCounter}`,
@@ -289,9 +301,24 @@ test("software exit with live broker legs: the exit monitor cancels the open bra
   const sellPost = postedOrders.find((o) => o.body.symbol === "BRAK1" && o.body.side === "sell");
   assert.ok(sellPost, "expected the liquidation sell to actually reach the broker");
 
-  // Ordering: every DELETE call for this symbol's legs must precede the sell POST.
-  const sellPostIndexAmongAllOrders = postedOrders.findIndex((o) => o.body.symbol === "BRAK1" && o.body.side === "sell");
-  assert.ok(sellPostIndexAmongAllOrders >= 0);
+  // M2 review fix: a REAL interleaving assertion. requestLog is one ordered
+  // list of every DELETE and POST /orders call the mock broker received, in
+  // the exact sequence they arrived -- not two separate arrays whose indices
+  // say nothing about each other. Every leg DELETE's index in that combined
+  // log must precede the sell POST's index (the old version of this
+  // assertion only checked the sell POST's index within a SELL-only array
+  // was >= 0, which is true for any successful sell whatsoever and could
+  // never actually fail).
+  const sellPostIndex = requestLog.findIndex((entry) => entry.type === "POST" && entry.symbol === "BRAK1" && entry.side === "sell");
+  assert.ok(sellPostIndex >= 0, `expected a sell POST entry in the request log, got: ${JSON.stringify(requestLog)}`);
+  for (const legId of legIds) {
+    const deleteIndex = requestLog.findIndex((entry) => entry.type === "DELETE" && entry.orderId === legId);
+    assert.ok(deleteIndex >= 0, `expected a DELETE entry for leg ${legId} in the request log, got: ${JSON.stringify(requestLog)}`);
+    assert.ok(
+      deleteIndex < sellPostIndex,
+      `expected DELETE /orders/${legId} (index ${deleteIndex}) to precede the sell POST (index ${sellPostIndex}), got request log: ${JSON.stringify(requestLog)}`,
+    );
+  }
 });
 
 test("cancel failure fails closed: when a leg cancel fails, the software exit is skipped this cycle and the position stays covered by the broker legs", async (t) => {
