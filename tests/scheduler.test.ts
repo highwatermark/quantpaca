@@ -8,6 +8,7 @@ import {
   MAX_INTERVAL_MINUTES,
   MAX_CONSECUTIVE_FAILURES,
   MAX_BUYS_PER_CYCLE,
+  WATCHDOG_CHECK_INTERVAL_MS,
   SchedulerDeps,
 } from "../src/server/scheduler";
 
@@ -19,6 +20,7 @@ test("named constants match the go-live plan's guardrail thresholds", () => {
   assert.equal(MAX_INTERVAL_MINUTES, 240);
   assert.equal(MAX_CONSECUTIVE_FAILURES, 3);
   assert.equal(MAX_BUYS_PER_CYCLE, 2);
+  assert.equal(WATCHDOG_CHECK_INTERVAL_MS, 5 * 60_000);
 });
 
 // --- resolveIntervalMinutes: validate + clamp + fail-closed-to-default ---
@@ -61,6 +63,8 @@ type DepsState = {
   pauseCalls: number;
   runCalls: number;
   tradingReady: boolean;
+  cycleCompletedCalls: Array<{ failed: boolean }>;
+  watchdogCalls: number;
 };
 
 function makeDeps(): { state: DepsState; deps: SchedulerDeps } {
@@ -74,6 +78,8 @@ function makeDeps(): { state: DepsState; deps: SchedulerDeps } {
     pauseCalls: 0,
     runCalls: 0,
     tradingReady: true,
+    cycleCompletedCalls: [],
+    watchdogCalls: 0,
   };
   const deps: SchedulerDeps = {
     now: () => 0,
@@ -95,6 +101,12 @@ function makeDeps(): { state: DepsState; deps: SchedulerDeps } {
     },
     onAutoPause: async () => {
       state.pauseCalls++;
+    },
+    onCycleCompleted: (outcome) => {
+      state.cycleCompletedCalls.push(outcome);
+    },
+    checkWatchdog: () => {
+      state.watchdogCalls++;
     },
     log: (m) => state.logs.push(m),
   };
@@ -200,15 +212,111 @@ test("2 failures then a success resets the counter without ever pausing", async 
   assert.equal(state.pauseCalls, 0);
 });
 
-test("stop() clears the armed timer and start() does not re-arm after stop", () => {
+test("start() arms both the tick timer and the watchdog timer", () => {
   const { state, deps } = makeDeps();
-  let cleared: unknown;
+  const scheduler = createScheduler(deps);
+  scheduler.start();
+  assert.equal(state.timers.length, 2);
+  assert.equal(
+    state.timers[1].ms,
+    WATCHDOG_CHECK_INTERVAL_MS,
+    "the watchdog timer uses its own fixed interval, independent of runIntervalMins -- a stuck/misconfigured main cycle chain must not also silence its own watchdog",
+  );
+});
+
+test("stop() clears both the tick timer and the watchdog timer; start() does not re-arm after stop", () => {
+  const { state, deps } = makeDeps();
+  const cleared: unknown[] = [];
   deps.clearTimer = (h) => {
-    cleared = h;
+    cleared.push(h);
   };
   const scheduler = createScheduler(deps);
   scheduler.start();
-  assert.equal(state.timers.length, 1);
+  assert.equal(state.timers.length, 2);
   scheduler.stop();
-  assert.equal(cleared, state.timers.length);
+  assert.equal(cleared.length, 2);
+  assert.deepEqual(new Set(cleared), new Set([1, 2]));
+});
+
+// --- Phase 2 Task 12: onCycleCompleted (heartbeat counter) / checkWatchdog wiring ---
+
+test("a tick that actually runs a cycle reports it via onCycleCompleted, regardless of outcome", async () => {
+  const { state, deps } = makeDeps();
+  state.cycleResults = [{ failed: true }];
+  const scheduler = createScheduler(deps);
+  await scheduler.runTickNow();
+  assert.deepEqual(state.cycleCompletedCalls, [{ failed: true }]);
+});
+
+test("a tick skipped for autoTrading-off never reports onCycleCompleted", async () => {
+  const { state, deps } = makeDeps();
+  state.autoTradingOn = false;
+  const scheduler = createScheduler(deps);
+  await scheduler.runTickNow();
+  assert.equal(state.cycleCompletedCalls.length, 0);
+});
+
+test("a tick skipped for startup-reconciliation-pending never reports onCycleCompleted", async () => {
+  const { state, deps } = makeDeps();
+  state.tradingReady = false;
+  const scheduler = createScheduler(deps);
+  await scheduler.runTickNow();
+  assert.equal(state.cycleCompletedCalls.length, 0);
+});
+
+test("a single-flight-skipped overlapping tick never reports onCycleCompleted a second time", async () => {
+  const { state, deps } = makeDeps();
+  let resolveCycle: (v: { failed: boolean }) => void = () => {};
+  deps.runScheduledCycle = () =>
+    new Promise((resolve) => {
+      resolveCycle = resolve;
+    });
+  const scheduler = createScheduler(deps);
+  const firstTick = scheduler.runTickNow();
+  await scheduler.runTickNow();
+  assert.equal(state.cycleCompletedCalls.length, 0, "the in-flight cycle has not resolved yet");
+  resolveCycle({ failed: false });
+  await firstTick;
+  assert.equal(state.cycleCompletedCalls.length, 1);
+});
+
+test("checkWatchdogNow() invokes deps.checkWatchdog() directly, without waiting for the timer", async () => {
+  const { state, deps } = makeDeps();
+  const scheduler = createScheduler(deps);
+  await scheduler.checkWatchdogNow();
+  assert.equal(state.watchdogCalls, 1);
+});
+
+test("the watchdog timer self-rearms after firing", async () => {
+  const { state, deps } = makeDeps();
+  const scheduler = createScheduler(deps);
+  scheduler.start();
+  const watchdogTimer = state.timers[1];
+  await watchdogTimer.cb();
+  assert.equal(state.watchdogCalls, 1);
+  assert.equal(state.timers.length, 3, "the watchdog timer must re-arm itself after firing");
+  assert.equal(state.timers[2].ms, WATCHDOG_CHECK_INTERVAL_MS);
+});
+
+test("stop() prevents the watchdog from re-arming even if its already-fired callback still runs once more", async () => {
+  const { state, deps } = makeDeps();
+  const scheduler = createScheduler(deps);
+  scheduler.start();
+  const watchdogTimer = state.timers[1];
+  scheduler.stop();
+  await watchdogTimer.cb();
+  assert.equal(state.timers.length, 2, "stop() must prevent the watchdog re-arm even though the stale callback still executed once");
+});
+
+test("a throwing deps.checkWatchdog() is caught and logged, and the watchdog still re-arms", async () => {
+  const { state, deps } = makeDeps();
+  deps.checkWatchdog = () => {
+    throw new Error("watchdog boom");
+  };
+  const scheduler = createScheduler(deps);
+  scheduler.start();
+  const watchdogTimer = state.timers[1];
+  await watchdogTimer.cb();
+  assert.ok(state.logs.some((l) => /watchdog/i.test(l)), `expected an error log mentioning the watchdog, got: ${JSON.stringify(state.logs)}`);
+  assert.equal(state.timers.length, 3, "a throwing watchdog check must not break the re-arm chain");
 });

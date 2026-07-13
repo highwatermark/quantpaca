@@ -1,0 +1,15 @@
+# Keep the build context small and secrets/state OUT of the image.
+node_modules/
+dist/
+build/
+coverage/
+data/
+*.sqlite
+*.log
+*.tmp
+.DS_Store
+.git/
+.claude/
+# Secrets stay on the host; docker-compose injects them via env_file.
+.env*
+!.env.example

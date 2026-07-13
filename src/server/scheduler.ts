@@ -31,6 +31,15 @@ export const MAX_CONSECUTIVE_FAILURES = 3;
 // re-exported from here so the threshold has exactly one definition.
 export const MAX_BUYS_PER_CYCLE = 2;
 
+// Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5): the missed-cycle
+// watchdog's own check cadence -- deliberately a fixed, independent interval
+// rather than a multiple of the (config-driven, operator-tunable)
+// runIntervalMins. If the main tick chain itself is stuck or dead, a
+// watchdog whose own timing depended on that same chain could never fire
+// either; arming it separately, in start()/stop() alongside the main tick
+// timer, is what lets it detect exactly that failure mode.
+export const WATCHDOG_CHECK_INTERVAL_MS = 5 * 60_000;
+
 /**
  * Validates and clamps a raw `system.runIntervalMins` config value. Invalid
  * (non-finite/unparsable) input fails closed to DEFAULT_INTERVAL_MINUTES;
@@ -88,6 +97,22 @@ export type SchedulerDeps = {
   // pause alert, and appends an audit event. Runs once, at the moment of the
   // MAX_CONSECUTIVE_FAILURES-th consecutive failure.
   onAutoPause: () => Promise<void>;
+  // Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5): fired exactly once per
+  // ACTUALLY-RUN cycle -- i.e. only from the branch that called
+  // runScheduledCycle() above, never from a tick skipped for autoTrading-off,
+  // startup-reconciliation-pending, or single-flight overlap. Backed by
+  // app_state in production (heartbeat.ts's CYCLE_COUNT_APP_STATE_KEY /
+  // LAST_CYCLE_COMPLETED_AT_APP_STATE_KEY) -- lets server.ts advance the
+  // heartbeat's completed-cycle counter and the watchdog's last-completed-at
+  // timestamp from one single chokepoint, regardless of the cycle's outcome
+  // (a FAILED cycle still completed -- it did not silently fail to run).
+  onCycleCompleted: (outcome: CycleOutcome) => void | Promise<void>;
+  // Phase 2 Task 12: the missed-cycle watchdog's actual check (reads
+  // app_state's last-completed-at, decides via heartbeat.ts's
+  // shouldAlertOverdueGap, sends the Telegram alert with delivery-gated
+  // stamping). Invoked on WATCHDOG_CHECK_INTERVAL_MS, independent of the main
+  // tick chain -- see that constant's doc comment for why.
+  checkWatchdog: () => void | Promise<void>;
   log: (message: string) => void;
 };
 
@@ -97,10 +122,15 @@ export type Scheduler = {
   // Test-visible: runs exactly one tick's logic directly, without waiting for
   // a real timer. Also used internally by the setTimeout chain.
   runTickNow(): Promise<void>;
+  // Test-visible: runs exactly one watchdog check directly, without waiting
+  // for the real WATCHDOG_CHECK_INTERVAL_MS timer. Also used internally by
+  // the watchdog's own self-rearming timer chain.
+  checkWatchdogNow(): Promise<void>;
 };
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   let timerHandle: SchedulerTimerHandle | null = null;
+  let watchdogTimerHandle: SchedulerTimerHandle | null = null;
   let cycleInFlight = false;
   // Defaults to "not stopped" so a directly-invoked runTickNow() (the
   // test-visible manual trigger, used without ever calling start()) still
@@ -114,6 +144,26 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     timerHandle = deps.setTimer(() => {
       void tick();
     }, intervalMinutes * 60_000);
+  }
+
+  function armWatchdog(): void {
+    if (stopped) return;
+    watchdogTimerHandle = deps.setTimer(() => {
+      void checkWatchdog();
+    }, WATCHDOG_CHECK_INTERVAL_MS);
+  }
+
+  async function checkWatchdog(): Promise<void> {
+    try {
+      await deps.checkWatchdog();
+    } catch (err) {
+      // Same defensive-backstop rationale as tick()'s own catch below: a bug
+      // in the watchdog check itself must never break the watchdog's own
+      // re-arm chain (that would silently disable the very thing meant to
+      // catch a stuck main loop).
+      deps.log(`[scheduler] Unexpected error in watchdog check: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    armWatchdog();
   }
 
   async function tick(): Promise<void> {
@@ -139,6 +189,17 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     cycleInFlight = true;
     try {
       const outcome = await deps.runScheduledCycle();
+      // Phase 2 Task 12: report the completed cycle BEFORE the failure-count/
+      // auto-pause branching below -- a FAILED cycle still completed (it did
+      // not fail to run), so the heartbeat counter and the watchdog's
+      // last-completed-at timestamp must advance regardless of outcome.failed.
+      // Isolated in its own try/catch: a bug in heartbeat/watchdog bookkeeping
+      // must never suppress the failure-count/auto-pause safety logic below it.
+      try {
+        await deps.onCycleCompleted(outcome);
+      } catch (err) {
+        deps.log(`[scheduler] Unexpected error in onCycleCompleted: ${err instanceof Error ? err.message : String(err)}`);
+      }
       if (outcome.failed) {
         const nextCount = deps.getConsecutiveFailureCount() + 1;
         deps.setConsecutiveFailureCount(nextCount);
@@ -169,6 +230,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     start() {
       stopped = false;
       armNext(resolveIntervalMinutes(deps.getIntervalMinutesRaw(), deps.log));
+      armWatchdog();
     },
     stop() {
       stopped = true;
@@ -176,7 +238,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         deps.clearTimer(timerHandle);
         timerHandle = null;
       }
+      if (watchdogTimerHandle !== null) {
+        deps.clearTimer(watchdogTimerHandle);
+        watchdogTimerHandle = null;
+      }
     },
     runTickNow: tick,
+    checkWatchdogNow: checkWatchdog,
   };
 }

@@ -191,9 +191,9 @@ supports it) so Phase 3 attribution can compare sources.
 *Deferred (do not build now):* Yellowbrick Road (candidate firehose — needs heavier filtering), Lead-Lag Report (regime input, not trade source — revisit after 1.3), ARK commentary.
 
 ### 2.5 Ops hardening
-- [ ] **Supervisor.** Dockerfile + restart policy (or systemd unit). Crash → auto-restart → startup reconciliation (2.2) → resume. **Crash-loop limit** (guardrail 9): after 3 restarts within 1 hour, stay down and alert instead of thrashing.
-  *Accept:* `kill -9` the process; it restarts and resumes the loop without manual action. Three rapid kills → stays down + alert.
-- [ ] **Heartbeat.** Telegram (or equivalent) heartbeat every N cycles + alert if a scheduled cycle is missed by >2× interval.
+- [x] **Supervisor.** Dockerfile + restart policy (or systemd unit). Crash → auto-restart → startup reconciliation (2.2) → resume. **Crash-loop limit** (guardrail 9): after 3 restarts within 1 hour, stay down and alert instead of thrashing.
+  *Accept:* `kill -9` the process; it restarts and resumes the loop without manual action. Three rapid kills → stays down + alert. (Dockerfile + docker-compose.yml + `src/server/crashLoopGuard.ts`; the kill -9 drills are operator-run — exact commands in `docs/OPS_RUNBOOK.md`.)
+- [x] **Heartbeat.** Telegram (or equivalent) heartbeat every N cycles + alert if a scheduled cycle is missed by >2× interval. (`src/server/heartbeat.ts` + scheduler watchdog timer; N=12, ~3h at the default 15-min interval.)
 - [ ] **SQLite backups.** Periodic `VACUUM INTO`/copy to a backups dir with retention; document restore.
   *Accept:* backup file exists after a cycle; restore drill documented in `docs/`.
 - [ ] **Outbound HTTP timeouts** on all fetches (Alpaca, Telegram, Anthropic) with bounded retry; **rate limiting + auth on read endpoints**; retire or fix the mock Google OAuth (`src/services/googleAuth.ts:19`) — remove the integration if unused.

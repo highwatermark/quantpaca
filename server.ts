@@ -55,7 +55,24 @@ import { checkAssetTradable } from "./src/server/tradabilityGuard";
 import { ReconciliationReport, RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
 import { EMPTY_SYNC_ALERT_STATE_KEY, EMPTY_SYNC_ALERT_WINDOW_MS, shouldSendThrottledAlert } from "./src/server/alertThrottle";
-import { createScheduler, MAX_BUYS_PER_CYCLE, MAX_CONSECUTIVE_FAILURES } from "./src/server/scheduler";
+import { createScheduler, resolveIntervalMinutes, MAX_BUYS_PER_CYCLE, MAX_CONSECUTIVE_FAILURES } from "./src/server/scheduler";
+import {
+  CRASH_LOOP_MAX_BOOTS,
+  CRASH_LOOP_WINDOW_MS,
+  CRASH_LOOP_STAY_DOWN_EXIT_CODE,
+  RESTART_HISTORY_APP_STATE_KEY,
+  CLEAN_SHUTDOWN_APP_STATE_KEY,
+  evaluateCrashLoopOnBoot,
+  parseRestartHistory,
+} from "./src/server/crashLoopGuard";
+import {
+  MISSED_CYCLE_ALERT_MULTIPLIER,
+  CYCLE_COUNT_APP_STATE_KEY,
+  LAST_CYCLE_COMPLETED_AT_APP_STATE_KEY,
+  WATCHDOG_ALERTED_GAP_START_APP_STATE_KEY,
+  shouldSendHeartbeat,
+  shouldAlertOverdueGap,
+} from "./src/server/heartbeat";
 import {
   buyGateRejectionReason,
   clearOrphans,
@@ -3829,6 +3846,109 @@ const scheduler = createScheduler({
       `🛑 <b>Auto-trading paused.</b> ${MAX_CONSECUTIVE_FAILURES} consecutive scheduled sync cycles failed. Trading stays paused until a human resumes (POST /api/config or the Telegram /resume command).`,
     );
   },
+  // Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5): heartbeat counter.
+  // Fires exactly once per ACTUALLY-RUN scheduled cycle (scheduler.ts never
+  // calls this for a tick skipped due to autoTrading-off/startup-
+  // reconciliation-pending/single-flight overlap). "Completed" counts a
+  // FAILED cycle too -- it still ran to completion, it just didn't succeed --
+  // same definition the pre-existing MAX_CONSECUTIVE_FAILURES counter above
+  // already uses one level up. No market-hours exception needed: a reduced
+  // cycle (market closed) still calls runScheduledCycle and still completes
+  // (see heartbeat.ts's MISSED_CYCLE_ALERT_MULTIPLIER doc comment).
+  onCycleCompleted: async () => {
+    let count = 0;
+    try {
+      const raw = productionStore.getAppState(CYCLE_COUNT_APP_STATE_KEY);
+      const parsed = raw === undefined ? NaN : Number(raw);
+      count = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    } catch (err) {
+      console.error("[heartbeat] Failed to read the persisted completed-cycle count; defaulting to 0.", err);
+    }
+    count += 1;
+    try {
+      productionStore.setAppState(CYCLE_COUNT_APP_STATE_KEY, String(count));
+      productionStore.setAppState(LAST_CYCLE_COMPLETED_AT_APP_STATE_KEY, String(Date.now()));
+    } catch (err) {
+      console.error("[heartbeat] Failed to persist the completed-cycle count / last-completed-at timestamp.", err);
+    }
+
+    if (!shouldSendHeartbeat(count)) return;
+
+    const regime = productionStore.latestRegimeAssessment();
+    let openPositions: number | "unknown" = "unknown";
+    try {
+      const portfolio = await getAlpacaPortfolio();
+      openPositions = Array.isArray(portfolio.positions) ? portfolio.positions.length : "unknown";
+    } catch (err) {
+      console.error("[heartbeat] Failed to fetch open positions for the heartbeat message; reporting unknown.", err);
+    }
+
+    // Heartbeat is informational, NOT throttled by the 6h empty-sync alert
+    // window (a separate channel class -- see alertThrottle.ts) -- it is
+    // inherently non-repeating already (gated on the cycle counter crossing
+    // a new multiple of HEARTBEAT_EVERY_N_CYCLES, not on elapsed time), so
+    // there is no throttle state to check. It IS delivery-gated in the sense
+    // that a failed/unconfigured send is only logged, never retried or
+    // thrown -- an unconfigured Telegram must never spin the scheduler loop.
+    const delivered = await sendTelegramAlert(
+      readDB().config?.telegram,
+      `💓 <b>Alive.</b> cycle ${count}, last regime ${regime?.marketMode ?? "unknown"}, open positions ${openPositions}.`,
+    );
+    if (!delivered) {
+      console.log(`[heartbeat] Telegram not configured or the send failed; heartbeat for cycle ${count} was not delivered (informational only, no retry).`);
+    }
+  },
+  // Phase 2 Task 12: missed-cycle watchdog. Invoked on scheduler.ts's own
+  // independent WATCHDOG_CHECK_INTERVAL_MS timer (not the main tick chain --
+  // see that constant's doc comment for why), so it can detect the main
+  // cycle chain itself being stuck/dead, not just a failing cycle.
+  checkWatchdog: async () => {
+    const autoTradingOn = Boolean(readDB().config?.system?.autoTrading);
+    if (!autoTradingOn) return;
+
+    let lastCycleCompletedAtMs: number | undefined;
+    try {
+      const raw = productionStore.getAppState(LAST_CYCLE_COMPLETED_AT_APP_STATE_KEY);
+      const parsed = raw === undefined ? NaN : Number(raw);
+      lastCycleCompletedAtMs = Number.isFinite(parsed) ? parsed : undefined;
+    } catch (err) {
+      console.error("[watchdog] Failed to read the last-completed-cycle timestamp; skipping this check.", err);
+      return;
+    }
+
+    const intervalMinutes = resolveIntervalMinutes(readDB().config?.system?.runIntervalMins, (m) => console.log(m));
+    const nowMs = Date.now();
+
+    let alreadyAlertedGapStartMs: number | undefined;
+    try {
+      const raw = productionStore.getAppState(WATCHDOG_ALERTED_GAP_START_APP_STATE_KEY);
+      const parsed = raw === undefined ? NaN : Number(raw);
+      alreadyAlertedGapStartMs = Number.isFinite(parsed) ? parsed : undefined;
+    } catch (err) {
+      console.error("[watchdog] Failed to read the already-alerted-gap marker; treating as no prior alert for this gap.", err);
+    }
+
+    if (!shouldAlertOverdueGap(lastCycleCompletedAtMs, nowMs, intervalMinutes, alreadyAlertedGapStartMs)) return;
+
+    const delivered = await sendTelegramAlert(
+      readDB().config?.telegram,
+      `⏰ <b>Scheduled cycle overdue.</b> No completed scheduled cycle in over ${MISSED_CYCLE_ALERT_MULTIPLIER}x the configured interval (${intervalMinutes}m). Last completed: ${lastCycleCompletedAtMs ? new Date(lastCycleCompletedAtMs).toISOString() : "never"}.`,
+    );
+    // Delivery-gated stamping (same pattern as the empty-sync alert throttle,
+    // Task 1, and onAutoPause above): only a DELIVERED alert stamps the gap
+    // as alerted. Stamping on a failed/unconfigured send would silently
+    // suppress the one alert that matters once Telegram comes back -- worse
+    // here than a time-based throttle, since an unstamped overdue gap stays
+    // overdue (and gets retried) until a human notices, rather than
+    // eventually re-opening on its own.
+    if (delivered) {
+      try {
+        productionStore.setAppState(WATCHDOG_ALERTED_GAP_START_APP_STATE_KEY, String(lastCycleCompletedAtMs));
+      } catch (err) {
+        console.error("[watchdog] Failed to persist the alerted-gap marker; may re-alert on the next check.", err);
+      }
+    }
+  },
   log: (message) => console.log(message),
 });
 
@@ -3900,8 +4020,127 @@ async function runStartupReconciliationForTests(): Promise<void> {
   await performStartupReconciliation();
 }
 
+// Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5, guardrail 9): the boot-time
+// crash-loop check. Pure decision logic lives in src/server/crashLoopGuard.ts;
+// this owns the app_state reads/writes and the Telegram alert. Standalone
+// (not inlined in run()) for the same reason as performStartupReconciliation
+// above: tests invoke exactly this, with the real store/Telegram plumbing,
+// without booting vite/the HTTP listener.
+//
+// Sequence per boot:
+//   1. Read + CLEAR the clean-shutdown marker (one marker excuses exactly one
+//      boot -- processGuards.ts writes it again on the next graceful shutdown).
+//   2. Read restart_history, prune entries older than CRASH_LOOP_WINDOW_MS,
+//      append this boot (unless excused by the marker), persist the pruned
+//      list back (bounded -- item 3 of the task brief).
+//   3. If CRASH_LOOP_MAX_BOOTS boots now sit inside the window: alert + tell
+//      the caller to stay down. run() then exits with
+//      CRASH_LOOP_STAY_DOWN_EXIT_CODE (0!) WITHOUT starting reconciliation,
+//      the scheduler, or the HTTP server -- see that constant's comment in
+//      crashLoopGuard.ts for why staying down REQUIRES a clean exit 0 under
+//      docker-compose's `restart: on-failure`.
+async function performCrashLoopBootCheck(): Promise<{ stayDown: boolean }> {
+  let hadCleanShutdownMarker = false;
+  try {
+    hadCleanShutdownMarker = Boolean(productionStore.getAppState(CLEAN_SHUTDOWN_APP_STATE_KEY));
+    if (hadCleanShutdownMarker) {
+      // Clear immediately (empty string = no marker; app_state has no
+      // delete): the marker excuses THIS boot only. If this boot then
+      // crashes, the next boot must count normally.
+      productionStore.setAppState(CLEAN_SHUTDOWN_APP_STATE_KEY, "");
+    }
+  } catch (err) {
+    // Fail toward "no marker" (this boot counts): an unreadable marker must
+    // not silently excuse boots from the crash window -- the marker is an
+    // optimization for operators, the window is the safety control.
+    console.error("[crash-loop] Failed to read/clear the clean-shutdown marker; treating this boot as counting toward the crash window.", err);
+    hadCleanShutdownMarker = false;
+  }
+
+  let priorHistory: number[] = [];
+  try {
+    priorHistory = parseRestartHistory(productionStore.getAppState(RESTART_HISTORY_APP_STATE_KEY));
+  } catch (err) {
+    // parseRestartHistory itself never throws; this catches a failed
+    // app_state READ. Fail open to an empty history (boot normally) -- see
+    // crashLoopGuard.ts's parseRestartHistory doc comment for why the
+    // breaker's own broken state must not stop the trading process.
+    console.error("[crash-loop] Failed to read restart_history; treating as empty (boots normally).", err);
+  }
+
+  const decision = evaluateCrashLoopOnBoot(priorHistory, Date.now(), hadCleanShutdownMarker);
+
+  try {
+    productionStore.setAppState(RESTART_HISTORY_APP_STATE_KEY, JSON.stringify(decision.prunedHistory));
+  } catch (err) {
+    console.error("[crash-loop] Failed to persist restart_history; the next boot may undercount restarts.", err);
+  }
+
+  if (decision.crashLoopDetected) {
+    console.error(
+      `[crash-loop] ${decision.prunedHistory.length} boots within ${CRASH_LOOP_WINDOW_MS / 60_000} minutes (limit ${CRASH_LOOP_MAX_BOOTS}, guardrail 9). Staying down instead of thrashing; a human must restart deliberately (docker compose up -d). Positions remain protected by broker-native bracket orders.`,
+    );
+    // Unthrottled and delivery-gated only in the weak sense (a failed send is
+    // logged, never retried -- the process is about to exit either way). No
+    // throttle stamp to write: staying down IS the repeat-suppression.
+    const delivered = await sendTelegramAlert(
+      readDB().config?.telegram,
+      `🔁🛑 <b>Crash loop detected; staying down.</b> ${decision.prunedHistory.length} boots within 1 hour (limit ${CRASH_LOOP_MAX_BOOTS}). The process will NOT restart on its own (guardrail 9) -- investigate, then restart deliberately. Positions remain broker-protected by their bracket orders.`,
+    );
+    if (!delivered) {
+      console.error("[crash-loop] Telegram alert could not be delivered (unconfigured or send failed); the log line above is the only signal.");
+    }
+    try {
+      productionStore.appendAuditEvents([{
+        id: `ae-crash-loop-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        type: "config",
+        actor: "crash_loop_guard",
+        message: `Crash loop detected: ${decision.prunedHistory.length} boots within 1 hour (limit ${CRASH_LOOP_MAX_BOOTS}). Staying down without starting the scheduler or HTTP server.`,
+        details: { bootTimestamps: decision.prunedHistory },
+      }]);
+    } catch (err) {
+      console.error("[crash-loop] Failed to append the crash-loop audit event.", err);
+    }
+  }
+
+  return { stayDown: decision.crashLoopDetected };
+}
+
+// Test-visible manual trigger (same rationale as runScheduledSyncTickForTests
+// above): runs exactly the real boot-time crash-loop check on demand, without
+// run() (which NODE_ENV=test never calls, and which would process.exit).
+async function runCrashLoopBootCheckForTests(): Promise<{ stayDown: boolean }> {
+  return performCrashLoopBootCheck();
+}
+
+// Test-visible manual trigger for the missed-cycle watchdog check (Phase 2
+// Task 12): runs exactly one watchdog check directly, without waiting for the
+// real WATCHDOG_CHECK_INTERVAL_MS timer (which only start() arms).
+async function runWatchdogCheckForTests(): Promise<void> {
+  await scheduler.checkWatchdogNow();
+}
+
 // Dev support or vite mounting
 async function run() {
+  // Phase 2 Task 12 (guardrail 9): the crash-loop check runs FIRST -- before
+  // env validation, startup reconciliation, vite, the HTTP listener, the
+  // scheduler. A crash-looping process must do the absolute minimum before
+  // deciding whether it is allowed to keep booting (and a fatal-env crash
+  // loop is still a crash loop -- each of those boots counts too, because
+  // this check precedes the validateStartupEnv exit below).
+  const crashLoopCheck = await performCrashLoopBootCheck();
+  if (crashLoopCheck.stayDown) {
+    // MUST exit 0 (CRASH_LOOP_STAY_DOWN_EXIT_CODE): docker-compose's
+    // `restart: on-failure` restarts ANY non-zero exit, so a distinct
+    // failure code (the brief's example 86) would be restarted forever and
+    // guardrail 9 would never actually keep the process down. A clean exit
+    // is the only "stay down" Docker understands under on-failure; the
+    // Telegram alert sent above is the operator's signal. Full reasoning on
+    // the constant in src/server/crashLoopGuard.ts.
+    process.exit(CRASH_LOOP_STAY_DOWN_EXIT_CODE);
+  }
+
   const startupIssues = validateStartupEnv(process.env);
   for (const issue of startupIssues) {
     const log = issue.level === "fatal" ? console.error : console.warn;
@@ -3947,10 +4186,27 @@ async function run() {
     exit: (code) => process.exit(code),
     closeServer: (onClosed) => httpServer.close(onClosed),
     stopScheduler: () => scheduler.stop(),
+    // Phase 2 Task 12 (guardrail 9): a graceful SIGTERM/SIGINT shutdown
+    // stamps the clean-shutdown marker so the NEXT boot's crash-loop check
+    // (performCrashLoopBootCheck above) knows it wasn't a crash-recovery
+    // boot. Synchronous SQLite write -- safe inside the shutdown path. NOT
+    // written on uncaughtException/unhandledRejection (processGuards.ts
+    // never calls this dep from those handlers): crashes must keep counting.
+    markCleanShutdown: () => {
+      try {
+        productionStore.setAppState(CLEAN_SHUTDOWN_APP_STATE_KEY, new Date().toISOString());
+      } catch (err) {
+        // Fail toward "counts as a crash": the next boot will add to the
+        // crash window unnecessarily, which at worst makes the breaker MORE
+        // eager -- never less. Log so an operator can explain a surprising
+        // stay-down after repeated clean restarts.
+        console.error("[shutdown] Failed to persist the clean-shutdown marker; the next boot will count toward the crash-loop window.", err);
+      }
+    },
   });
 }
 
-export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests, runStartupReconciliationForTests };
+export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests, runStartupReconciliationForTests, runCrashLoopBootCheckForTests, runWatchdogCheckForTests };
 
 if (process.env.NODE_ENV !== "test") {
   run();
