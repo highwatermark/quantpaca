@@ -5,6 +5,24 @@ import { AuditEvent, BROKER_SUCCESS_TRADE_STATUSES, ExitPlan, PipelineTrade, Tra
 import { ReconciliationReport, RegimeAssessment, ReviewedSignal, SizedTradeIntent } from "./domainTypes";
 import { normalizeStance } from "./bearishMapping";
 import { CrossSourceSignal } from "./crossSourceConfirmation";
+import { AppConfig, StockAnalysis, SyncLog, Trade } from "../types";
+
+// Phase 2 Task 14 (docs/GO_LIVE_PLAN.md Phase 2.5, "Store consolidation"):
+// operational state that used to live in the atomic-JSON db.json file --
+// config, sync logs, analyses, the legacy UI trades list, and the offline
+// simulated portfolio -- now lives here, in SQLite, alongside every other
+// piece of durable state this store already owns. db.json is frozen legacy
+// state after the one-time migration (src/server/appStore.ts); nothing in
+// this codebase writes it anymore. `SYNC_LOG_RETENTION` bounds sync_logs to
+// the newest N rows, pruned opportunistically on every write (same pattern
+// as saveCooldown's opportunistic DELETE above) -- the old db.json array had
+// no such bound and grew forever.
+export const SYNC_LOG_RETENTION = 5000;
+
+// Single-row-table id used by both `config` and `simulated_portfolio` below --
+// there is only ever one current config and one current simulated portfolio,
+// same "singleton row" shape SQLite's CHECK (id = 1) enforces.
+const SINGLETON_ROW_ID = 1;
 
 type DatabaseSync = {
   exec(sql: string): void;
@@ -162,6 +180,34 @@ export type ProductionStore = {
   // catching it -- this method itself does not swallow errors.
   backupTo(destPath: string): void;
   close(): void;
+
+  // Phase 2 Task 14 (store consolidation): the five db.json state classes,
+  // now backed by SQLite. `getConfig`/`getSimulatedPortfolio` return
+  // undefined when no row has ever been written (first boot, pre-migration)
+  // -- callers (src/server/appStore.ts) are expected to substitute their own
+  // conservative defaults, same "undefined means never written" contract as
+  // getAppState above. `setConfig` is a full replace (versioned internally --
+  // see the `config` table's `version` column -- for future schema-evolution
+  // disclosure; the version is not currently read back by any caller).
+  getConfig(): AppConfig | undefined;
+  setConfig(config: AppConfig): void;
+  // Appends one sync-log row and opportunistically prunes the table back
+  // down to SYNC_LOG_RETENTION rows (newest by timestamp, ties broken by
+  // insertion order) -- same "prune on the write path we already have open"
+  // pattern as saveCooldown/saveThesisInvalidation/saveDoNotBuy above.
+  addSyncLog(log: SyncLog): void;
+  listSyncLogs(limit?: number): SyncLog[];
+  // analyses/ui_trades are plain append+list JSON-payload tables (Task 14
+  // brief: "mirroring current shapes") -- unbounded, same as the arrays they
+  // replace; `saveTradeIntent`'s deduped SQLite trade_intents table above
+  // remains the reconciliation source of truth, this is purely the legacy
+  // per-attempt UI history.
+  appendAnalysis(analysis: StockAnalysis): void;
+  listAnalyses(limit?: number): StockAnalysis[];
+  appendUiTrade(trade: Trade): void;
+  listUiTrades(limit?: number): Trade[];
+  getSimulatedPortfolio(): (Record<string, unknown> & { positions: unknown[] }) | undefined;
+  setSimulatedPortfolio(portfolio: Record<string, unknown> & { positions: unknown[] }): void;
 };
 
 export function createProductionStore(dbPath = path.join(process.cwd(), "data", "quantpaca.sqlite")): ProductionStore {
@@ -248,6 +294,36 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       expires_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL,
+      payload_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sync_logs (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      level TEXT NOT NULL,
+      message TEXT NOT NULL,
+      details TEXT,
+      payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS analyses (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ui_trades (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS simulated_portfolio (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      payload_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sync_logs_timestamp ON sync_logs(timestamp);
   `);
 
   // Backfill-safe migration: databases created before this column existed won't
@@ -496,6 +572,69 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     setAppState(key, value) {
       db.prepare("INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)")
         .run(key, value, new Date().toISOString());
+    },
+    getConfig() {
+      const row = db.prepare("SELECT payload_json FROM config WHERE id = ?").get(SINGLETON_ROW_ID);
+      return row ? (JSON.parse(String(row.payload_json)) as AppConfig) : undefined;
+    },
+    setConfig(config) {
+      const existing = db.prepare("SELECT version FROM config WHERE id = ?").get(SINGLETON_ROW_ID);
+      const nextVersion = existing ? Number(existing.version) + 1 : 1;
+      db.prepare("INSERT OR REPLACE INTO config (id, version, payload_json, updated_at) VALUES (?, ?, ?, ?)")
+        .run(SINGLETON_ROW_ID, nextVersion, JSON.stringify(config), new Date().toISOString());
+    },
+    addSyncLog(log) {
+      db.prepare(`
+        INSERT OR REPLACE INTO sync_logs (id, timestamp, level, message, details, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(log.id, log.timestamp, log.type, log.message, log.details ?? null, JSON.stringify(log));
+      // Opportunistic prune (same pattern as saveCooldown's delete-on-write
+      // above): keep only the newest SYNC_LOG_RETENTION rows, ordered by
+      // timestamp with the implicit rowid as an insertion-order tiebreak for
+      // same-millisecond writes (a single sync cycle can log several lines
+      // within one JS event-loop tick). Cheap COUNT(*) guard first -- a sync
+      // cycle logs a few dozen lines at a time, so most calls are well under
+      // the retention cap and should skip the DELETE/subquery entirely rather
+      // than re-sorting the whole table on every single log line.
+      const { count } = db.prepare("SELECT COUNT(*) AS count FROM sync_logs").get() as { count: number };
+      if (Number(count) > SYNC_LOG_RETENTION) {
+        db.exec(`
+          DELETE FROM sync_logs WHERE id NOT IN (
+            SELECT id FROM sync_logs ORDER BY timestamp DESC, rowid DESC LIMIT ${SYNC_LOG_RETENTION}
+          )
+        `);
+      }
+    },
+    listSyncLogs(limit = SYNC_LOG_RETENTION) {
+      return rowsToPayloads<SyncLog>(
+        db.prepare("SELECT payload_json FROM sync_logs ORDER BY timestamp DESC, rowid DESC LIMIT ?").all(limit),
+      );
+    },
+    appendAnalysis(analysis) {
+      db.prepare("INSERT OR REPLACE INTO analyses (id, timestamp, payload_json) VALUES (?, ?, ?)")
+        .run(analysis.id, analysis.timestamp, JSON.stringify(analysis));
+    },
+    listAnalyses(limit = 10000) {
+      return rowsToPayloads<StockAnalysis>(
+        db.prepare("SELECT payload_json FROM analyses ORDER BY timestamp DESC, rowid DESC LIMIT ?").all(limit),
+      );
+    },
+    appendUiTrade(trade) {
+      db.prepare("INSERT OR REPLACE INTO ui_trades (id, timestamp, payload_json) VALUES (?, ?, ?)")
+        .run(trade.id, trade.timestamp, JSON.stringify(trade));
+    },
+    listUiTrades(limit = 10000) {
+      return rowsToPayloads<Trade>(
+        db.prepare("SELECT payload_json FROM ui_trades ORDER BY timestamp DESC, rowid DESC LIMIT ?").all(limit),
+      );
+    },
+    getSimulatedPortfolio() {
+      const row = db.prepare("SELECT payload_json FROM simulated_portfolio WHERE id = ?").get(SINGLETON_ROW_ID);
+      return row ? (JSON.parse(String(row.payload_json)) as Record<string, unknown> & { positions: unknown[] }) : undefined;
+    },
+    setSimulatedPortfolio(portfolio) {
+      db.prepare("INSERT OR REPLACE INTO simulated_portfolio (id, payload_json, updated_at) VALUES (?, ?, ?)")
+        .run(SINGLETON_ROW_ID, JSON.stringify(portfolio), new Date().toISOString());
     },
     backupTo(destPath) {
       // node:sqlite's exec() takes a raw SQL string (no parameter binding for
