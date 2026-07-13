@@ -2073,6 +2073,25 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
       reducedCycle = marketKnownClosed;
     }
 
+    // Phase 2 final review, finding I2: guardrail 7's cycle-failure signal
+    // (below, near `failed`) previously only ever looked at ingestion source
+    // errors (Gmail/YouTube) -- a broker that is hard-down (account/positions
+    // fetch failing, or every order submission this cycle coming back
+    // BrokerFailed) never counted, so the scheduler would retry against a
+    // dead broker forever without ever reaching MAX_CONSECUTIVE_FAILURES.
+    // Set true below by MODULE 1.6 (position reconciliation) when the
+    // account/positions fetch itself fails, and/or by the BUY/SELL
+    // order-placement loops when every order submission that reached the
+    // broker this cycle came back BrokerFailed. Additive: does not change
+    // the ingestion-failure semantics `allAttemptedSourcesErrored` already
+    // encodes, only ORs a second, independent way a cycle can be "failed".
+    let brokerConnectivityFailed = false;
+    // Every trade status this cycle's BUY/SELL submissions produced, so the
+    // final `failed` computation can ask "did every order that reached the
+    // broker this cycle come back BrokerFailed" without threading a second
+    // signal through each individual call site.
+    const brokerSubmissionStatusesThisCycle: string[] = [];
+
     // ==========================================================
     // MODULE 1: OUTBOX RESILIENT SYNCHRONIZER QUEUE Retrying Failed Integrations
     // ==========================================================
@@ -2215,6 +2234,11 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
       } else {
         const reconciliationFetch = await fetchAccountAndPositionsForReconciliation(reconciliationBrokerConfig);
         if (reconciliationFetch.ok === false) {
+          // Finding I2: this is NOT drift (the latch/comparison logic above
+          // is unchanged), but it IS a broker-connectivity signal -- the
+          // account/positions endpoints themselves are unreachable, distinct
+          // from "no ingestion source produced anything this cycle."
+          brokerConnectivityFailed = true;
           addLog(
             "error",
             "Position reconciliation skipped: Alpaca account/positions fetch failed. Absence of data is not drift; latch state left unchanged.",
@@ -2602,6 +2626,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             },
             marketKnownClosed,
           });
+          brokerSubmissionStatusesThisCycle.push(liquidationTrade.status);
           Object.assign(liquidationTrade, {
             symbol: pos.symbol,
             qty: sellQty,
@@ -3423,6 +3448,7 @@ For "stance", classify the source's own directional call on the ticker into exac
                 maxNotional: maxPositionValue,
                 marketKnownClosed,
               });
+              brokerSubmissionStatusesThisCycle.push(newTrade.status);
 
               // Notify channels
               const tgMsg = `🚨 <b>ZipTrader Automation: BUY INTENT ${newTrade.status}</b>\n<b>Ticker:</b> ${newTrade.symbol}\n<b>Quantity:</b> ${newTrade.qty}\n<b>Price:</b> $${newTrade.price}\n<b>Thesis Log:</b> ${newTrade.reasoning}`;
@@ -3541,6 +3567,7 @@ For "stance", classify the source's own directional call on the ticker into exac
               },
               marketKnownClosed,
             });
+            brokerSubmissionStatusesThisCycle.push(newTrade.status);
 
             const tgMsg = `🚨 <b>ZipTrader Automation: SELL INTENT ${newTrade.status}</b>\n<b>Ticker:</b> ${newTrade.symbol}\n<b>Quantity:</b> ${newTrade.qty}\n<b>Price:</b> $${newTrade.price}\n<b>Reasoning:</b> ${newTrade.reasoning}`;
             newTrade.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgMsg);
@@ -3581,7 +3608,24 @@ For "stance", classify the source's own directional call on the ticker into exac
   // below) can fail a reduced cycle.
   const anySourceAttempted = gmailAttempted || youtubeAttempted;
   const allAttemptedSourcesErrored = (!gmailAttempted || gmailErrored) && (!youtubeAttempted || youtubeErrored);
-  const failed = !reducedCycle && anySourceAttempted && allAttemptedSourcesErrored;
+  const ingestionFailed = !reducedCycle && anySourceAttempted && allAttemptedSourcesErrored;
+  // Finding I2 (docs/GO_LIVE_PLAN.md guardrail 7): additive broker-
+  // connectivity signal, ORed into the same `failed` guardrail 7 already
+  // feeds into the scheduler's MAX_CONSECUTIVE_FAILURES auto-pause --
+  // ingestion-failure semantics above are unchanged. A cycle also counts as
+  // failed when the broker itself was unreachable this cycle: the position-
+  // reconciliation account/positions fetch failed (brokerConnectivityFailed,
+  // set above, MODULE 1.6), or every order submission that actually reached
+  // the broker this cycle came back BrokerFailed. The latter is deliberately
+  // scoped to submissions that reached the broker at all
+  // (brokerSubmissionStatusesThisCycle is only ever pushed to by an
+  // executeTradeIntent call, never for a cycle that placed zero orders) --
+  // zero orders this cycle is not a broker-connectivity signal one way or
+  // the other.
+  const allBrokerSubmissionsFailed =
+    brokerSubmissionStatusesThisCycle.length > 0 &&
+    brokerSubmissionStatusesThisCycle.every((status) => status === "BrokerFailed");
+  const failed = ingestionFailed || brokerConnectivityFailed || allBrokerSubmissionsFailed;
   return { ok: true, trigger, analyses: parsedAnalyses, logs, failed };
   } catch (err: any) {
     console.error("Critical error in /api/sync:", err);
