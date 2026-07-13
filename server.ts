@@ -85,6 +85,7 @@ import {
 import { BackupDeps, runBackup, shouldRunScheduledBackup } from "./src/server/backupEngine";
 import { fetchWithTimeout } from "./src/server/httpDefaults";
 import { createRateLimitMiddleware } from "./src/server/rateLimiter";
+import { AppStore, createAppStore, DBJSON_MIGRATED_AT_APP_STATE_KEY, migrateDbJsonIfNeeded, SimulatedPortfolio } from "./src/server/appStore";
 
 dotenv.config();
 
@@ -101,48 +102,33 @@ app.use(express.json());
 app.use("/api", createRateLimitMiddleware());
 
 const DATA_DIR = process.env.QUANTPACA_DATA_DIR || path.join(process.cwd(), "data");
+// Phase 2 Task 14 (docs/GO_LIVE_PLAN.md Phase 2.5, "Store consolidation"):
+// db.json is frozen legacy state -- read exactly once, at boot, by the
+// one-time migration below (migrateDbJsonIfNeeded), and never written again.
+// It is deliberately NOT deleted (conservative migration; see
+// docs/OPS_RUNBOOK.md). DB_PATH stays a module constant because
+// backupEngine.ts's best-effort backup copy (Task 13) and the migration both
+// still need to know where it lives on disk.
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const productionStore = createProductionStore(path.join(DATA_DIR, "quantpaca.sqlite"));
+// Store facade (src/server/appStore.ts) -- replaces the old atomic-JSON
+// read/write db.json pair everywhere in this file. Owns the config
+// read-modify-write mutex internally (see appStore.ts's doc comment); every
+// OTHER call site in this file that needs to compose several appStore calls
+// into one larger critical section still acquires appStore.acquire() itself
+// first, same acquire/read/.../write/release pattern the old db.json mutex
+// call sites used.
+const appStore: AppStore = createAppStore(productionStore);
 // Phase 2 Task 8 (docs/GO_LIVE_PLAN.md Phase 2.4): the signal-source registry
-// lives alongside the rest of this app's data (same DATA_DIR as db.json/the
-// sqlite file), not a new env var -- it's config DATA, edited by operators,
-// not a deploy-time setting. sourceRegistry.ts creates it with the default
+// lives alongside the rest of this app's data (same DATA_DIR as the sqlite
+// file), not a new env var -- it's config DATA, edited by operators, not a
+// deploy-time setting. sourceRegistry.ts creates it with the default
 // ZipTrader-only source on first read if it's absent (migration-safe).
 const SOURCE_REGISTRY_PATH = path.join(DATA_DIR, "signal-sources.json");
 // Phase 2 Task 13 (docs/GO_LIVE_PLAN.md Phase 2.5): SQLite backups land here,
 // same DATA_DIR convention as everything else -- survives container
 // replacement via the same volume mount documented in docs/OPS_RUNBOOK.md.
 const BACKUPS_DIR = path.join(DATA_DIR, "backups");
-
-// Simple queue-based lock to serialize all operations that read or write to DB
-class DBConcurrencyMutex {
-  private queue: (() => void)[] = [];
-  private locked = false;
-
-  acquire(): Promise<() => void> {
-    return new Promise((resolve) => {
-      const release = () => {
-        if (this.queue.length > 0) {
-          const next = this.queue.shift();
-          next?.();
-        } else {
-          this.locked = false;
-        }
-      };
-
-      if (!this.locked) {
-        this.locked = true;
-        resolve(release);
-      } else {
-        this.queue.push(() => {
-          resolve(release);
-        });
-      }
-    });
-  }
-}
-
-const dbMutex = new DBConcurrencyMutex();
 
 // Risk limits load ONCE at module scope (not inside run()) so that test imports of
 // server.ts also get valid limits. See docs/LOOP_ARCHITECTURE.md "Structural
@@ -203,9 +189,13 @@ const BROKER_REACHED_TRADE_STATUSES = new Set([
 
 const getBrokerConfig = () => buildBrokerConfigFromEnv(process.env);
 
-function appendAuditEvents(db: any, events: AuditEvent[]) {
-  db.auditEvents = db.auditEvents || [];
-  db.auditEvents.push(...events);
+// Phase 2 Task 14: this used to ALSO push onto the legacy db.json
+// `auditEvents` array (db.auditEvents.push(...)) -- removed. SQLite's
+// audit_events table (productionStore.appendAuditEvents, below) was already
+// written unconditionally on every call, so it was always a full mirror; the
+// db.json copy was 100% redundant. GET /api/audit already reads straight
+// from productionStore.listAuditEvents().
+function appendAuditEvents(events: AuditEvent[]) {
   productionStore.appendAuditEvents(events);
 }
 
@@ -404,7 +394,6 @@ async function alertOnSourceRegistryIssues(config: AppConfig, issues: SourceRegi
 }
 
 async function executeTradeIntent(input: {
-  db: any;
   config: AppConfig;
   request: TradeRequest;
   maxNotional?: number;
@@ -445,7 +434,7 @@ async function executeTradeIntent(input: {
   const toPersist = { ...breakerState, latch: latchResult.latchState };
   productionStore.saveBreakerState(toPersist);
   if (latchResult.event !== "none") {
-    appendAuditEvents(input.db, [
+    appendAuditEvents([
       breakerLatchAuditEvent({
         event: latchResult.event,
         corrupt: latchResult.corrupt,
@@ -576,7 +565,7 @@ async function executeTradeIntent(input: {
               ? breakerState.metrics.equity - lastEquityForDaily
               : Number.NaN;
           })(),
-          dailyTradeCount: (input.db.trades || []).filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
+          dailyTradeCount: appStore.listTrades().filter((trade: any) => String(trade.timestamp || "").startsWith(new Date().toISOString().slice(0, 10))).length,
           openPositionCount: portfolioAssessment.positions.length,
           // Phase 2 Task 3 (PDT guard): threaded straight from the account
           // snapshot fetched above (portfolio.equity / portfolio.daytrade_count
@@ -673,7 +662,7 @@ async function executeTradeIntent(input: {
     });
   }
 
-  appendAuditEvents(input.db, result.auditEvents);
+  appendAuditEvents(result.auditEvents);
   productionStore.saveTradeIntent(result.trade);
   if (result.trade.riskDecision) productionStore.saveRiskDecision(result.trade.id, result.trade.riskDecision);
   // Only persist the exit plan when the order actually reached the broker
@@ -709,13 +698,13 @@ async function executeTradeIntent(input: {
 // applyBreakerLatch(fresh, null) starts from "no latch" exactly like a first-ever
 // evaluation, so if thresholds are STILL breached right now, it re-trips (and
 // re-latches) immediately. Caller supplies `actor` for the audit trail (e.g.
-// "admin_api" or "telegram:<userId>") and is responsible for NOT holding dbMutex
-// already -- this acquires it itself (broker calls must not happen while already
-// holding the lock; see handleTelegramCommand's read-only-reply comment below).
+// "admin_api" or "telegram:<userId>") and is responsible for NOT already
+// holding appStore's lock -- this acquires it itself (broker calls must not
+// happen while already holding the lock; see handleTelegramCommand's
+// read-only-reply comment below).
 async function performBreakerReset(actor: string): Promise<{ status: BreakerState["status"]; reTripped: boolean }> {
-  const release = await dbMutex.acquire();
+  const release = await appStore.acquire();
   try {
-    const db = readDB();
     const brokerConfig = getBrokerConfig();
     const portfolio = await getAlpacaPortfolio(brokerConfig);
     const previousBreaker = productionStore.latestBreakerState<PreviousBreakerRecord>();
@@ -743,77 +732,10 @@ async function performBreakerReset(actor: string): Promise<{ status: BreakerStat
         reasons: freshBreaker.reasons,
       },
     };
-    appendAuditEvents(db, [auditEvent]);
-    writeDB(db);
+    appendAuditEvents([auditEvent]);
     return { status: latchResult.effective.status, reTripped };
   } finally {
     release();
-  }
-}
-
-function defaultDB() {
-  return {
-    config: {
-      alpaca: { apiKeyId: "", secretKey: "", paper: true },
-      notion: { token: "", databaseId: "" },
-      telegram: { botToken: "", chatId: "", enabled: false },
-      google: { spreadsheetId: "", enabled: false },
-      system: {
-        autoTrading: false,
-        runIntervalMins: 15,
-        maxPositionSizePercent: 10,
-        stopLossPercent: 5,
-        targetProfitPercent: 15,
-      },
-    },
-    analyses: [],
-    trades: [],
-    syncLogs: [],
-    auditEvents: [],
-    simulatedPortfolio: {
-      cash: "100000.00",
-      buying_power: "100000.00",
-      portfolio_value: "100000.00",
-      equity: "100000.00",
-      long_market_value: "0.00",
-      daytrade_count: 0,
-      positions: [],
-    },
-  };
-}
-
-// Cache values or helper functions to read and write db
-function readDB() {
-  try {
-    if (!fs.existsSync(DB_PATH)) {
-      // Ensure directory exists
-      fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-      return defaultDB();
-    }
-    const data = fs.readFileSync(DB_PATH, "utf8");
-    const parsed = JSON.parse(data);
-    return { ...defaultDB(), ...parsed, config: { ...defaultDB().config, ...(parsed.config || {}) } };
-  } catch (error) {
-    console.error("Error reading database:", error);
-    return defaultDB();
-  }
-}
-
-function writeDB(data: any) {
-  try {
-    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-    // Atomic Write Sequence: write to temporary file first then rename atomically
-    const tempPath = DB_PATH + ".tmp";
-    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), "utf8");
-    fs.renameSync(tempPath, DB_PATH);
-  } catch (error) {
-    console.error("Critical: Error writing database atomically:", error);
-    // Safe fallback to direct write to prevent data loss
-    try {
-      fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf8");
-    } catch (fallbackError) {
-      console.error("Emergency fallback write database failed:", fallbackError);
-    }
   }
 }
 
@@ -857,8 +779,7 @@ const claudeText = (response: Anthropic.Message): string =>
 async function getAlpacaPortfolio(brokerConfig: BrokerConfig = getBrokerConfig()) {
   if (!brokerConfig.configured) {
     // If not configured, retrieve our realistic simulated portfolio
-    const db = readDB();
-    return db.simulatedPortfolio || { cash: "100000.00", portfolio_value: "100000.00", positions: [] };
+    return appStore.getSimulatedPortfolio();
   }
 
   const headers = {
@@ -1083,7 +1004,6 @@ async function cancelAlpacaOrder(brokerConfig: BrokerConfig, orderId: string): P
 //    proceeds (nothing left to cancel); if it's still live (or the re-poll
 //    itself fails), this fails closed exactly as before Task 5.
 async function cancelBracketLegsBeforeSell(input: {
-  db: any;
   symbol: string;
   // For the audit trail: which sell path is asking (e.g. "exit_monitor",
   // "emergency_close", "manual_override").
@@ -1093,7 +1013,7 @@ async function cancelBracketLegsBeforeSell(input: {
   if (!brokerConfig.configured) return { ok: true, canceledCount: 0, reason: "" };
 
   const auditNote = (message: string, details: Record<string, unknown>) => {
-    appendAuditEvents(input.db, [{
+    appendAuditEvents([{
       id: `ae-bracket-cancel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       timestamp: new Date().toISOString(),
       type: "broker",
@@ -1169,7 +1089,7 @@ async function cancelBracketLegsBeforeSell(input: {
             console.error(`[bracket-cancel] Failed to persist re-polled leg state for ${legId} (${input.symbol}).`, saveErr);
           }
           if (outcome.auditEvents.length) {
-            appendAuditEvents(input.db, outcome.auditEvents.map((event) => ({
+            appendAuditEvents(outcome.auditEvents.map((event) => ({
               id: `ae-bracket-repoll-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               timestamp: new Date().toISOString(),
               actor: input.actor,
@@ -1446,9 +1366,8 @@ async function handleTelegramCommand(update: any) {
   // second of the task's two required reset paths and must actually execute.
   let confirmedBreakerReset = false;
 
-  const release = await dbMutex.acquire();
+  const release = await appStore.acquire();
   try {
-    const db = readDB();
     const auditEvent: AuditEvent = {
       id: `tg-${update.update_id || Date.now()}`,
       timestamp: new Date().toISOString(),
@@ -1457,7 +1376,7 @@ async function handleTelegramCommand(update: any) {
       message: `Telegram command ${command} ${auth.allowed ? "accepted" : "rejected"}`,
       details: { command, chatId, auth },
     };
-    appendAuditEvents(db, [auditEvent]);
+    appendAuditEvents([auditEvent]);
 
     if (!auth.allowed) {
       outbound.push(`Rejected: ${auth.reason || "unauthorized"}.`);
@@ -1490,23 +1409,23 @@ async function handleTelegramCommand(update: any) {
       pendingTelegramConfirmations.set(token.token, token);
       outbound.push(`Breaker reset requires confirmation. Reply: /confirm ${token.token}`);
     } else if (command === "/pause" || command === "/block_buys") {
-      db.config.system.autoTrading = false;
+      const config = appStore.getConfig();
+      appStore.setConfig({ ...config, system: { ...config.system, autoTrading: false } });
       outbound.push("Auto trading paused. New buys are blocked.");
     } else if (command === "/resume") {
-      db.config.system.autoTrading = true;
+      const config = appStore.getConfig();
+      appStore.setConfig({ ...config, system: { ...config.system, autoTrading: true } });
       outbound.push("Auto trading resumed subject to risk checks.");
     } else {
       needsReadOnlyReply = true;
     }
-
-    writeDB(db);
   } finally {
     release();
   }
 
   if (confirmedBreakerReset) {
     // Admin reset path 2 of 2 (Task 10). Runs after the lock above is released;
-    // performBreakerReset re-acquires dbMutex itself around the actual state change.
+    // performBreakerReset re-acquires appStore's lock itself around the actual state change.
     const result = await performBreakerReset(`telegram:${userId}`);
     outbound.push(`Breaker reset executed. Status: ${result.status}${result.reTripped ? " (still breached — re-latched)" : ""}.`);
   }
@@ -1646,45 +1565,38 @@ async function saveToNotionDatabase(config: AppConfig["notion"], analysis: Stock
 
 // Config Endpoints
 app.get("/api/config", requireReadToken, (req, res) => {
-  const db = readDB();
-  res.json(redactConfigForClient(db.config));
+  res.json(redactConfigForClient(appStore.getConfig()));
 });
 
 app.post("/api/config", requireAdminCommand, async (req, res) => {
-  const release = await dbMutex.acquire();
   try {
-    const db = readDB();
-    db.config = stripPersistedSecrets({ ...db.config, ...req.body });
-    writeDB(db);
-    res.json({ success: true, config: redactConfigForClient(db.config) });
+    const config = await appStore.updateConfig((current) => stripPersistedSecrets({ ...current, ...req.body }) as AppConfig);
+    res.json({ success: true, config: redactConfigForClient(config) });
   } catch (error) {
     console.error("Config update failed:", error);
     res.status(500).json({ error: "Failed to update configuration." });
-  } finally {
-    release();
   }
 });
 
 // Logs, Trades, Analyses
 app.get("/api/analyses", requireReadToken, (req, res) => {
-  const db = readDB();
-  res.json(db.analyses || []);
+  res.json(appStore.listAnalyses());
 });
 
 app.get("/api/trades", requireReadToken, (req, res) => {
-  const db = readDB();
-  res.json(db.trades || []);
+  res.json(appStore.listTrades());
 });
 
 app.get("/api/logs", requireReadToken, (req, res) => {
-  const db = readDB();
-  res.json(db.syncLogs || []);
+  res.json(appStore.getLogs());
 });
 
 app.get("/api/audit", requireReadToken, (req, res) => {
-  const db = readDB();
-  const persisted = productionStore.listAuditEvents();
-  res.json(persisted.length ? persisted : (db.auditEvents || []));
+  // Phase 2 Task 14: the legacy db.json `auditEvents` fallback is gone --
+  // productionStore.appendAuditEvents was already called unconditionally on
+  // every appendAuditEvents(...) call site, so SQLite's audit_events table
+  // was always a full mirror (see appendAuditEvents's doc comment above).
+  res.json(productionStore.listAuditEvents());
 });
 
 app.get("/api/regime/latest", requireReadToken, (req, res) => {
@@ -1731,13 +1643,12 @@ app.get("/api/portfolio/assessment", requireReadToken, async (req, res) => {
 });
 
 app.get("/api/signals/reviewed", requireReadToken, (req, res) => {
-  const db = readDB();
   const persisted = productionStore.listReviewedSignals();
   if (persisted.length) {
     res.json(persisted);
     return;
   }
-  res.json((db.analyses || []).map((analysis: StockAnalysis) => ({
+  res.json(appStore.listAnalyses().map((analysis: StockAnalysis) => ({
     id: analysis.id,
     symbol: analysis.symbol,
     source: analysis.source,
@@ -1752,13 +1663,12 @@ app.get("/api/signals/reviewed", requireReadToken, (req, res) => {
 });
 
 app.get("/api/trade-intents", requireReadToken, (req, res) => {
-  const db = readDB();
   const persisted = productionStore.listTradeIntents();
   if (persisted.length) {
     res.json(persisted);
     return;
   }
-  res.json((db.trades || []).map((trade: any) => ({
+  res.json(appStore.listTrades().map((trade: any) => ({
     id: trade.id,
     symbol: trade.symbol,
     side: trade.side,
@@ -1773,13 +1683,12 @@ app.get("/api/trade-intents", requireReadToken, (req, res) => {
 });
 
 app.get("/api/risk-decisions", requireReadToken, (req, res) => {
-  const db = readDB();
   const persisted = productionStore.listRiskDecisions();
   if (persisted.length) {
     res.json(persisted);
     return;
   }
-  res.json((db.trades || []).filter((trade: any) => trade.riskDecision).map((trade: any) => ({
+  res.json(appStore.listTrades().filter((trade: any) => trade.riskDecision).map((trade: any) => ({
     tradeId: trade.id,
     symbol: trade.symbol,
     ...trade.riskDecision,
@@ -1787,13 +1696,12 @@ app.get("/api/risk-decisions", requireReadToken, (req, res) => {
 });
 
 app.get("/api/exit-plans", requireReadToken, (req, res) => {
-  const db = readDB();
   const persisted = productionStore.listExitPlans();
   if (persisted.length) {
     res.json(persisted);
     return;
   }
-  res.json((db.trades || []).filter((trade: any) => trade.exitPlan).map((trade: any) => ({
+  res.json(appStore.listTrades().filter((trade: any) => trade.exitPlan).map((trade: any) => ({
     tradeId: trade.id,
     symbol: trade.symbol,
     ...trade.exitPlan,
@@ -2028,27 +1936,36 @@ type SyncCycleResult =
   | { ok: false; trigger: "manual" | "scheduled"; error: string };
 
 async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string | null): Promise<SyncCycleResult> {
-  const release = await dbMutex.acquire();
+  const release = await appStore.acquire();
   try {
-    const db = readDB();
-
     const logs: SyncLog[] = [];
     const results: any[] = [];
 
     const timestamp = new Date().toISOString();
     const logId = () => "l-" + Math.random().toString(36).substr(2, 9);
 
-    // Initialize helper to write log lines
+    // Initialize helper to write log lines. Phase 2 Task 14: persists
+    // immediately (appStore.addLog) instead of staging into an in-memory
+    // db.json object for one big batched write at the end of the cycle --
+    // every log line this function has EVER written is now durable the
+    // moment it's written, not just if the whole cycle reaches its final
+    // batched write without crashing first.
     const addLog = (type: SyncLog["type"], msg: string, details?: string) => {
       const sl: SyncLog = { id: logId(), timestamp: new Date().toISOString(), type, message: msg, details, trigger };
-      db.syncLogs.unshift(sl);
+      appStore.addLog(sl);
       logs.push(sl);
     };
 
-    const currentConfig: AppConfig = db.config;
+    const currentConfig: AppConfig = appStore.getConfig();
+    // Phase 2 Task 14: read once, mutated in place at each simulated-fill
+    // point below (mirrors the old db.simulatedPortfolio's shared-mutable-
+    // object pattern so multiple trades within ONE cycle keep compounding
+    // against each other), persisted via appStore.setSimulatedPortfolio(...)
+    // immediately after each mutation point rather than in one final batch.
+    const simulatedPortfolio: SimulatedPortfolio = appStore.getSimulatedPortfolio();
 
     addLog("sync", "Starting automation loop & thesis scanner...");
-    appendAuditEvents(db, [{
+    appendAuditEvents([{
       id: `ae-cycle-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       timestamp: new Date().toISOString(),
       type: "sync",
@@ -2079,7 +1996,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
     const hasNotion = currentConfig.notion && currentConfig.notion.token && currentConfig.notion.databaseId;
     const hasTelegram = currentConfig.telegram && currentConfig.telegram.enabled && currentConfig.telegram.botToken && currentConfig.telegram.chatId;
 
-    const pendingTrades = (db.trades || []).filter((tr: any) =>
+    const pendingTrades = appStore.listTrades().filter((tr: any) =>
       (hasGoogle && authHeader && !tr.exportedSheets) ||
       (hasNotion && !tr.loggedNotion) ||
       (hasTelegram && !tr.notifiedTelegram)
@@ -2122,6 +2039,11 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
               addLog("sync", `Outbox Sync Success: Dispatched delayed Telegram warning for trade ${tr.id} (${tr.symbol}).`);
             }
           }
+          // Phase 2 Task 14: persist this trade's (possibly) updated outbox
+          // flags immediately -- appendTrade upserts by id (same "in place"
+          // semantics the old db.trades array mutation + one final batched
+          // write used to rely on).
+          appStore.appendTrade(tr);
         } catch (queueErr: any) {
           console.error("Failed handling outbox element retry:", queueErr.message);
         }
@@ -2164,7 +2086,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
         for (const line of pollResult.logs) addLog("sync", line);
         for (const line of pollResult.errorLogs) addLog("error", line);
         if (pollResult.auditEvents.length) {
-          appendAuditEvents(db, pollResult.auditEvents.map((event) => ({
+          appendAuditEvents(pollResult.auditEvents.map((event) => ({
             id: `ae-poll-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
             actor: "order_status_poller",
@@ -2237,7 +2159,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             `Position reconciliation: ${report.status} (${report.mismatches.length} mismatch(es)).`,
             report.mismatches.length ? JSON.stringify(report.mismatches) : undefined,
           );
-          appendAuditEvents(db, [
+          appendAuditEvents([
             {
               id: `ae-position-reconciliation-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               timestamp: new Date().toISOString(),
@@ -2271,7 +2193,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             const toPersist = { ...latchResult.effective, latch: latchResult.latchState };
             productionStore.saveBreakerState(toPersist);
             if (latchResult.event !== "none") {
-              appendAuditEvents(db, [
+              appendAuditEvents([
                 breakerLatchAuditEvent({
                   event: latchResult.event,
                   corrupt: latchResult.corrupt,
@@ -2548,7 +2470,7 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           // for the full rationale). Fail closed: a lookup/cancel failure
           // skips this software exit for the cycle -- the broker legs remain
           // the position's active protection (audited by the helper).
-          const legCancel = await cancelBracketLegsBeforeSell({ db, symbol: decision.symbol, actor: "exit_monitor" });
+          const legCancel = await cancelBracketLegsBeforeSell({ symbol: decision.symbol, actor: "exit_monitor" });
           if (!legCancel.ok) {
             addLog("error", `Software exit for ${decision.symbol} skipped: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);
             continue;
@@ -2558,7 +2480,6 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
           }
 
           const liquidationTrade = await executeTradeIntent({
-            db,
             config: currentConfig,
             request: {
               source: "stop_loss",
@@ -2595,14 +2516,15 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
             timestamp: liquidationTrade.timestamp
           });
 
-          db.trades.unshift(liquidationTrade);
+          appStore.appendTrade(liquidationTrade);
 
           // Clean local simulated portfolio if offline mode
           if (!getBrokerConfig().configured && liquidationTrade.status !== "BrokerFailed" && liquidationTrade.status !== "RiskRejected") {
-            db.simulatedPortfolio.positions = (db.simulatedPortfolio.positions || []).filter((p: any) => p.symbol !== pos.symbol);
+            simulatedPortfolio.positions = (simulatedPortfolio.positions || []).filter((p: any) => p.symbol !== pos.symbol);
             const fundBack = sellQty * (parseFloat(pos.current_price) || 50);
-            db.simulatedPortfolio.cash = String(parseFloat(db.simulatedPortfolio.cash) + fundBack);
-            db.simulatedPortfolio.long_market_value = String(parseFloat(db.simulatedPortfolio.long_market_value) - fundBack);
+            simulatedPortfolio.cash = String(parseFloat(simulatedPortfolio.cash) + fundBack);
+            simulatedPortfolio.long_market_value = String(parseFloat(simulatedPortfolio.long_market_value) - fundBack);
+            appStore.setSimulatedPortfolio(simulatedPortfolio);
           }
 
           addLog("trade", `Liquidated ${sellQty} shares of ${pos.symbol} (${decision.kind === "plan_exit" ? "exit plan" : "legacy stop loss"} trigger).`);
@@ -3128,7 +3050,7 @@ For "stance", classify the source's own directional call on the ticker into exac
           continue;
         }
 
-        db.analyses.unshift(item);
+        appStore.appendAnalysis(item);
         parsedAnalyses.push(item);
         results.push(item);
 
@@ -3185,7 +3107,7 @@ For "stance", classify the source's own directional call on the ticker into exac
                 "trade",
                 `Thesis invalidated for ${item.symbol} by source "${bearishMappingResult.sourceId}" (bearish stance, whipsaw-verified reversal). With autoTrading on, the exit executes via the SELL decision path this cycle; MODULE 2 re-evaluates this dimension on subsequent cycles until ${bearishMappingResult.expiresAt}.`,
               );
-              appendAuditEvents(db, [{
+              appendAuditEvents([{
                 id: `ae-thesisinv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 timestamp: new Date().toISOString(),
                 type: "risk",
@@ -3209,7 +3131,7 @@ For "stance", classify the source's own directional call on the ticker into exac
                 "trade",
                 `${item.symbol} added to the do-not-buy list by source "${bearishMappingResult.sourceId}" (bearish stance on an unheld symbol) until ${bearishMappingResult.expiresAt}.`,
               );
-              appendAuditEvents(db, [{
+              appendAuditEvents([{
                 id: `ae-donotbuy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 timestamp: new Date().toISOString(),
                 type: "risk",
@@ -3283,7 +3205,7 @@ For "stance", classify the source's own directional call on the ticker into exac
               addLog("error", `Do-not-buy store read failed for ${item.symbol}; failing closed and rejecting this BUY.`, err?.message || String(err));
             }
             if (doNotBuyLoadFailed) {
-              appendAuditEvents(db, [{
+              appendAuditEvents([{
                 id: `ae-donotbuy-readfail-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 timestamp: new Date().toISOString(),
                 type: "risk",
@@ -3296,7 +3218,7 @@ For "stance", classify the source's own directional call on the ticker into exac
                 "error",
                 `Order skipped for ${item.symbol}. On the do-not-buy list until ${doNotBuyEntry.expiresAt} (source "${doNotBuyEntry.sourceId}": ${doNotBuyEntry.reason}).`,
               );
-              appendAuditEvents(db, [{
+              appendAuditEvents([{
                 id: `ae-donotbuy-blocked-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 timestamp: new Date().toISOString(),
                 type: "risk",
@@ -3347,7 +3269,7 @@ For "stance", classify the source's own directional call on the ticker into exac
               // audited skip. SELLs/exits are never capped (see the SELL branch below
               // and MODULE 2's liquidations above -- neither touches this counter).
               addLog("error", `Order skipped for ${item.symbol}. Per-cycle BUY cap (${MAX_BUYS_PER_CYCLE}) already reached this cycle.`);
-              appendAuditEvents(db, [{
+              appendAuditEvents([{
                 id: `ae-buycap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 timestamp: new Date().toISOString(),
                 type: "risk",
@@ -3360,7 +3282,6 @@ For "stance", classify the source's own directional call on the ticker into exac
               const qty = sized.qty;
               addLog("sync", `Submitting buy intent for ${qty} shares of ${item.symbol} at approx $${price} through safety pipeline...`);
               const newTrade = await executeTradeIntent({
-                db,
                 config: currentConfig,
                 request: {
                   source: "automation",
@@ -3387,11 +3308,11 @@ For "stance", classify the source's own directional call on the ticker into exac
               // Log to Notion
               newTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, item);
 
-              db.trades.unshift(newTrade);
+              appStore.appendTrade(newTrade);
 
               // Update simulation list
               if (!getBrokerConfig().configured && newTrade.status !== "BrokerFailed" && newTrade.status !== "RiskRejected") {
-                const currentSim = db.simulatedPortfolio;
+                const currentSim = simulatedPortfolio;
                 const existingPos = currentSim.positions.find((p: any) => p.symbol === item.symbol);
                 if (existingPos) {
                   const oldQty = parseInt(existingPos.qty);
@@ -3416,6 +3337,7 @@ For "stance", classify the source's own directional call on the ticker into exac
                 }
                 currentSim.cash = String(parseFloat(currentSim.cash) - (qty * price));
                 currentSim.long_market_value = String(parseFloat(currentSim.long_market_value) + (qty * price));
+                appStore.setSimulatedPortfolio(currentSim);
               }
 
               addLog("trade", `Submitted BUY ${qty} shares of ${item.symbol}. State: ${newTrade.status}. Telegram: ${newTrade.notifiedTelegram ? 'Sent' : 'Disabled'}, Sheets: ${newTrade.exportedSheets ? 'Appended' : 'Disabled'}, Notion: ${newTrade.loggedNotion ? 'Saved' : 'Disabled'}`);
@@ -3435,7 +3357,7 @@ For "stance", classify the source's own directional call on the ticker into exac
             // next cycle re-evaluates. Without this, every trend-reversal
             // close on a bracket-protected position would be deterministically
             // rejected by Alpaca ("insufficient qty -- held for orders").
-            const legCancel = await cancelBracketLegsBeforeSell({ db, symbol: item.symbol, actor: "automation" });
+            const legCancel = await cancelBracketLegsBeforeSell({ symbol: item.symbol, actor: "automation" });
             if (!legCancel.ok) {
               addLog("error", `Automation SELL for ${item.symbol} skipped this cycle: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);
               continue;
@@ -3456,7 +3378,6 @@ For "stance", classify the source's own directional call on the ticker into exac
               : `Trend reversal warning assessed or stop loss margin hit. Closing positions.`;
 
             const newTrade = await executeTradeIntent({
-              db,
               config: currentConfig,
               request: {
                 source: "automation",
@@ -3474,13 +3395,14 @@ For "stance", classify the source's own directional call on the ticker into exac
             newTrade.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, newTrade);
             newTrade.loggedNotion = await saveToNotionDatabase(currentConfig.notion, item);
 
-            db.trades.unshift(newTrade);
+            appStore.appendTrade(newTrade);
 
             if (!getBrokerConfig().configured && newTrade.status !== "BrokerFailed" && newTrade.status !== "RiskRejected") {
-              const currentSim = db.simulatedPortfolio;
+              const currentSim = simulatedPortfolio;
               currentSim.positions = currentSim.positions.filter((p: any) => p.symbol !== item.symbol);
               currentSim.cash = String(parseFloat(currentSim.cash) + (qty * price));
               currentSim.long_market_value = String(parseFloat(currentSim.long_market_value) - (qty * price));
+              appStore.setSimulatedPortfolio(currentSim);
             }
 
             addLog("trade", `Submitted SELL ${qty} shares of ${item.symbol}. State: ${newTrade.status}. Telegram: ${newTrade.notifiedTelegram ? 'Sent' : 'Disabled'}`);
@@ -3495,7 +3417,6 @@ For "stance", classify the source's own directional call on the ticker into exac
   }
 
   addLog("sync", "ZipTrader portfolio optimization cycle completed.");
-  writeDB(db);
   // Guardrail 7 (docs/GO_LIVE_PLAN.md Phase 2.1): a cycle counts as FAILED if
   // every ATTEMPTED ingestion source errored -- not merely zero emails/no
   // YouTube content, both of which are expected, non-error outcomes (see
@@ -3534,17 +3455,17 @@ app.post("/api/sync", requireAdminCommand, async (req, res) => {
 
 // Manual Override trade actions API
 app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
-  const release = await dbMutex.acquire();
+  const release = await appStore.acquire();
   try {
     const { symbol, side } = req.body;
-    const db = readDB();
     const authHeader = req.headers.authorization || null;
 
-    const currentConfig: AppConfig = db.config;
+    const currentConfig: AppConfig = appStore.getConfig();
+    const simulatedPortfolio: SimulatedPortfolio = appStore.getSimulatedPortfolio();
     const timestamp = new Date().toISOString();
 
     const addLog = (type: SyncLog["type"], msg: string, details?: string) => {
-      db.syncLogs.unshift({ id: "l-" + Math.random().toString(36).substr(2, 9), timestamp, type, message: msg, details });
+      appStore.addLog({ id: "l-" + Math.random().toString(36).substr(2, 9), timestamp, type, message: msg, details });
     };
 
     // Fail closed on unparsable request numerics (docs/GO_LIVE_PLAN.md Phase 1.4):
@@ -3586,7 +3507,6 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
       const parsedPortfolioValue = Number(portfolio.portfolio_value);
       if (!Number.isFinite(parsedPortfolioValue) || parsedPortfolioValue <= 0) {
         addLog("error", `Manual override BUY rejected for ${symbol}. Portfolio value is not a finite number; failing closed.`);
-        writeDB(db);
         res.status(422).json({ error: "Manual trade override rejected", details: "Portfolio value is not a finite number; failing closed." });
         return;
       }
@@ -3609,7 +3529,6 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
       if (capQty <= 0) {
         const capNames = capRoom.capsApplied.join(", ") || "no room remaining";
         addLog("error", `Manual override BUY rejected for ${symbol}. No executable quantity remains under cap(s): ${capNames}.`);
-        writeDB(db);
         res.status(422).json({
           error: "Manual trade override rejected",
           details: `No executable quantity remains under cap(s): ${capNames}.`,
@@ -3622,7 +3541,7 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
         qty = capQty;
         clamp = { requestedQty, approvedQty: capQty, capsApplied: capRoom.capsApplied };
         addLog("override", `Manual override BUY for ${symbol} clamped from ${requestedQty} to ${capQty} shares (cap: ${capRoom.capsApplied.join(", ")}).`);
-        appendAuditEvents(db, [{
+        appendAuditEvents([{
           id: `ae-override-clamp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           timestamp: new Date().toISOString(),
           type: "risk",
@@ -3643,10 +3562,9 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     // (the legs remain the protection) and the response says so honestly
     // instead of claiming success for an order that never went out.
     if (side === "sell") {
-      const legCancel = await cancelBracketLegsBeforeSell({ db, symbol, actor: "manual_override" });
+      const legCancel = await cancelBracketLegsBeforeSell({ symbol, actor: "manual_override" });
       if (!legCancel.ok) {
         addLog("error", `Manual override SELL for ${symbol} skipped: ${legCancel.reason}. The broker-native bracket legs remain this position's active protection.`);
-        writeDB(db);
         res.status(502).json({
           success: false,
           error: "Manual trade override rejected",
@@ -3660,7 +3578,6 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     }
 
     const tradeVal = await executeTradeIntent({
-      db,
       config: currentConfig,
       request: {
         source: "manual",
@@ -3680,13 +3597,13 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
     tradeVal.notifiedTelegram = await sendTelegramAlert(currentConfig.telegram, tgMsg);
     tradeVal.exportedSheets = await appendTradeToSheets(currentConfig.google, authHeader, tradeVal);
 
-    // Intentionally NOT deduped by client_order_id: this legacy JSON trades log is an
+    // Intentionally NOT deduped by client_order_id: this legacy trades log is an
     // append-only per-attempt record (UI history, daily trade counting); the SQLite
     // trade_intents store is the deduped source of truth for reconciliation (Task 13).
-    db.trades.unshift(tradeVal);
+    appStore.appendTrade(tradeVal);
 
     if (!getBrokerConfig().configured && tradeVal.status !== "BrokerFailed" && tradeVal.status !== "RiskRejected") {
-      const currentSim = db.simulatedPortfolio;
+      const currentSim = simulatedPortfolio;
       const existingPos = currentSim.positions.find((p: any) => p.symbol === symbol);
       const sharesCost = qty * price;
 
@@ -3725,9 +3642,9 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
           currentSim.long_market_value = String(parseFloat(currentSim.long_market_value) - sharesCost);
         }
       }
+      appStore.setSimulatedPortfolio(currentSim);
     }
 
-    writeDB(db);
     // Task 4 honesty fix: `orderPlaced` (additive field) reports whether this
     // trade actually reached the broker successfully; for a SELL, `success`
     // itself is honest -- a RiskRejected/BrokerFailed sell must never read as
@@ -3750,13 +3667,13 @@ app.post("/api/override/trade", requireAdminCommand, async (req, res) => {
 
 // Urgent close-out control
 app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
-  const release = await dbMutex.acquire();
+  const release = await appStore.acquire();
   try {
-    const db = readDB();
+    const config = appStore.getConfig();
+    const simulatedPortfolio: SimulatedPortfolio = appStore.getSimulatedPortfolio();
     const timestamp = new Date().toISOString();
-    const config = db.config;
 
-    db.syncLogs.unshift({
+    appStore.addLog({
       id: "l-" + Math.random().toString(36).substr(2, 9),
       timestamp,
       type: "override",
@@ -3776,7 +3693,7 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
     for (const pos of portfolio.positions) {
       const currentPrice = parseFloat(pos.current_price);
       if (!currentPrice || !Number.isFinite(currentPrice)) {
-        db.syncLogs.unshift({
+        appStore.addLog({
           id: "l-" + Math.random().toString(36).substr(2, 9),
           timestamp,
           type: "error",
@@ -3789,9 +3706,9 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
       // fail-closed semantics as the exit monitor). A cancel failure skips
       // THIS symbol only -- its legs remain the protection -- and the rest of
       // the portfolio still closes; the failure is counted and audited.
-      const legCancel = await cancelBracketLegsBeforeSell({ db, symbol: pos.symbol, actor: "emergency_close" });
+      const legCancel = await cancelBracketLegsBeforeSell({ symbol: pos.symbol, actor: "emergency_close" });
       if (!legCancel.ok) {
-        db.syncLogs.unshift({
+        appStore.addLog({
           id: "l-" + Math.random().toString(36).substr(2, 9),
           timestamp,
           type: "error",
@@ -3801,7 +3718,6 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
         continue;
       }
       const emergencyTrade = await executeTradeIntent({
-        db,
         config,
         request: {
           source: "emergency",
@@ -3813,7 +3729,7 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
           actor: "ui",
         },
       });
-      db.trades.unshift(emergencyTrade);
+      appStore.appendTrade(emergencyTrade);
       const sold = BROKER_SUCCESS_TRADE_STATUSES.has(emergencyTrade.status);
       results.push({
         symbol: pos.symbol,
@@ -3827,10 +3743,11 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
     const failedCount = results.length - soldCount;
 
     if (!getBrokerConfig().configured) {
-      const totalPosValue = parseFloat(db.simulatedPortfolio.long_market_value) || 0;
-      db.simulatedPortfolio.cash = String(parseFloat(db.simulatedPortfolio.cash) + totalPosValue);
-      db.simulatedPortfolio.long_market_value = "0.00";
-      db.simulatedPortfolio.positions = [];
+      const totalPosValue = parseFloat(simulatedPortfolio.long_market_value) || 0;
+      simulatedPortfolio.cash = String(parseFloat(simulatedPortfolio.cash) + totalPosValue);
+      simulatedPortfolio.long_market_value = "0.00";
+      simulatedPortfolio.positions = [];
+      appStore.setSimulatedPortfolio(simulatedPortfolio);
     }
 
     // Send panic telegram broadcast -- honest about the real outcome, never
@@ -3841,7 +3758,6 @@ app.post("/api/override/close-all", requireAdminCommand, async (req, res) => {
       : `🚨 <b>Portfolio Panic Trigger: EMERGENCY CLOSE PARTIAL.</b> ${soldCount} of ${results.length} position(s) sold; ${failedCount} FAILED/SKIPPED (${failedSymbols.join(", ")}). Skipped bracket-protected positions remain covered by their broker legs. Manual review required.`;
     await sendTelegramAlert(config.telegram, tgMessage);
 
-    writeDB(db);
     res.json({
       success: failedCount === 0,
       soldCount,
@@ -3877,8 +3793,8 @@ const scheduler = createScheduler({
     return handle;
   },
   clearTimer: (handle) => clearTimeout(handle as NodeJS.Timeout),
-  getIntervalMinutesRaw: () => readDB().config?.system?.runIntervalMins,
-  isAutoTradingOn: () => Boolean(readDB().config?.system?.autoTrading),
+  getIntervalMinutesRaw: () => appStore.getConfig().system?.runIntervalMins,
+  isAutoTradingOn: () => Boolean(appStore.getConfig().system?.autoTrading),
   // Phase 2 Task 6: read fresh every tick, same as isAutoTradingOn -- a tick
   // that fires while startup reconciliation is still pending (or retrying)
   // skips the whole cycle (scheduler.ts logs "startup reconciliation pending").
@@ -3909,24 +3825,18 @@ const scheduler = createScheduler({
     // autoTrading=false (persisted), an audit event, and an UNTHROTTLED
     // Telegram alert (unlike the empty-sync alert, this fires once per
     // actual pause -- a state change, not a repeating warning).
-    const release = await dbMutex.acquire();
-    let telegramConfig: AppConfig["telegram"] | undefined;
-    try {
-      const db = readDB();
-      db.config.system.autoTrading = false;
-      telegramConfig = db.config.telegram;
-      appendAuditEvents(db, [{
-        id: `ae-autopause-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        timestamp: new Date().toISOString(),
-        type: "config",
-        actor: "scheduler",
-        message: `Auto-pause: ${MAX_CONSECUTIVE_FAILURES} consecutive scheduled sync cycle failures; autoTrading set to false. Stays paused until a human resumes.`,
-        details: { consecutiveFailures: MAX_CONSECUTIVE_FAILURES },
-      }]);
-      writeDB(db);
-    } finally {
-      release();
-    }
+    // appStore.updateConfig acquires/releases the lock itself -- do not wrap
+    // this in a manual appStore.acquire() (it would deadlock).
+    const config = await appStore.updateConfig((current) => ({ ...current, system: { ...current.system, autoTrading: false } }));
+    const telegramConfig = config.telegram;
+    appendAuditEvents([{
+      id: `ae-autopause-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "config",
+      actor: "scheduler",
+      message: `Auto-pause: ${MAX_CONSECUTIVE_FAILURES} consecutive scheduled sync cycle failures; autoTrading set to false. Stays paused until a human resumes.`,
+      details: { consecutiveFailures: MAX_CONSECUTIVE_FAILURES },
+    }]);
     await sendTelegramAlert(
       telegramConfig,
       `🛑 <b>Auto-trading paused.</b> ${MAX_CONSECUTIVE_FAILURES} consecutive scheduled sync cycles failed. Trading stays paused until a human resumes (POST /api/config or the Telegram /resume command).`,
@@ -3986,7 +3896,7 @@ const scheduler = createScheduler({
     // that a failed/unconfigured send is only logged, never retried or
     // thrown -- an unconfigured Telegram must never spin the scheduler loop.
     const delivered = await sendTelegramAlert(
-      readDB().config?.telegram,
+      appStore.getConfig().telegram,
       `💓 <b>Alive.</b> cycle ${count}, last regime ${regime?.marketMode ?? "unknown"}, open positions ${openPositions}.`,
     );
     if (!delivered) {
@@ -3998,7 +3908,7 @@ const scheduler = createScheduler({
   // see that constant's doc comment for why), so it can detect the main
   // cycle chain itself being stuck/dead, not just a failing cycle.
   checkWatchdog: async () => {
-    const autoTradingOn = Boolean(readDB().config?.system?.autoTrading);
+    const autoTradingOn = Boolean(appStore.getConfig().system?.autoTrading);
     if (!autoTradingOn) return;
 
     let lastCycleCompletedAtMs: number | undefined;
@@ -4011,7 +3921,7 @@ const scheduler = createScheduler({
       return;
     }
 
-    const intervalMinutes = resolveIntervalMinutes(readDB().config?.system?.runIntervalMins, (m) => console.log(m));
+    const intervalMinutes = resolveIntervalMinutes(appStore.getConfig().system?.runIntervalMins, (m) => console.log(m));
     const nowMs = Date.now();
 
     let alreadyAlertedGapStartMs: number | undefined;
@@ -4026,7 +3936,7 @@ const scheduler = createScheduler({
     if (!shouldAlertOverdueGap(lastCycleCompletedAtMs, nowMs, intervalMinutes, alreadyAlertedGapStartMs)) return;
 
     const delivered = await sendTelegramAlert(
-      readDB().config?.telegram,
+      appStore.getConfig().telegram,
       `⏰ <b>Scheduled cycle overdue.</b> No completed scheduled cycle in over ${MISSED_CYCLE_ALERT_MULTIPLIER}x the configured interval (${intervalMinutes}m). Last completed: ${lastCycleCompletedAtMs ? new Date(lastCycleCompletedAtMs).toISOString() : "never"}.`,
     );
     // Delivery-gated stamping (same pattern as the empty-sync alert throttle,
@@ -4055,6 +3965,25 @@ async function runScheduledSyncTickForTests(): Promise<void> {
   await scheduler.runTickNow();
 }
 
+// Phase 2 Task 14 (docs/GO_LIVE_PLAN.md Phase 2.5, "Store consolidation"):
+// the one-time db.json -> SQLite migration (src/server/appStore.ts). Wired
+// as a standalone function (not inlined in run()) for the same reason as
+// performStartupReconciliation below -- tests invoke exactly this, with the
+// real store/fs plumbing, without booting the rest of run(). Synchronous
+// (migrateDbJsonIfNeeded does no I/O beyond fs/sqlite, both synchronous
+// APIs) -- never throws (a migration failure degrades to clean defaults
+// internally; see that function's doc comment).
+function performDbJsonMigration(): ReturnType<typeof migrateDbJsonIfNeeded> {
+  return migrateDbJsonIfNeeded(appStore, productionStore, DB_PATH);
+}
+
+// Test-visible manual trigger (same rationale as runScheduledSyncTickForTests
+// above): runs exactly the real one-time migration on demand, without
+// waiting for run() (which NODE_ENV=test never calls).
+function runDbJsonMigrationForTests(): ReturnType<typeof migrateDbJsonIfNeeded> {
+  return performDbJsonMigration();
+}
+
 // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): the boot-time reconciliation
 // step, wired here as a standalone async function (not inlined in run()) so
 // tests can invoke exactly this -- with the real store/broker/Telegram
@@ -4075,10 +4004,9 @@ async function performStartupReconciliation(): Promise<void> {
       listTrades: () => productionStore.listTradeIntents(250),
       saveTrade: (trade) => productionStore.saveTradeIntent(trade),
       cancelOrder: (orderId) => cancelAlpacaOrder(brokerConfig, orderId),
-      // Straight to the durable SQLite store (bypasses db.json/dbMutex --
-      // GET /api/audit already prefers productionStore.listAuditEvents()
-      // over db.auditEvents whenever the former is non-empty, so this alone
-      // is sufficient for every audit-reading route/test to see these events).
+      // Straight to the durable SQLite store -- GET /api/audit reads straight
+      // from productionStore.listAuditEvents(), so this alone is sufficient
+      // for every audit-reading route/test to see these events.
       appendAuditEvents: (events) =>
         productionStore.appendAuditEvents(
           events.map((event) => ({
@@ -4089,7 +4017,7 @@ async function performStartupReconciliation(): Promise<void> {
           })),
         ),
       persistOrphans: (orphans) => productionStore.setAppState(STARTUP_ORPHANS_APP_STATE_KEY, JSON.stringify(orphans)),
-      sendTelegramAlert: (message) => sendTelegramAlert(readDB().config?.telegram, message),
+      sendTelegramAlert: (message) => sendTelegramAlert(appStore.getConfig().telegram, message),
       log: (message) => console.log(message),
       setTimer: (callback, delayMs) => {
         const handle = setTimeout(callback, delayMs);
@@ -4126,7 +4054,15 @@ const backupDeps: BackupDeps = {
   now: () => Date.now(),
   ensureBackupsDir: () => fs.mkdirSync(BACKUPS_DIR, { recursive: true }),
   backupSqliteTo: (filename) => productionStore.backupTo(path.join(BACKUPS_DIR, filename)),
-  dbJsonExists: () => fs.existsSync(DB_PATH),
+  // Phase 2 Task 14 (docs/GO_LIVE_PLAN.md Phase 2.5, "Store consolidation"):
+  // marker-aware. Pre-migration (marker absent), db.json is still live
+  // interim state and rides along with every backup, same as Task 13. Once
+  // the one-time migration has run, db.json is frozen legacy state -- copying
+  // it into every future backup would be pointless (it never changes again)
+  // and would misleadingly suggest it's still part of the current system of
+  // record. Post-migration state lives fully in the SQLite backup; see
+  // docs/OPS_RUNBOOK.md's restore-drill note.
+  dbJsonExists: () => !productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY) && fs.existsSync(DB_PATH),
   copyDbJsonTo: (filename) => fs.copyFileSync(DB_PATH, path.join(BACKUPS_DIR, filename)),
   listBackupsDir: () => {
     try {
@@ -4142,9 +4078,9 @@ const backupDeps: BackupDeps = {
   deleteBackupFile: (filename) => fs.unlinkSync(path.join(BACKUPS_DIR, filename)),
   getAppState: (key) => productionStore.getAppState(key),
   setAppState: (key, value) => productionStore.setAppState(key, value),
-  // Straight to the durable SQLite store, same "bypasses db.json/dbMutex"
-  // rationale performStartupReconciliation's appendAuditEvents dep above
-  // documents -- GET /api/audit already prefers productionStore.listAuditEvents().
+  // Straight to the durable SQLite store, same rationale
+  // performStartupReconciliation's appendAuditEvents dep above documents --
+  // GET /api/audit reads straight from productionStore.listAuditEvents().
   appendAuditEvent: (message, details) =>
     productionStore.appendAuditEvents([{
       id: `ae-backup-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -4154,7 +4090,7 @@ const backupDeps: BackupDeps = {
       message,
       details,
     }]),
-  sendAlert: (message) => sendTelegramAlert(readDB().config?.telegram, message),
+  sendAlert: (message) => sendTelegramAlert(appStore.getConfig().telegram, message),
   log: (message) => console.log(message),
 };
 
@@ -4233,7 +4169,7 @@ async function performCrashLoopBootCheck(): Promise<{ stayDown: boolean }> {
     // logged, never retried -- the process is about to exit either way). No
     // throttle stamp to write: staying down IS the repeat-suppression.
     const delivered = await sendTelegramAlert(
-      readDB().config?.telegram,
+      appStore.getConfig().telegram,
       `🔁🛑 <b>Crash loop detected; staying down.</b> ${decision.prunedHistory.length} boots within 1 hour (limit ${CRASH_LOOP_MAX_BOOTS}). The process will NOT restart on its own (guardrail 9) -- investigate, then restart deliberately. Positions remain broker-protected by their bracket orders.`,
     );
     if (!delivered) {
@@ -4300,6 +4236,14 @@ async function run() {
     process.exit(1);
   }
 
+  // Phase 2 Task 14 (docs/GO_LIVE_PLAN.md Phase 2.5, "Store consolidation"):
+  // one-time db.json -> SQLite migration. Runs BEFORE startup reconciliation
+  // (below) and everything after it -- every other boot step reads
+  // config/trades/etc. through appStore, which must already reflect
+  // migrated (or clean-default) state by the time anything else runs.
+  // Idempotent (marker-gated); a no-op on every boot after the first.
+  performDbJsonMigration();
+
   // Phase 2 Task 6 (docs/GO_LIVE_PLAN.md Phase 2.2): startup reconciliation.
   // Runs BEFORE the HTTP server starts accepting connections and BEFORE
   // scheduler.start() -- store is already open (productionStore, module
@@ -4360,7 +4304,7 @@ async function run() {
   });
 }
 
-export { app, dbMutex, handleTelegramCommand, readDB, runScheduledSyncTickForTests, runStartupReconciliationForTests, runCrashLoopBootCheckForTests, runWatchdogCheckForTests, runBackupForTests };
+export { app, appStore, productionStore, handleTelegramCommand, runScheduledSyncTickForTests, runStartupReconciliationForTests, runCrashLoopBootCheckForTests, runWatchdogCheckForTests, runBackupForTests, runDbJsonMigrationForTests };
 
 if (process.env.NODE_ENV !== "test") {
   run();

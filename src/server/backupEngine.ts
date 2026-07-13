@@ -7,10 +7,15 @@
 //
 // Binding constraints from the task brief: backups NEVER block or crash a
 // trading cycle (every I/O call below is wrapped so a throw anywhere becomes
-// a logged+audited failure, never a rethrow) and db.json (interim scope --
-// see the next task for consolidating it into SQLite) rides along as a
+// a logged+audited failure, never a rethrow) and db.json rides along as a
 // best-effort file copy alongside each backup run, not a hard dependency of
-// success.
+// success. Phase 2 Task 14 ("Store consolidation") made this deps.dbJsonExists()
+// call marker-aware on the server.ts side: db.json only still rides along
+// PRE-migration (still-live interim state); once the one-time db.json ->
+// SQLite migration has run, db.json is frozen legacy state and is no longer
+// copied into new backups (see src/server/appStore.ts and
+// docs/OPS_RUNBOOK.md). This module's own logic is unchanged either way --
+// it just does what deps.dbJsonExists() tells it.
 
 // ~half a day at the default 15-minute scheduler interval (48 * 15min = 12h).
 export const BACKUP_EVERY_N_CYCLES = 48;

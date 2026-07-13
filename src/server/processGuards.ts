@@ -6,7 +6,7 @@ export interface ProcessGuardDeps {
   // sync scheduler (clears its armed timer) as the first step of graceful
   // shutdown. Optional so every existing caller/test that predates the
   // scheduler keeps working unchanged. A cycle already in flight is not
-  // interrupted -- it holds dbMutex and simply runs to completion.
+  // interrupted -- it holds the appStore lock and simply runs to completion.
   stopScheduler?: () => void;
   // Phase 2 Task 12 (docs/GO_LIVE_PLAN.md Phase 2.5, guardrail 9): records
   // the clean-shutdown marker (src/server/crashLoopGuard.ts's
