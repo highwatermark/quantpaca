@@ -178,11 +178,20 @@ export type DbJsonMigrationResult = {
 };
 
 // One-time migration, called from run() BEFORE startup reconciliation (see
-// server.ts). Idempotent: gated on DBJSON_MIGRATED_AT_APP_STATE_KEY, so a
-// second boot (or a retry after a partial failure) is a pure no-op. Never
-// throws -- a migration failure degrades to clean defaults (fail toward "the
-// process still boots with a usable, empty config") rather than blocking
-// startup; the failure is logged and audited either way.
+// server.ts). Idempotent: gated on DBJSON_MIGRATED_AT_APP_STATE_KEY.
+//
+// Atomicity (Task 14 review fix 2): every copy plus the marker stamp runs in
+// ONE SQLite transaction (productionStore.transaction) -- either the whole
+// migration commits (all five state classes AND the marker), or none of it
+// does. A hard crash mid-copy therefore leaves the database exactly as it
+// was, and the marker-gated migration simply retries from scratch on the
+// next boot; partial state can never be stranded.
+//
+// Never throws -- a CAUGHT failure (corrupt db.json, a row that violates a
+// constraint) rolls the transaction back and degrades to clean defaults
+// (fail toward "the process still boots with a usable, empty config"),
+// stamping the marker so a poisoned db.json is not retried -- and re-failed
+// -- on every boot. The failure is logged and audited either way.
 export function migrateDbJsonIfNeeded(
   appStore: AppStore,
   productionStore: ProductionStore,
@@ -194,9 +203,19 @@ export function migrateDbJsonIfNeeded(
   }
 
   const configIsEmpty = productionStore.getConfig() === undefined;
-  let result: DbJsonMigrationResult;
 
-  if (configIsEmpty && fs.existsSync(dbJsonPath)) {
+  if (fs.existsSync(dbJsonPath)) {
+    // db.json exists and the marker is absent: db.json is still the system
+    // of record, so the full copy runs. `configIsEmpty` is the normal first
+    // boot; a NON-empty config here can only be (a) partial state stranded
+    // by the pre-transaction version of this migration (which copied
+    // class-by-class with per-statement commits and stamped the marker
+    // LAST -- a crash mid-copy could leave config without logs/analyses/
+    // trades), or (b) a config written through the store before the first
+    // boot migration ever ran. Either way the copy below (re)runs in full:
+    // every write is an INSERT OR REPLACE upsert keyed by id, so completing
+    // a stranded partial copy and restarting a fresh one are the same
+    // operation, and nothing already in db.json can be lost.
     try {
       const raw = fs.readFileSync(dbJsonPath, "utf8");
       const parsed = JSON.parse(raw) as {
@@ -207,35 +226,37 @@ export function migrateDbJsonIfNeeded(
         simulatedPortfolio?: SimulatedPortfolio;
       };
 
-      appStore.setConfig({ ...DEFAULT_CONFIG, ...(parsed.config || {}) });
-
       const syncLogs = Array.isArray(parsed.syncLogs) ? parsed.syncLogs.slice(0, SYNC_LOG_RETENTION) : [];
-      for (const log of syncLogs) appStore.addLog(log);
-
       const analyses = Array.isArray(parsed.analyses) ? parsed.analyses : [];
-      for (const analysis of analyses) appStore.appendAnalysis(analysis);
-
       const trades = Array.isArray(parsed.trades) ? parsed.trades : [];
-      for (const trade of trades) appStore.appendTrade(trade);
-
       const hadSimulatedPortfolio = Boolean(parsed.simulatedPortfolio);
-      if (parsed.simulatedPortfolio) appStore.setSimulatedPortfolio(parsed.simulatedPortfolio);
-
       const counts = { syncLogs: syncLogs.length, analyses: analyses.length, trades: trades.length, simulatedPortfolio: hadSimulatedPortfolio };
+
+      // One transaction: all five copies + audit + marker, or nothing.
+      productionStore.transaction(() => {
+        appStore.setConfig({ ...DEFAULT_CONFIG, ...(parsed.config || {}) });
+        for (const log of syncLogs) appStore.addLog(log);
+        for (const analysis of analyses) appStore.appendAnalysis(analysis);
+        for (const trade of trades) appStore.appendTrade(trade);
+        if (parsed.simulatedPortfolio) appStore.setSimulatedPortfolio(parsed.simulatedPortfolio);
+        productionStore.appendAuditEvents([{
+          id: `ae-dbjson-migration-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          type: "config",
+          actor: "dbjson_migration",
+          message: "One-time db.json -> SQLite migration completed (config, sync logs, analyses, trades, simulated portfolio). db.json is now frozen legacy state.",
+          details: counts,
+        }]);
+        productionStore.setAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY, new Date().toISOString());
+      });
+
       console.log(
         `[migration] db.json migrated into SQLite: config, ${counts.syncLogs} sync log(s), ${counts.analyses} analysis/es, ${counts.trades} legacy trade(s), simulated portfolio ${hadSimulatedPortfolio ? "present" : "absent"}.`,
       );
-      productionStore.appendAuditEvents([{
-        id: `ae-dbjson-migration-${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        type: "config",
-        actor: "dbjson_migration",
-        message: "One-time db.json -> SQLite migration completed (config, sync logs, analyses, trades, simulated portfolio). db.json is now frozen legacy state.",
-        details: counts,
-      }]);
-      // Sibling marker file (see dbJsonMigratedMarkerPath's doc comment above)
-      // -- best-effort; a failure here never fails the migration itself (the
-      // app_state marker below is the real, load-bearing idempotency gate).
+      // Sibling marker file (see dbJsonMigratedMarkerPath's doc comment
+      // above) -- written AFTER the commit, best-effort; a failure here never
+      // fails the migration itself (the app_state marker, committed above, is
+      // the real, load-bearing idempotency gate).
       try {
         fs.writeFileSync(
           dbJsonMigratedMarkerPath(dbJsonPath),
@@ -245,8 +266,12 @@ export function migrateDbJsonIfNeeded(
       } catch (markerErr) {
         console.error("[migration] Failed to write the db.json.MIGRATED marker file (informational only; the app_state marker is authoritative).", markerErr);
       }
-      result = { ran: true, source: "db_json", counts };
+      return { ran: true, source: "db_json", counts };
     } catch (err) {
+      // The transaction above rolled back entirely -- no partially-copied
+      // rows survive into this fallback. Degrade to a bootable clean-default
+      // config and stamp the marker (a poisoned db.json must not be retried
+      // and re-failed on every subsequent boot); audited so the loss is loud.
       console.error("[migration] Failed to migrate db.json; falling back to clean defaults so the process still boots with a usable configuration.", err);
       appStore.setConfig(DEFAULT_CONFIG);
       productionStore.appendAuditEvents([{
@@ -256,26 +281,31 @@ export function migrateDbJsonIfNeeded(
         actor: "dbjson_migration",
         message: `db.json migration failed; falling back to clean defaults. Error: ${err instanceof Error ? err.message : String(err)}`,
       }]);
-      result = { ran: true, source: "migration_failed" };
+      productionStore.setAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY, new Date().toISOString());
+      return { ran: true, source: "migration_failed" };
     }
-  } else if (configIsEmpty) {
-    // No db.json at all (fresh install) -- clean first-boot defaults.
-    appStore.setConfig(DEFAULT_CONFIG);
+  }
+
+  // No db.json at all: nothing to copy. A fresh install seeds clean
+  // first-boot defaults; a PRE-EXISTING config (config row present, no
+  // marker, no db.json) is kept as-is -- with the transactional copy above
+  // always committing the marker together with the copied state, this
+  // combination can only mean a genuinely non-migration config (written
+  // through the store before the first boot migration ever ran, e.g. by
+  // test seeding), never a stranded partial migration. Marker stamped
+  // either way, in the same transaction as the seed/audit.
+  productionStore.transaction(() => {
+    if (configIsEmpty) appStore.setConfig(DEFAULT_CONFIG);
     productionStore.appendAuditEvents([{
       id: `ae-dbjson-migration-clean-${Date.now()}`,
       timestamp: new Date().toISOString(),
       type: "config",
       actor: "dbjson_migration",
-      message: "No db.json found; initialized SQLite config with clean first-boot defaults.",
+      message: configIsEmpty
+        ? "No db.json found; initialized SQLite config with clean first-boot defaults."
+        : "No db.json found; kept the pre-existing (non-migration) SQLite config as-is.",
     }]);
-    result = { ran: true, source: "clean_default" };
-  } else {
-    // Config already present for some other reason (e.g. a prior partial run
-    // that wrote config but crashed before stamping the marker) -- nothing to
-    // copy; stamp the marker below so this never re-runs.
-    result = { ran: true, source: "clean_default" };
-  }
-
-  productionStore.setAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY, new Date().toISOString());
-  return result;
+    productionStore.setAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY, new Date().toISOString());
+  });
+  return { ran: true, source: "clean_default" };
 }

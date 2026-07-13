@@ -19,6 +19,15 @@ import { AppConfig, StockAnalysis, SyncLog, Trade } from "../types";
 // no such bound and grew forever.
 export const SYNC_LOG_RETENTION = 5000;
 
+// Default read cap for the legacy UI list tables (analyses/ui_trades) below.
+// The old db.json arrays were truly unbounded; these reads return the newest
+// UI_LIST_DEFAULT_LIMIT rows (timestamp DESC, insertion-order tiebreak) --
+// generous enough that no realistic dashboard/UI request notices, while
+// keeping a single response from ever serializing a multi-year table
+// unboundedly. The tables themselves remain unpruned (only sync_logs has
+// write-side retention).
+export const UI_LIST_DEFAULT_LIMIT = 10000;
+
 // Single-row-table id used by both `config` and `simulated_portfolio` below --
 // there is only ever one current config and one current simulated portfolio,
 // same "singleton row" shape SQLite's CHECK (id = 1) enforces.
@@ -198,16 +207,29 @@ export type ProductionStore = {
   addSyncLog(log: SyncLog): void;
   listSyncLogs(limit?: number): SyncLog[];
   // analyses/ui_trades are plain append+list JSON-payload tables (Task 14
-  // brief: "mirroring current shapes") -- unbounded, same as the arrays they
-  // replace; `saveTradeIntent`'s deduped SQLite trade_intents table above
-  // remains the reconciliation source of truth, this is purely the legacy
-  // per-attempt UI history.
+  // brief: "mirroring current shapes"). The tables themselves are unpruned
+  // (writes are unbounded, like the arrays they replace), but the list reads
+  // are capped at the newest UI_LIST_DEFAULT_LIMIT rows (timestamp DESC,
+  // insertion-order tiebreak) by default -- a deliberate, disclosed departure
+  // from the old fully-unbounded array reads. `saveTradeIntent`'s deduped
+  // SQLite trade_intents table above remains the reconciliation source of
+  // truth; this is purely the legacy per-attempt UI history.
   appendAnalysis(analysis: StockAnalysis): void;
   listAnalyses(limit?: number): StockAnalysis[];
   appendUiTrade(trade: Trade): void;
   listUiTrades(limit?: number): Trade[];
   getSimulatedPortfolio(): (Record<string, unknown> & { positions: unknown[] }) | undefined;
   setSimulatedPortfolio(portfolio: Record<string, unknown> & { positions: unknown[] }): void;
+
+  // Phase 2 Task 14 review fix 2: runs `fn` inside one SQLite transaction
+  // (BEGIN IMMEDIATE -> COMMIT, ROLLBACK on any throw -- the error is
+  // rethrown after the rollback). Used by the one-time db.json migration
+  // (src/server/appStore.ts) so all five state-class copies plus the
+  // migration marker commit atomically: a crash/failure anywhere mid-copy
+  // leaves the database exactly as it was, and the marker-gated migration
+  // retries cleanly from scratch on the next boot. Not reentrant (SQLite has
+  // no nested BEGIN) -- callers must not nest transaction() calls.
+  transaction<T>(fn: () => T): T;
 };
 
 export function createProductionStore(dbPath = path.join(process.cwd(), "data", "quantpaca.sqlite")): ProductionStore {
@@ -614,7 +636,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       db.prepare("INSERT OR REPLACE INTO analyses (id, timestamp, payload_json) VALUES (?, ?, ?)")
         .run(analysis.id, analysis.timestamp, JSON.stringify(analysis));
     },
-    listAnalyses(limit = 10000) {
+    listAnalyses(limit = UI_LIST_DEFAULT_LIMIT) {
       return rowsToPayloads<StockAnalysis>(
         db.prepare("SELECT payload_json FROM analyses ORDER BY timestamp DESC, rowid DESC LIMIT ?").all(limit),
       );
@@ -623,7 +645,7 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
       db.prepare("INSERT OR REPLACE INTO ui_trades (id, timestamp, payload_json) VALUES (?, ?, ?)")
         .run(trade.id, trade.timestamp, JSON.stringify(trade));
     },
-    listUiTrades(limit = 10000) {
+    listUiTrades(limit = UI_LIST_DEFAULT_LIMIT) {
       return rowsToPayloads<Trade>(
         db.prepare("SELECT payload_json FROM ui_trades ORDER BY timestamp DESC, rowid DESC LIMIT ?").all(limit),
       );
@@ -635,6 +657,25 @@ export function createProductionStore(dbPath = path.join(process.cwd(), "data", 
     setSimulatedPortfolio(portfolio) {
       db.prepare("INSERT OR REPLACE INTO simulated_portfolio (id, payload_json, updated_at) VALUES (?, ?, ?)")
         .run(SINGLETON_ROW_ID, JSON.stringify(portfolio), new Date().toISOString());
+    },
+    transaction(fn) {
+      // BEGIN IMMEDIATE (not plain BEGIN): takes the write lock up front so
+      // the transaction can never fail mid-way on a lock upgrade under WAL.
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = fn();
+        db.exec("COMMIT");
+        return result;
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK");
+        } catch (rollbackErr) {
+          // A failed ROLLBACK (e.g. the connection itself died) must not mask
+          // the original error -- log it and rethrow the original below.
+          console.error("[persistence] ROLLBACK failed after a transaction error (the original error follows).", rollbackErr);
+        }
+        throw err;
+      }
     },
     backupTo(destPath) {
       // node:sqlite's exec() takes a raw SQL string (no parameter binding for

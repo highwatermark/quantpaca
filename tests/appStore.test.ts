@@ -235,3 +235,89 @@ test("migration: empty/absent db.json produces clean first-boot defaults and sti
   assert.deepEqual(appStore.getSimulatedPortfolio(), DEFAULT_SIMULATED_PORTFOLIO);
   assert.ok(productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY), "marker must be stamped even with no db.json");
 });
+
+// Review fix 2: the pre-transaction version of this migration copied
+// class-by-class with per-statement commits and stamped the marker LAST -- a
+// hard crash mid-copy could strand "config row present, no marker" with the
+// other four classes never copied. A boot on that stranded state must
+// complete/restart the copy from db.json, not stamp the marker over it and
+// silently lose the un-copied logs/analyses/trades.
+test("migration: stranded partial state (config present, no marker, db.json still has logs/analyses) is re-copied in full -- nothing lost", () => {
+  const { dbJsonPath, productionStore, appStore } = freshStore();
+  const fixtureConfig = { ...DEFAULT_CONFIG, system: { ...DEFAULT_CONFIG.system, runIntervalMins: 45 } };
+  const fixture = {
+    config: fixtureConfig,
+    syncLogs: [{ id: "l-stranded", timestamp: "2026-01-01T00:00:00.000Z", type: "sync", message: "written pre-crash" }],
+    analyses: [{
+      id: "a-stranded", symbol: "AAPL", source: "email", sourceTitle: "t", sourceContent: "c",
+      growthScore: 80, sentimentScore: 50, riskProfile: "Low", reasoning: "r", whipsawCheck: "w",
+      decision: "BUY", timestamp: "2026-01-01T00:00:00.000Z",
+    }],
+    trades: [{
+      id: "t-stranded", symbol: "AAPL", qty: 1, price: 100, side: "buy", status: "Accepted",
+      timestamp: "2026-01-01T00:00:00.000Z", reasoning: "r", notifiedTelegram: false, exportedSheets: false, loggedNotion: false,
+    }],
+    simulatedPortfolio: { ...DEFAULT_SIMULATED_PORTFOLIO, cash: "777.00" },
+  };
+  fs.writeFileSync(dbJsonPath, JSON.stringify(fixture, null, 2), "utf8");
+
+  // Simulate the stranded partial state: config copied, marker never stamped,
+  // nothing else copied (exactly what the old code's crash window could leave).
+  appStore.setConfig(fixtureConfig);
+  assert.equal(productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY), undefined, "sanity: no marker");
+
+  const result = migrateDbJsonIfNeeded(appStore, productionStore, dbJsonPath);
+  assert.equal(result.ran, true);
+  assert.equal(result.source, "db_json", "with db.json present and no marker, the copy must run -- never be skipped");
+
+  assert.deepEqual(appStore.getConfig(), fixtureConfig);
+  assert.equal(appStore.getLogs().length, 1, "the stranded sync log must have been copied");
+  assert.equal(appStore.listAnalyses().length, 1, "the stranded analysis must have been copied");
+  assert.equal(appStore.listTrades().length, 1, "the stranded trade must have been copied");
+  assert.deepEqual(appStore.getSimulatedPortfolio(), fixture.simulatedPortfolio);
+  assert.ok(productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY), "marker stamped only once the copy is complete");
+});
+
+// Review fix 2 (transaction): every copy plus the marker commits atomically.
+// A failure mid-copy must roll ALL of it back -- no partially-copied rows may
+// survive into the clean-defaults fallback.
+test("migration: a mid-copy failure rolls back the entire transaction -- no partial rows survive into the fallback", () => {
+  const { dbJsonPath, productionStore, appStore } = freshStore();
+  const customConfig = { ...DEFAULT_CONFIG, system: { ...DEFAULT_CONFIG.system, runIntervalMins: 77 } };
+  const fixture = {
+    config: customConfig,
+    syncLogs: [
+      { id: "l-good", timestamp: "2026-01-01T00:00:00.000Z", type: "sync", message: "copied before the poison row" },
+      // timestamp: null violates sync_logs' NOT NULL constraint -> the copy
+      // throws partway through, AFTER config and the first log were written.
+      { id: "l-poison", timestamp: null, type: "sync", message: "poison" },
+    ],
+  };
+  fs.writeFileSync(dbJsonPath, JSON.stringify(fixture, null, 2), "utf8");
+
+  const result = migrateDbJsonIfNeeded(appStore, productionStore, dbJsonPath);
+  assert.equal(result.ran, true);
+  assert.equal(result.source, "migration_failed");
+
+  assert.deepEqual(appStore.getConfig(), DEFAULT_CONFIG, "the partially-copied db.json config must have been rolled back (clean defaults instead)");
+  assert.equal(appStore.getLogs().length, 0, "the log row copied before the poison row must have been rolled back");
+  assert.ok(productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY), "marker stamped so a poisoned db.json is not retried (and re-failed) on every boot");
+});
+
+// Review fix 2 (documented branch): with the transactional copy always
+// stamping the marker in the same commit, "config present + no marker + no
+// db.json" can only mean a genuinely non-migration config (written through
+// the store before the first boot migration ever ran). It must be kept
+// as-is, never overwritten with defaults.
+test("migration: a pre-existing non-migration config with no db.json is kept as-is; marker stamped", () => {
+  const { dbJsonPath, productionStore, appStore } = freshStore();
+  assert.equal(fs.existsSync(dbJsonPath), false);
+  const preExisting = { ...DEFAULT_CONFIG, system: { ...DEFAULT_CONFIG.system, runIntervalMins: 33 } };
+  appStore.setConfig(preExisting);
+
+  const result = migrateDbJsonIfNeeded(appStore, productionStore, dbJsonPath);
+  assert.equal(result.ran, true);
+  assert.equal(result.source, "clean_default");
+  assert.deepEqual(appStore.getConfig(), preExisting, "a pre-existing non-migration config must not be overwritten");
+  assert.ok(productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY));
+});

@@ -4124,6 +4124,30 @@ async function runBackupForTests(reason: "boot" | "cycle" = "boot"): Promise<{ o
 //      the scheduler, or the HTTP server -- see that constant's comment in
 //      crashLoopGuard.ts for why staying down REQUIRES a clean exit 0 under
 //      docker-compose's `restart: on-failure`.
+// Phase 2 Task 14 review fix 1: the crash-loop check above runs FIRST at boot
+// -- deliberately BEFORE the one-time db.json -> SQLite migration (a crash
+// loop caused by any later boot step, including a buggy migration itself,
+// must still be caught). On a PRE-migration boot (marker absent) the SQLite
+// config row doesn't exist yet: the Telegram config still lives in the
+// legacy db.json, and reading only the store's clean defaults would make the
+// crash-loop alert silently no-op exactly when an upgrading deployment
+// crash-loops for the first time. This helper falls back to a tolerant,
+// READ-ONLY db.json parse for that one window; any failure (missing/corrupt
+// file, malformed shape) logs and proceeds with the store's config/defaults
+// -- the alert path never blocks or changes the boot decision.
+function telegramConfigForBootAlert(): AppConfig["telegram"] | undefined {
+  try {
+    if (!productionStore.getAppState(DBJSON_MIGRATED_AT_APP_STATE_KEY) && fs.existsSync(DB_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(DB_PATH, "utf8")) as { config?: { telegram?: AppConfig["telegram"] } };
+      const telegram = parsed?.config?.telegram;
+      if (telegram && typeof telegram === "object") return telegram;
+    }
+  } catch (err) {
+    console.error("[crash-loop] Failed to read the legacy db.json telegram config for the boot alert; falling back to the store's config/defaults.", err);
+  }
+  return appStore.getConfig().telegram;
+}
+
 async function performCrashLoopBootCheck(): Promise<{ stayDown: boolean }> {
   let hadCleanShutdownMarker = false;
   try {
@@ -4169,7 +4193,7 @@ async function performCrashLoopBootCheck(): Promise<{ stayDown: boolean }> {
     // logged, never retried -- the process is about to exit either way). No
     // throttle stamp to write: staying down IS the repeat-suppression.
     const delivered = await sendTelegramAlert(
-      appStore.getConfig().telegram,
+      telegramConfigForBootAlert(),
       `🔁🛑 <b>Crash loop detected; staying down.</b> ${decision.prunedHistory.length} boots within 1 hour (limit ${CRASH_LOOP_MAX_BOOTS}). The process will NOT restart on its own (guardrail 9) -- investigate, then restart deliberately. Positions remain broker-protected by their bracket orders.`,
     );
     if (!delivered) {
