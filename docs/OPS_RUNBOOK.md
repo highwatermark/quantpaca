@@ -10,6 +10,15 @@ HTTP timeouts, read-endpoint auth + rate limiting. Code-facing reasoning
 lives in `src/server/backupEngine.ts`, `src/server/httpDefaults.ts`,
 `src/server/rateLimiter.ts`, and the wiring in `server.ts`.
 
+Phase 2 Task 14 (docs/GO_LIVE_PLAN.md Phase 2.5, "Store consolidation"):
+`db.json` operational state (config, sync logs, the legacy UI trades/analyses
+lists, the offline simulated portfolio) has moved into SQLite. `db.json` is
+now **frozen legacy state** — read exactly once, at boot, by a one-time
+migration, and never written again. Code-facing reasoning lives in
+`src/server/appStore.ts` (the Store facade + migration) and
+`src/server/persistence.ts` (the new `config`/`sync_logs`/`analyses`/
+`ui_trades`/`simulated_portfolio` tables).
+
 ## Deploy / start
 
 ```bash
@@ -22,10 +31,40 @@ docker compose logs -f quantpaca
 curl -s http://localhost:3000/api/health | jq .
 ```
 
-State (SQLite, `db.json`, `signal-sources.json`) lives in `./data` on the
-host, volume-mounted to `/app/data` — it survives container replacement.
-Never delete `./data` casually: it holds trade intents, exit plans, audit
-history, and the crash-loop/heartbeat state.
+State (SQLite, `signal-sources.json`) lives in `./data` on the host,
+volume-mounted to `/app/data` — it survives container replacement. Never
+delete `./data` casually: it holds trade intents, exit plans, audit history,
+config, sync logs, and the crash-loop/heartbeat state. `db.json` also still
+lives in `./data` as frozen legacy state (see the Task 14 note above and the
+"Store consolidation" section below) — it is not deleted, but nothing reads
+or writes it after the very first boot's migration.
+
+### Store consolidation (Task 14) — what changed, what to expect
+
+- **First boot after upgrading to this version:** if `data/db.json` exists
+  and SQLite's `config` table is still empty, the process migrates
+  config/sync-logs (newest 5,000)/analyses/legacy-trades/simulated-portfolio
+  into SQLite on boot, before startup reconciliation runs. This is logged
+  (`[migration] db.json migrated into SQLite: ...`) and audited (`GET
+  /api/audit`, `actor: dbjson_migration`). A sibling marker file,
+  `data/db.json.MIGRATED`, is written next to `db.json` documenting this
+  (informational only — nothing reads it back; the real idempotency gate is
+  an internal SQLite `app_state` marker).
+- **A fresh install** (no `data/db.json` at all) initializes SQLite with
+  clean first-boot defaults instead — same marker, same one-time gate.
+- **Every boot after the first** is a no-op: the migration is gated on the
+  marker and never re-runs, even if `db.json` is later edited by hand (it
+  won't be — see below).
+- **`db.json` is never deleted.** It is left on disk, untouched, as a
+  conservative rollback safety net (see the restore-drill note below) — it
+  simply stops being read or written by anything in this codebase after that
+  first boot.
+- **Backups:** the `db.json` sibling copy in each backup set
+  (`data/backups/db-<stamp>.json`) is now conditional on the migration marker
+  — it rides along only for a PRE-migration boot (marker absent); once
+  migrated, `db.json` is frozen and never changes again, so copying it into
+  every future backup would be pointless. Post-migration, the SQLite snapshot
+  alone is the complete, current system of record.
 
 ## How supervision works (read once)
 
@@ -61,13 +100,17 @@ history, and the crash-loop/heartbeat state.
   (`src/server/backupEngine.ts`).
 - **What's captured:** `data/backups/quantpaca-<ISO-stamp>.sqlite` via
   SQLite's own `VACUUM INTO` (safe against a live, open WAL-mode connection —
-  not a raw file copy, which could race a concurrent writer).
-  `data/backups/db-<ISO-stamp>.json` rides alongside as a best-effort file
-  copy of `db.json` — **interim scope**: `db.json` is not yet a hard
-  dependency of backup success (a future task consolidates it into SQLite;
-  see the Phase 2.5 "Store consolidation" checkbox in `docs/GO_LIVE_PLAN.md`).
-  If the `db.json` copy fails, the SQLite backup still counts as a success —
-  only the SQLite snapshot is load-bearing today.
+  not a raw file copy, which could race a concurrent writer). Every operational
+  state class (config, sync logs, audit, trades, signals, exit plans, etc.) now
+  lives in SQLite (Task 14, "Store consolidation") — this one file is the
+  complete, current system of record post-migration.
+  `data/backups/db-<ISO-stamp>.json` rides alongside **only pre-migration**
+  (the `dbjson_migrated_at` app_state marker is absent) as a best-effort file
+  copy of `db.json`, which is still live interim state at that point. Once the
+  one-time migration has run, `db.json` is frozen legacy state that never
+  changes again, so it's no longer copied into new backups — see the "Store
+  consolidation" section above. Either way, a `db.json` copy failure never
+  fails the SQLite backup itself — only the SQLite snapshot is load-bearing.
 - **Retention:** the newest 14 backup sets are kept; older ones are deleted
   (bounded, logged). A set is both files sharing one timestamp — pruning
   always removes the pair together.
@@ -88,6 +131,18 @@ history, and the crash-loop/heartbeat state.
 Expected: after restoring a backup, the process boots cleanly, startup
 reconciliation runs, and `/api/health` reports OK.
 
+**Rollback note (Task 14, "Store consolidation"):** a backup set taken
+*before* the store-consolidation migration ran contains a real, live
+`db-<stamp>.json` alongside its `.sqlite` file — restoring that pair restores
+the pre-migration split-store state exactly as it was (the restored process
+will itself re-run the migration on next boot, same as any pre-migration
+boot). A backup set taken *after* migration has no `db-<stamp>.json` at
+all — post-migration state lives **fully** inside the `.sqlite` snapshot, so
+restoring just the SQLite file is complete and sufficient; there is nothing
+else to restore. Check which kind of backup you're restoring with
+`ls ./data/backups/ | grep <chosen-stamp>` — a `.json` file next to the
+`.sqlite` one means it's a pre-migration backup.
+
 ```bash
 docker compose stop                      # graceful stop (see "Normal operations" below)
 
@@ -96,7 +151,8 @@ ls -t ./data/backups/quantpaca-*.sqlite | head -1
 
 cp ./data/quantpaca.sqlite ./data/quantpaca.sqlite.pre-restore.bak   # safety copy of the CURRENT db first
 cp ./data/backups/quantpaca-<chosen-stamp>.sqlite ./data/quantpaca.sqlite
-# If you are also restoring db.json (see the interim-scope note above):
+# Only if a db-<chosen-stamp>.json file also exists for this stamp (a
+# pre-migration backup -- see the rollback note above):
 cp ./data/backups/db-<chosen-stamp>.json ./data/db.json
 
 docker compose up -d
