@@ -48,24 +48,33 @@ test("symbol cooldowns persist, filter expired entries, and survive reopen", () 
 
   const store = createProductionStore(dbPath);
 
-  store.saveCooldown({ symbol: "PLTR", expiresAt: "2026-07-13T00:00:00.000Z", reason: "trade reached broker" });
-  store.saveCooldown({ symbol: "OLD", expiresAt: "2020-01-01T00:00:00.000Z", reason: "long expired" });
+  // Relative to the real clock, NOT hardcoded calendar dates: saveCooldown's
+  // opportunistic cleanup deletes rows whose expires_at <= new Date() (the
+  // real wall clock), so a hardcoded "future" date silently becomes an
+  // already-expired one the day the calendar catches up and the write itself
+  // deletes the row (this exact test broke that way on 2026-07-13).
+  const nowMs = Date.now();
+  const iso = (offsetMs: number) => new Date(nowMs + offsetMs).toISOString();
+  const DAY_MS = 24 * 60 * 60 * 1000;
 
-  const active = store.listActiveCooldownSymbols("2026-07-12T00:00:00.000Z");
+  store.saveCooldown({ symbol: "PLTR", expiresAt: iso(DAY_MS), reason: "trade reached broker" });
+  store.saveCooldown({ symbol: "OLD", expiresAt: iso(-365 * DAY_MS), reason: "long expired" });
+
+  const active = store.listActiveCooldownSymbols(iso(0));
   assert.deepEqual(active, ["PLTR"]);
 
-  const noneActive = store.listActiveCooldownSymbols("2030-01-01T00:00:00.000Z");
+  const noneActive = store.listActiveCooldownSymbols(iso(30 * DAY_MS));
   assert.deepEqual(noneActive, []);
 
   // A later cooldown write for the same symbol replaces (extends) the prior window.
-  store.saveCooldown({ symbol: "PLTR", expiresAt: "2026-07-20T00:00:00.000Z", reason: "second trade" });
-  const stillOne = store.listActiveCooldownSymbols("2026-07-13T00:00:00.000Z");
+  store.saveCooldown({ symbol: "PLTR", expiresAt: iso(8 * DAY_MS), reason: "second trade" });
+  const stillOne = store.listActiveCooldownSymbols(iso(DAY_MS));
   assert.deepEqual(stillOne, ["PLTR"]);
 
   store.close();
 
   const reopened = createProductionStore(dbPath);
-  assert.deepEqual(reopened.listActiveCooldownSymbols("2026-07-13T00:00:00.000Z"), ["PLTR"]);
+  assert.deepEqual(reopened.listActiveCooldownSymbols(iso(DAY_MS)), ["PLTR"]);
   reopened.close();
   fs.unlinkSync(dbPath);
 });
@@ -102,19 +111,26 @@ test("thesis invalidations persist, filter expired entries, and survive reopen",
 
   const store = createProductionStore(dbPath);
 
-  store.saveThesisInvalidation({ symbol: "NVDA", sourceId: "michael-burry", reason: "Short Thoughts NVDA", expiresAt: "2026-08-11T00:00:00.000Z" });
-  store.saveThesisInvalidation({ symbol: "OLD", sourceId: "michael-burry", reason: "long expired", expiresAt: "2020-01-01T00:00:00.000Z" });
+  // Relative dates for the same reason as the cooldown test above: the
+  // delete-expired-on-write cleanup uses the REAL clock, so hardcoded
+  // calendar dates rot into pre-expired ones.
+  const nowMs = Date.now();
+  const iso = (offsetMs: number) => new Date(nowMs + offsetMs).toISOString();
+  const DAY_MS = 24 * 60 * 60 * 1000;
 
-  const active = store.listActiveThesisInvalidatedSymbols("2026-07-12T00:00:00.000Z");
+  store.saveThesisInvalidation({ symbol: "NVDA", sourceId: "michael-burry", reason: "Short Thoughts NVDA", expiresAt: iso(30 * DAY_MS) });
+  store.saveThesisInvalidation({ symbol: "OLD", sourceId: "michael-burry", reason: "long expired", expiresAt: iso(-365 * DAY_MS) });
+
+  const active = store.listActiveThesisInvalidatedSymbols(iso(0));
   assert.deepEqual(active, ["NVDA"]);
 
-  const noneActive = store.listActiveThesisInvalidatedSymbols("2030-01-01T00:00:00.000Z");
+  const noneActive = store.listActiveThesisInvalidatedSymbols(iso(90 * DAY_MS));
   assert.deepEqual(noneActive, []);
 
   store.close();
 
   const reopened = createProductionStore(dbPath);
-  assert.deepEqual(reopened.listActiveThesisInvalidatedSymbols("2026-07-12T00:00:00.000Z"), ["NVDA"]);
+  assert.deepEqual(reopened.listActiveThesisInvalidatedSymbols(iso(0)), ["NVDA"]);
   reopened.close();
   fs.unlinkSync(dbPath);
 });
@@ -125,28 +141,34 @@ test("do-not-buy entries persist with full record detail, filter expired entries
 
   const store = createProductionStore(dbPath);
 
-  store.saveDoNotBuy({ symbol: "NVDA", sourceId: "michael-burry", reason: "Short Thoughts NVDA (unheld)", expiresAt: "2026-08-11T00:00:00.000Z" });
-  store.saveDoNotBuy({ symbol: "OLD", sourceId: "michael-burry", reason: "long expired", expiresAt: "2020-01-01T00:00:00.000Z" });
+  // Relative dates -- same rationale as the cooldown test above.
+  const nowMs = Date.now();
+  const iso = (offsetMs: number) => new Date(nowMs + offsetMs).toISOString();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const firstExpiry = iso(30 * DAY_MS);
 
-  const active = store.listActiveDoNotBuy("2026-07-12T00:00:00.000Z");
+  store.saveDoNotBuy({ symbol: "NVDA", sourceId: "michael-burry", reason: "Short Thoughts NVDA (unheld)", expiresAt: firstExpiry });
+  store.saveDoNotBuy({ symbol: "OLD", sourceId: "michael-burry", reason: "long expired", expiresAt: iso(-365 * DAY_MS) });
+
+  const active = store.listActiveDoNotBuy(iso(0));
   assert.equal(active.length, 1);
   assert.equal(active[0].symbol, "NVDA");
   assert.equal(active[0].sourceId, "michael-burry");
   assert.equal(active[0].reason, "Short Thoughts NVDA (unheld)");
-  assert.equal(active[0].expiresAt, "2026-08-11T00:00:00.000Z");
+  assert.equal(active[0].expiresAt, firstExpiry);
 
-  assert.deepEqual(store.listActiveDoNotBuy("2030-01-01T00:00:00.000Z"), []);
+  assert.deepEqual(store.listActiveDoNotBuy(iso(90 * DAY_MS)), []);
 
   // A later write for the same symbol replaces (extends/updates) the prior entry.
-  store.saveDoNotBuy({ symbol: "NVDA", sourceId: "michael-burry", reason: "renewed", expiresAt: "2026-09-01T00:00:00.000Z" });
-  const renewed = store.listActiveDoNotBuy("2026-08-15T00:00:00.000Z");
+  store.saveDoNotBuy({ symbol: "NVDA", sourceId: "michael-burry", reason: "renewed", expiresAt: iso(50 * DAY_MS) });
+  const renewed = store.listActiveDoNotBuy(iso(35 * DAY_MS));
   assert.equal(renewed.length, 1);
   assert.equal(renewed[0].reason, "renewed");
 
   store.close();
 
   const reopened = createProductionStore(dbPath);
-  const reopenedActive = reopened.listActiveDoNotBuy("2026-08-15T00:00:00.000Z");
+  const reopenedActive = reopened.listActiveDoNotBuy(iso(35 * DAY_MS));
   assert.equal(reopenedActive.length, 1);
   assert.equal(reopenedActive[0].symbol, "NVDA");
   reopened.close();
