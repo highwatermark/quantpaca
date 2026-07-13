@@ -117,6 +117,7 @@ after(() => {
 
 const { app } = await import("../server");
 const { createProductionStore } = await import("../src/server/persistence");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 async function placeOrder(port: number, body: { symbol: string; qty: number; side: "buy" | "sell"; price: number }) {
   const res = await fetch(`http://127.0.0.1:${port}/api/override/trade`, {
@@ -136,11 +137,12 @@ async function closeAll(port: number) {
 }
 
 // Telegram config is persisted through stripPersistedSecrets (which blanks the
-// botToken) on the /api/config route, so enable it by editing db.json directly.
+// botToken) on the /api/config route, so enable it by seeding the store directly.
 function enableTelegramDirectly() {
-  const db = JSON.parse(fs.readFileSync(dbJsonPath, "utf8"));
-  db.config.telegram = { botToken: "test-bot-token", chatId: "test-chat", enabled: true };
-  fs.writeFileSync(dbJsonPath, JSON.stringify(db, null, 2), "utf8");
+  withAppStore(dataDir, (store) => {
+    const config = store.getConfig();
+    store.setConfig({ ...config, telegram: { botToken: "test-bot-token", chatId: "test-chat", enabled: true } });
+  });
 }
 
 function positionFixture(symbol: string, qty: number, price: number) {

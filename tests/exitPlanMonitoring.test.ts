@@ -44,6 +44,7 @@ after(() => {
 
 const { app } = await import("../server");
 const { createProductionStore } = await import("../src/server/persistence");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 const ADMIN_TOKEN = "test-admin-token-0123456789";
 const dbJsonPath = path.join(dataDir, "db.json");
@@ -85,44 +86,39 @@ async function runSync(port: number) {
   return res.json() as Promise<any>;
 }
 
-function readDbJson() {
-  return JSON.parse(fs.readFileSync(dbJsonPath, "utf8"));
-}
-
-function writeDbJson(db: any) {
-  fs.writeFileSync(dbJsonPath, JSON.stringify(db, null, 2), "utf8");
-}
-
 // Directly mutates the simulated position's current_price/unrealized_plpc between
 // the buy and the sync -- simulates the market having moved without needing a
 // second broker round trip (there is no live broker in these tests; the local
 // simulated portfolio is the "market" this monitoring loop reads from).
 function setSimulatedMarketState(symbol: string, currentPrice: number, unrealizedPlPercent: number) {
-  const db = readDbJson();
-  const pos = (db.simulatedPortfolio.positions || []).find((p: any) => p.symbol === symbol);
-  assert.ok(pos, `expected a simulated position for ${symbol}`);
-  pos.current_price = String(currentPrice);
-  pos.unrealized_plpc = String(unrealizedPlPercent / 100);
-  writeDbJson(db);
+  withAppStore(dataDir, (store) => {
+    const simulatedPortfolio = store.getSimulatedPortfolio();
+    const pos = (simulatedPortfolio.positions || []).find((p: any) => p.symbol === symbol);
+    assert.ok(pos, `expected a simulated position for ${symbol}`);
+    pos.current_price = String(currentPrice);
+    pos.unrealized_plpc = String(unrealizedPlPercent / 100);
+    store.setSimulatedPortfolio(simulatedPortfolio);
+  });
 }
 
 // Injects a position directly into the simulated portfolio, bypassing the trade
 // pipeline entirely -- simulates a manual buy or pre-existing position that was
 // never routed through executeTradeIntent, so it has no persisted exit plan.
 function injectUnplannedPosition(symbol: string, qty: number, currentPrice: number, unrealizedPlPercent: number) {
-  const db = readDbJson();
-  db.simulatedPortfolio.positions = db.simulatedPortfolio.positions || [];
-  db.simulatedPortfolio.positions.push({
-    symbol,
-    qty: String(qty),
-    market_value: String(qty * currentPrice),
-    cost_basis: String(qty * currentPrice),
-    unrealized_pl: "0.00",
-    unrealized_plpc: String(unrealizedPlPercent / 100),
-    current_price: String(currentPrice),
-    avg_entry_price: String(currentPrice),
+  withAppStore(dataDir, (store) => {
+    const simulatedPortfolio = store.getSimulatedPortfolio();
+    simulatedPortfolio.positions.push({
+      symbol,
+      qty: String(qty),
+      market_value: String(qty * currentPrice),
+      cost_basis: String(qty * currentPrice),
+      unrealized_pl: "0.00",
+      unrealized_plpc: String(unrealizedPlPercent / 100),
+      current_price: String(currentPrice),
+      avg_entry_price: String(currentPrice),
+    });
+    store.setSimulatedPortfolio(simulatedPortfolio);
   });
-  writeDbJson(db);
 }
 
 function futureIso(days: number) {

@@ -49,13 +49,13 @@ after(() => {
 });
 
 const { app, runScheduledSyncTickForTests } = await import("../server");
-const dbJsonPath = path.join(dataDir, "db.json");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 function enableTelegram() {
-  const raw = fs.existsSync(dbJsonPath) ? JSON.parse(fs.readFileSync(dbJsonPath, "utf8")) : {};
-  raw.config = { ...(raw.config || {}), telegram: { botToken: "test-telegram-bot-token", chatId: "test-chat-id", enabled: true } };
-  fs.mkdirSync(path.dirname(dbJsonPath), { recursive: true });
-  fs.writeFileSync(dbJsonPath, JSON.stringify(raw, null, 2), "utf8");
+  withAppStore(dataDir, (store) => {
+    const config = store.getConfig();
+    store.setConfig({ ...config, telegram: { botToken: "test-telegram-bot-token", chatId: "test-chat-id", enabled: true } });
+  });
 }
 
 async function setAutoTrading(port: number) {
@@ -74,9 +74,9 @@ test("guardrail 7: the third consecutive failed scheduled cycle pauses trading -
   const port = (listener.address() as { port: number }).port;
   t.after(() => listener.close());
 
-  // Order matters: POST /api/config (setAutoTrading) round-trips db.config
+  // Order matters: POST /api/config (setAutoTrading) round-trips config
   // through stripPersistedSecrets, which always zeroes telegram.botToken --
-  // enableTelegram's direct db.json write must happen AFTER, or the config
+  // enableTelegram's direct store seed must happen AFTER, or the config
   // POST below would immediately wipe it back out (same reasoning as
   // emptySyncTelegramThrottle.test.ts's enableTelegram comment).
   await setAutoTrading(port);

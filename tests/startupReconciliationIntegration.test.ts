@@ -122,6 +122,7 @@ after(() => {
 const { app, runStartupReconciliationForTests } = await import("../server");
 const { createProductionStore } = await import("../src/server/persistence");
 const startupReconciliation = await import("../src/server/startupReconciliation");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 async function setConfig(port: number) {
   const res = await fetch(`http://127.0.0.1:${port}/api/config`, {
@@ -135,10 +136,10 @@ async function setConfig(port: number) {
 }
 
 function enableTelegram() {
-  const raw = fs.existsSync(dbJsonPath) ? JSON.parse(fs.readFileSync(dbJsonPath, "utf8")) : {};
-  raw.config = { ...(raw.config || {}), telegram: { botToken: "test-telegram-bot-token", chatId: "test-chat-id", enabled: true } };
-  fs.mkdirSync(path.dirname(dbJsonPath), { recursive: true });
-  fs.writeFileSync(dbJsonPath, JSON.stringify(raw, null, 2), "utf8");
+  withAppStore(dataDir, (store) => {
+    const config = store.getConfig();
+    store.setConfig({ ...config, telegram: { botToken: "test-telegram-bot-token", chatId: "test-chat-id", enabled: true } });
+  });
 }
 
 async function placeOrder(port: number, body: { symbol: string; qty: number; side: "buy" | "sell"; price: number }) {
@@ -208,9 +209,9 @@ test("orphan sweep: an unmatched open broker order blocks new BUYs and alerts Te
   const port = (listener.address() as { port: number }).port;
   t.after(() => listener.close());
   await setConfig(port);
-  // Order matters: POST /api/config (setConfig) round-trips db.config through
+  // Order matters: POST /api/config (setConfig) round-trips config through
   // stripPersistedSecrets, which always zeroes telegram.botToken -- this
-  // direct db.json write must happen AFTER, or setConfig would immediately
+  // direct store seed must happen AFTER, or setConfig would immediately
   // wipe it back out (same reasoning as schedulerAutoPauseThreeFailures.test.ts's
   // enableTelegram comment).
   enableTelegram();

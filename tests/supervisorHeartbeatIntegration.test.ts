@@ -101,6 +101,7 @@ after(() => {
 
 const { runCrashLoopBootCheckForTests, runScheduledSyncTickForTests, runWatchdogCheckForTests } = await import("../server");
 const { createProductionStore } = await import("../src/server/persistence");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 const {
   CRASH_LOOP_WINDOW_MS,
   RESTART_HISTORY_APP_STATE_KEY,
@@ -116,23 +117,21 @@ const {
 // sends to actually fire against the mocked fetch above. autoTrading on so
 // scheduled ticks run cycles and the watchdog is armed to care.
 function writeDbJson(overrides?: { autoTrading?: boolean }) {
-  fs.mkdirSync(path.dirname(dbJsonPath), { recursive: true });
-  fs.writeFileSync(
-    dbJsonPath,
-    JSON.stringify({
-      config: {
-        telegram: { botToken: "test-bot-token", chatId: "test-chat-id", enabled: true },
-        system: {
-          autoTrading: overrides?.autoTrading ?? true,
-          runIntervalMins: 15,
-          maxPositionSizePercent: 10,
-          stopLossPercent: 5,
-          targetProfitPercent: 15,
-        },
+  withAppStore(dataDir, (store) => {
+    const config = store.getConfig();
+    store.setConfig({
+      ...config,
+      telegram: { botToken: "test-bot-token", chatId: "test-chat-id", enabled: true },
+      system: {
+        ...config.system,
+        autoTrading: overrides?.autoTrading ?? true,
+        runIntervalMins: 15,
+        maxPositionSizePercent: 10,
+        stopLossPercent: 5,
+        targetProfitPercent: 15,
       },
-    }, null, 2),
-    "utf8",
-  );
+    });
+  });
 }
 writeDbJson();
 

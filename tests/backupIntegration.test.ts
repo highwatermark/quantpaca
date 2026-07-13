@@ -53,6 +53,7 @@ const { runBackupForTests, runScheduledSyncTickForTests } = await import("../ser
 const { CYCLE_COUNT_APP_STATE_KEY } = await import("../src/server/heartbeat");
 const { BACKUP_LAST_SUCCESS_AT_APP_STATE_KEY } = await import("../src/server/backupEngine");
 const { createProductionStore } = await import("../src/server/persistence");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 function setAppState(key: string, value: string) {
   const store = createProductionStore(path.join(dataDir, "quantpaca.sqlite"));
@@ -72,6 +73,14 @@ function getAppState(key: string): string | undefined {
   }
 }
 
+// Phase 2 Task 14: db.json itself is no longer read at request time (only
+// once, at boot, by the migration -- never triggered in this test file), so
+// this ALSO seeds the running server's actual config through the store
+// directly (autoTrading must be true for runScheduledSyncTickForTests below
+// to actually run a cycle). The on-disk db.json file is still written too
+// (pre-migration -- the marker is never stamped in this file, so
+// backupDeps.dbJsonExists stays true) purely to exercise the "db.json rides
+// alongside" backup-copy assertion below.
 function writeDbJson() {
   fs.mkdirSync(path.dirname(dbJsonPath), { recursive: true });
   fs.writeFileSync(
@@ -84,6 +93,14 @@ function writeDbJson() {
     }, null, 2),
     "utf8",
   );
+  withAppStore(dataDir, (store) => {
+    const config = store.getConfig();
+    store.setConfig({
+      ...config,
+      telegram: { botToken: "", chatId: "", enabled: false },
+      system: { ...config.system, autoTrading: true, runIntervalMins: 15, maxPositionSizePercent: 10, stopLossPercent: 5, targetProfitPercent: 15 },
+    });
+  });
 }
 writeDbJson();
 

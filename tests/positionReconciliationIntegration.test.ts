@@ -158,12 +158,13 @@ after(() => {
 });
 
 const { app } = await import("../server");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 function enableTelegram() {
-  const raw = fs.existsSync(dbJsonPath) ? JSON.parse(fs.readFileSync(dbJsonPath, "utf8")) : {};
-  raw.config = { ...(raw.config || {}), telegram: { botToken: "test-telegram-bot-token", chatId: "test-chat-id", enabled: true } };
-  fs.mkdirSync(path.dirname(dbJsonPath), { recursive: true });
-  fs.writeFileSync(dbJsonPath, JSON.stringify(raw, null, 2), "utf8");
+  withAppStore(dataDir, (store) => {
+    const config = store.getConfig();
+    store.setConfig({ ...config, telegram: { botToken: "test-telegram-bot-token", chatId: "test-chat-id", enabled: true } });
+  });
 }
 
 async function placeOrder(port: number, body: { symbol: string; qty: number; side: "buy" | "sell"; price: number }) {

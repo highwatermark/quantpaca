@@ -135,6 +135,7 @@ after(() => {
 
 const { app } = await import("../server");
 const { createProductionStore } = await import("../src/server/persistence");
+const { withAppStore } = await import("./helpers/appStoreFixture");
 
 async function runSync(port: number) {
   const res = await fetch(`http://127.0.0.1:${port}/api/sync`, {
@@ -177,20 +178,20 @@ const dbJsonPath = path.join(dataDir, "db.json");
 // unaffected). Requires db.json to already exist (call after at least one
 // prior request in the test, e.g. enableAutoTrading).
 function injectPricedGhostPosition(symbol: string, price: number) {
-  const db = JSON.parse(fs.readFileSync(dbJsonPath, "utf8"));
-  db.simulatedPortfolio = db.simulatedPortfolio || { positions: [], cash: "100000", long_market_value: "0" };
-  db.simulatedPortfolio.positions = db.simulatedPortfolio.positions || [];
-  db.simulatedPortfolio.positions.push({
-    symbol,
-    qty: "0",
-    market_value: "0",
-    cost_basis: "0",
-    unrealized_pl: "0.00",
-    unrealized_plpc: "0.0000",
-    current_price: String(price),
-    avg_entry_price: String(price),
+  withAppStore(dataDir, (store) => {
+    const simulatedPortfolio = store.getSimulatedPortfolio();
+    simulatedPortfolio.positions.push({
+      symbol,
+      qty: "0",
+      market_value: "0",
+      cost_basis: "0",
+      unrealized_pl: "0.00",
+      unrealized_plpc: "0.0000",
+      current_price: String(price),
+      avg_entry_price: String(price),
+    });
+    store.setSimulatedPortfolio(simulatedPortfolio);
   });
-  fs.writeFileSync(dbJsonPath, JSON.stringify(db, null, 2), "utf8");
 }
 
 async function seedPosition(port: number, symbol: string, qty: number, price: number) {
