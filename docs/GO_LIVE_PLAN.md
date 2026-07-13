@@ -317,3 +317,72 @@ mapping (regime-change source is live as of Task 9).
 final review. Options: (a) merge locally, (b) open a PR for your own review first,
 (c) hold. The executor stopped here per guardrail 1 — Phase 2 begins only after your
 sign-off.
+
+---
+
+## Phase 2 completion report (2026-07-13, branch `phase2-operational-spine`, HEAD `9757f2c`)
+
+**Status: all 14 Phase 2 checkboxes complete.** 36 commits, 185 → 572 tests, lint + full
+suite independently verified green at HEAD. Same process as Phase 1: fresh implementer
+per task, adversarial spec+quality review, fix/re-review loops (8 of 14 tasks needed fix
+rounds — the reviews caught real defects each time), then a whole-branch final review
+whose fix wave closed 2 Criticals and 4 Importants no per-task review could see.
+Final verdict: **"Ready to merge: Yes."**
+
+**What the final review caught (cross-task):** every broker-side bracket exit would have
+permanently latched the reconciliation breaker (leg fills now write a synthetic SELL
+ledger entry and complete the exit plan); sell paths canceled protective legs before a
+risk gate could still reject the sell (all four sell paths now pre-flight sell-fatal
+gates BEFORE touching legs, and liquidation alerts are status-aware — never claim a
+close that didn't reach the broker); lowercase symbols bypassed every buy gate (one
+normalization at the chokepoint); broker hard-down never fed the auto-pause (now it
+does); UnknownBrokerState untested (now pinned).
+
+**Schema/persistence disclosures (guardrail 5):** new tables `symbol_cooldowns`-era
+plus this phase: `thesis_invalidations`, `do_not_buy`, `config`, `sync_logs`,
+`analyses`, `ui_trades`, `simulated_portfolio`; app_state keys (scheduler failure
+counter, throttle stamps, restart history, orphan list, acknowledged baselines,
+migration marker); one-time transactional db.json→SQLite migration (db.json frozen,
+never deleted; `.MIGRATED` sibling marker). New env var: `QUANTPACA_READ_TOKEN`
+(read-endpoint auth; boot-validated; unset → admin token required for reads + boot
+warning). New files: `Dockerfile`, `docker-compose.yml`, `data/signal-sources.json`
+(registry), `docs/OPS_RUNBOOK.md` (drills: crash-loop, restore, kill -9). No new npm
+dependencies.
+
+**Disclosed behavior changes:** bracket orders use `time_in_force: gtc` for the whole
+bracket (entry was day); crash-loop guard counts the initial boot, so it stays down
+after 2 rapid kills, not 3 — stricter than guardrail 9's prose, safety-conservative
+(runbook notes it); UI list reads capped at newest 10,000 (named constant).
+
+**Decisions requiring explicit human sign-off before the 5-day run:**
+1. *Sell-side risk-gate policy:* daily-loss / daily-trade-count / buying-power gates
+   can still reject a PROTECTIVE exit sell (pre-existing semantics, untouched per
+   guardrail 3). The system now handles it honestly (legs stay in place, honest skip
+   audit) — but decide: should risk-reducing sells ever be blocked by these gates?
+2. *Email autonomy (blocker for part of the exit criteria):* scheduled cycles have no
+   Gmail credential — ALL email sources (ZipTrader/Fool/Burry) are inert on unattended
+   cycles; only YouTube sentiment runs autonomously. Needs a server-side Gmail refresh
+   token (follow-up task + your OAuth consent) before "all new sources producing
+   attributed signals" can be satisfied unattended.
+3. *Enabling Motley Fool / Burry:* both ship `enabled: false` in
+   data/signal-sources.json. Before flipping them on, the ZipTrader-flavored base
+   analysis prompt should be made source-generic (tracked follow-up M4).
+4. *Overnight broker maintenance* (>45 min) can now trip auto-pause since broker
+   failures count toward guardrail 7 (per spec) — accept, or scope connectivity
+   failures to market-open cycles.
+
+**Known follow-ups (non-blocking, ledgered):** partial-leg-fill-then-cancel leaves
+filled shares unledgered → drift alarm (fails toward the alarm, correct direction);
+plus the per-task Minors in .superpowers/sdd/progress.md.
+
+**Phase 2 exit criteria status:** all code-verifiable criteria are met by tests
+(scheduler cycles, bracketed orders, polling, reconciliation gating, heartbeats,
+auto-restart machinery). The binding criterion — **5 consecutive unattended market
+days in paper mode** — is wall-clock validation only you can start: deploy via
+`docker compose up -d` (see docs/OPS_RUNBOOK.md), enable autoTrading, and let it run.
+Recommend resolving sign-off item 2 first so email signals participate.
+
+**Branch decision needed:** merge `phase2-operational-spine` to `main` (final review:
+Yes), or PR first. Note: the Phase 1 merge commit on local `main` is still unpushed to
+origin (push was blocked pending your approval). The executor stopped here per
+guardrail 1 — Phase 3 begins only after your sign-off AND the 5-day run.
