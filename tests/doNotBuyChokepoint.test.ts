@@ -67,6 +67,38 @@ test("manual override BUY of a symbol on the do-not-buy list is RiskRejected wit
   );
 });
 
+// Phase 2 final review, finding I1: /api/override/trade used to pass
+// req.body.symbol RAW into executeTradeIntent, but the do-not-buy/cooldown
+// lookups (and every other chokepoint check) compare case-SENSITIVELY
+// against the uppercase symbols those lists are keyed on -- only
+// submitTradeThroughPipeline's own validateSymbol normalized to uppercase,
+// and only AFTER every chokepoint check above it had already run against the
+// raw, un-normalized string. A lowercase symbol therefore sailed straight
+// past the do-not-buy block.
+test("a lowercase override BUY of a do-not-buy symbol is still rejected -- the chokepoint is case-insensitive", async (t) => {
+  const listener = app.listen(0);
+  const port = (listener.address() as { port: number }).port;
+  t.after(() => listener.close());
+
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  seedDoNotBuy("LOWERME", expiresAt);
+
+  const buy = await placeOrder(port, { symbol: "lowerme", qty: 1, side: "buy", price: 100 });
+  assert.equal(
+    buy.body.trade.status,
+    "RiskRejected",
+    `expected the chokepoint to reject the lowercase manual BUY, got: ${JSON.stringify(buy.body.trade)}`,
+  );
+  assert.match(buy.body.trade.riskDecision.reason, /do-not-buy/i);
+  assert.equal(buy.body.trade.symbol, "LOWERME", "the trade record itself must carry the canonical uppercase symbol");
+
+  const audit = await (await fetch(`http://127.0.0.1:${port}/api/audit`, { headers: { "x-admin-token": "test-admin-token-0123456789" } })).json() as any[];
+  assert.ok(
+    audit.some((e) => e.entityId === buy.body.trade.id && /do-not-buy/i.test(JSON.stringify(e))),
+    "expected an audit event for the rejected lowercase trade referencing the do-not-buy block",
+  );
+});
+
 test("admin escape hatch: DELETE /api/do-not-buy/:symbol removes the entry (audited), after which the BUY proceeds", async (t) => {
   const listener = app.listen(0);
   const port = (listener.address() as { port: number }).port;

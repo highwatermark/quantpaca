@@ -18,6 +18,7 @@ import {
   submitTradeThroughPipeline,
   TradeRequest,
   TradeState,
+  validateSymbol,
 } from "./src/server/tradingSafety";
 import {
   fetchBrokerOrder,
@@ -414,6 +415,23 @@ async function executeTradeIntent(input: {
   // of being suppressed by a broken clock.
   marketKnownClosed?: boolean;
 }) {
+  // Phase 2 final review, finding I1: normalize the symbol ONCE, here, at the
+  // shared order chokepoint -- before ANY downstream consumer reads it. Every
+  // check below this line (do-not-buy lookup, cooldown lookup, tradability
+  // check, reviewRisk's intent.symbol) compares case-SENSITIVELY, but
+  // submitTradeThroughPipeline's own validateSymbol normalizes internally and
+  // persists the trade uppercase -- so a lowercase symbol used to sail past
+  // every one of those chokepoint checks (they never matched the uppercase
+  // entries do-not-buy/cooldown store) and land in the ledger uppercase
+  // anyway, poisoning reconciliation's per-symbol key in the process. Reuses
+  // validateSymbol's own trim+uppercase normalization -- no forked logic --
+  // and falls back to the original (invalid) string when normalization fails
+  // so the existing "invalid symbol" RiskRejected path (inside
+  // submitTradeThroughPipeline) still fires with a clear message rather than
+  // this silently swallowing a malformed symbol.
+  const symbolNormalization = validateSymbol(input.request.symbol);
+  input.request.symbol = symbolNormalization.normalized || input.request.symbol;
+
   const brokerConfig = getBrokerConfig();
   const portfolio = await getAlpacaPortfolio(brokerConfig);
   const portfolioAssessment = assessPortfolio({
