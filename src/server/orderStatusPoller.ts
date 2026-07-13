@@ -292,6 +292,21 @@ export type LegPollOutcome = {
   auditEvents: PartialAuditEvent[];
   becameTerminal: boolean;
   legMappedState: TradeState;
+  // Bracket-orders review finding C1: set only when this poll discovered a
+  // leg newly Filled with a usable filled_qty. A distinct, ready-to-persist
+  // PipelineTrade the caller must save (via the same saveTrade/saveTradeIntent
+  // path it already uses for `trade` above) so the SELL-side ledger entry
+  // this fill implies actually lands in trade_intents -- see
+  // computeExpectedPositions (reconciliationEngine.ts), which sums
+  // broker-successful BUY fills minus SELL fills per symbol. Without this,
+  // that sum never learns a broker-side leg fill happened at all, and keeps
+  // expecting the position forever (a permanent, sticky missing_position
+  // mismatch/breaker latch for a perfectly healthy fill).
+  syntheticSellTrade?: PipelineTrade;
+  // Same "unusable response" meaning as TradePollOutcome.unusableReason
+  // above: a Filled-implying leg status with no usable filled_qty. Set
+  // instead of advancing brokerLegStates -- see the guard below for why.
+  unusableReason?: string;
 };
 
 // Applies a leg's poll result onto its OWNING (entry) trade -- brokerLegStates
@@ -307,11 +322,35 @@ export function applyLegPollResult(
   now: () => Date,
 ): LegPollOutcome {
   const mapped = mapBrokerStatusToTradeState(poll.status);
+  const previousLegState = trade.brokerLegStates?.[legId];
+
+  // Same "unusable response" guard as applyTradePollResult above: a Filled
+  // leg with no usable filled_qty must not advance brokerLegStates to a
+  // terminal state. Terminal leg states are never re-polled (see
+  // POLLABLE_TRADE_STATES/selectPollTargets), so recording "Filled" here
+  // without a usable quantity would both (a) permanently freeze this leg as
+  // un-repollable and (b) still be exactly the C1 poisoning bug in a
+  // different shape -- a "filled" leg with no SELL-side ledger entry ever
+  // recorded for it, because there is no usable quantity to record one with.
+  // Leaving state untouched (only lastPollError set) keeps the leg pollable
+  // so a later, well-formed response self-corrects.
+  if (mapped === "Filled" && poll.filledQty === undefined) {
+    const unusableReason = `broker reported ${poll.status} for leg ${legId} (${trade.symbol}) but filled_qty was missing/unparsable; leg state unchanged.`;
+    return {
+      trade: { ...trade, lastPollError: unusableReason },
+      auditEvents: [],
+      becameTerminal: false,
+      legMappedState: previousLegState || "UnknownBrokerState",
+      unusableReason,
+    };
+  }
+
   const updated: PipelineTrade = {
     ...trade,
     brokerLegStates: { ...(trade.brokerLegStates || {}), [legId]: mapped },
   };
   const auditEvents: PartialAuditEvent[] = [];
+  let syntheticSellTrade: PipelineTrade | undefined;
 
   if (mapped === "Filled") {
     // Alpaca's own leg `type` distinguishes take-profit (a limit order) from
@@ -319,16 +358,61 @@ export function applyLegPollResult(
     // bookkeeping needed, the broker's response already carries it.
     const legType = poll.orderType === "limit" ? "take-profit" : poll.orderType === "stop" ? "stop-loss" : "leg";
     const price = poll.filledAvgPrice ?? poll.limitPrice ?? poll.stopPrice;
-    updated.exitClosedBrokerSide = { legId, legType, price, at: now().toISOString() };
+    const at = now().toISOString();
+    updated.exitClosedBrokerSide = { legId, legType, price, at };
+    // Closes the Task-5 deferred "exit-plan completion audit-only" item --
+    // same root as exitClosedBrokerSide/the missing ledger entry: the plan
+    // this entry trade carries is now explicitly recorded as complete, not
+    // just informationally noted.
+    updated.exitPlanComplete = true;
     auditEvents.push({
       type: "broker",
       entityId: trade.id,
       message: `broker-side exit filled: ${legType} @ ${price !== undefined ? price : "unknown price"} (${trade.symbol})`,
       details: { symbol: trade.symbol, tradeId: trade.id, legId, legType, price },
     });
+
+    // Bracket-orders review finding C1: the SELL-side ledger entry this fill
+    // implies. `filledQty` is guaranteed defined here (the unusable-response
+    // guard above returned early otherwise). Deterministic id (keyed off the
+    // leg id, not a random suffix) so a redundant re-application of this same
+    // leg's fill (e.g. the 422-retry single-leg re-poll in server.ts's
+    // cancelBracketLegsBeforeSell) upserts the SAME row instead of minting a
+    // second ledger entry for one real fill.
+    const filledQty = poll.filledQty as number;
+    syntheticSellTrade = {
+      id: `tr-legfill-${legId}`,
+      symbol: trade.symbol,
+      qty: filledQty,
+      price: price ?? 0,
+      side: "sell",
+      status: "Filled",
+      source: "broker_leg_fill",
+      timestamp: at,
+      reasoning: `Synthetic ledger entry: ${legType} leg ${legId} filled broker-side for ${trade.symbol} (owning entry trade ${trade.id}).`,
+      notifiedTelegram: true,
+      exportedSheets: true,
+      loggedNotion: true,
+      filledQty,
+      remainingQty: 0,
+      brokerOrderId: legId,
+      brokerStatus: poll.status,
+    };
+    auditEvents.push({
+      type: "broker",
+      entityId: syntheticSellTrade.id,
+      message: `Synthetic SELL ledger entry recorded for ${trade.symbol}: ${filledQty} share(s) via broker-side ${legType} fill (leg ${legId}, owning entry ${trade.id}).`,
+      details: { symbol: trade.symbol, tradeId: syntheticSellTrade.id, entryTradeId: trade.id, legId, legType, filledQty },
+    });
   }
 
-  return { trade: updated, auditEvents, becameTerminal: isTerminalTradeState(mapped), legMappedState: mapped };
+  return {
+    trade: updated,
+    auditEvents,
+    becameTerminal: isTerminalTradeState(mapped),
+    legMappedState: mapped,
+    syntheticSellTrade,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -454,8 +538,28 @@ export async function pollPendingOrders(input: {
     } else {
       const outcome = applyLegPollResult(trade, target.orderId, poll, now);
       auditEvents.push(...outcome.auditEvents);
+
+      if (outcome.unusableReason) {
+        // Same handling as a trade-level unusable response: logged, state
+        // left untouched (only lastPollError set), stays pollable.
+        errorLogs.push(
+          `Order-status poll unusable for ${trade.symbol} (leg order ${target.orderId}): ${outcome.unusableReason}.`,
+        );
+      }
+
       working.set(outcome.trade.id, outcome.trade);
       touched.add(outcome.trade.id);
+
+      if (outcome.syntheticSellTrade) {
+        // Saved immediately (not deferred through `working`/`touched`, which
+        // key strictly by the ENTRY trade's own id): this is a distinct trade
+        // record, and every leg-fill discovery is expected to persist at most
+        // once per leg (see the deterministic id above) -- no risk of a later
+        // target in this same cycle clobbering it with a stale copy.
+        input.saveTrade(outcome.syntheticSellTrade);
+        const message = `Ledger self-corrected for ${outcome.syntheticSellTrade.symbol}: recorded a synthetic SELL of ${outcome.syntheticSellTrade.filledQty} share(s) for the broker-side leg fill (leg ${target.orderId}).`;
+        logs.push(message);
+      }
     }
   }
 

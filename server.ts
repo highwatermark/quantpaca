@@ -1085,6 +1085,14 @@ async function cancelBracketLegsBeforeSell(input: {
           const outcome = applyLegPollResult(entryTrade, legId, poll, () => new Date());
           try {
             productionStore.saveTradeIntent(outcome.trade);
+            // Bracket-orders review finding C1: this re-poll path can ALSO be
+            // the first time a leg's fill is discovered (not just MODULE 1.5's
+            // regular poll) -- persist the synthetic SELL ledger entry here
+            // too, or a fill only ever surfaced via this 422-retry path would
+            // poison computeExpectedPositions exactly like the original bug.
+            if (outcome.syntheticSellTrade) {
+              productionStore.saveTradeIntent(outcome.syntheticSellTrade);
+            }
           } catch (saveErr: any) {
             console.error(`[bracket-cancel] Failed to persist re-polled leg state for ${legId} (${input.symbol}).`, saveErr);
           }

@@ -69,7 +69,17 @@ export type RiskDecision = {
 };
 
 export type TradeRequest = {
-  source: "manual" | "telegram" | "automation" | "stop_loss" | "emergency";
+  // "broker_leg_fill" (Task 5 / bracket-orders review finding C1): the ONE
+  // synthetic source used exclusively for the SELL-side ledger entry
+  // orderStatusPoller.ts's applyLegPollResult synthesizes when it discovers a
+  // bracket leg (take-profit/stop-loss) filled BROKER-side. No TradeRequest is
+  // ever actually built with this source (no order is submitted) -- it exists
+  // purely so the synthetic PipelineTrade record it produces is honestly
+  // labeled in the ledger/audit trail as "the system recorded this, the
+  // broker did the actual selling" rather than being misattributed to
+  // "automation" or "stop_loss" (both of which imply this process placed a
+  // real sell order).
+  source: "manual" | "telegram" | "automation" | "stop_loss" | "emergency" | "broker_leg_fill";
   symbol: string;
   side: "buy" | "sell";
   qty: number;
@@ -143,6 +153,16 @@ export type PipelineTrade = Trade & {
   // that fact visible on the trade record and in the audit trail instead of
   // silently disappearing.
   exitClosedBrokerSide?: { legId: string; legType: string; price?: number; at: string };
+  // Set alongside exitClosedBrokerSide, same moment: this entry's exit plan
+  // is done -- the position it protected was closed BROKER-side, not by a
+  // software sell this system placed. Closes the Task-5 deferred "exit-plan
+  // completion audit-only" item (bracket-orders review finding C1, same
+  // root as exitClosedBrokerSide/the missing SELL-side ledger entry): before
+  // this field existed, exitClosedBrokerSide was purely informational --
+  // nothing recorded, on the trade record itself, that the plan it belongs to
+  // had actually run its course. Never set false; simply absent until a leg
+  // fill sets it true.
+  exitPlanComplete?: boolean;
 };
 
 // Task 5 (order-status polling): trade states that mean an order actually
