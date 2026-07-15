@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.4.1  # pinned: node:test IPC deserialization failure on 24.18 with double-import test files — see ledger follow-up
           cache: npm
       - run: npm ci
       - run: npm run lint
