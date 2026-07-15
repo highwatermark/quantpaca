@@ -63,5 +63,31 @@ export function validateStartupEnv(env: NodeJS.ProcessEnv): StartupIssue[] {
     });
   }
 
+  // Phase 2 follow-up (docs/GO_LIVE_PLAN.md sign-off item 2): server-side
+  // Gmail refresh-token auth (src/server/googleTokenBroker.ts) needs ALL
+  // THREE of GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN
+  // to mint access tokens for unattended scheduled cycles. A partial set (1
+  // or 2 of 3) is a misconfiguration that must fail loudly at boot rather
+  // than silently leaving the broker "not configured" (same null result as
+  // an operator who never intended to use it) -- an operator who set two of
+  // three env vars almost certainly meant to enable this and would otherwise
+  // never notice scheduled email ingestion staying inert. Zero set (never
+  // touched the feature) and all three set (fully configured) both boot
+  // cleanly. Never echoes the value of any GOOGLE_* var in the message --
+  // only which var names are missing.
+  const googleEnvVars = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"] as const;
+  const googlePresent = googleEnvVars.filter((name) => (env[name] || "").trim().length > 0);
+  if (googlePresent.length > 0 && googlePresent.length < googleEnvVars.length) {
+    const missing = googleEnvVars.filter((name) => !googlePresent.includes(name));
+    issues.push({
+      level: "fatal",
+      message:
+        `Partial Google OAuth broker configuration: ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing. ` +
+        "GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN must be set ALL THREE or NONE -- a partial " +
+        "set would silently leave scheduled Gmail ingestion inert instead of failing loudly. Run " +
+        "scripts/get-google-refresh-token.mjs to obtain all three, or unset the ones you have to disable the broker.",
+    });
+  }
+
   return issues;
 }

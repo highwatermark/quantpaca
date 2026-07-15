@@ -84,3 +84,71 @@ test("a strong read token together with a placeholder admin token still reports 
   } as NodeJS.ProcessEnv);
   assert.ok(issues.some((i) => i.level === "fatal" && i.message.includes("ADMIN_API_TOKEN")));
 });
+
+// --- Google OAuth broker env vars (Phase 2 follow-up: server-side Gmail
+// refresh-token auth, docs/GO_LIVE_PLAN.md sign-off item 2) ---
+// GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN are
+// all-or-nothing: a partial set would silently leave scheduled email
+// ingestion inert (the broker reports "not configured" for ANY missing var)
+// instead of failing loudly, so 1-of-3 or 2-of-3 present is fatal at boot.
+// Zero present is a legitimate "not using the broker" config (existing
+// browser-header-only behavior); three present is the fully-configured case.
+// Both boot cleanly.
+
+const baseAdminEnv = { ADMIN_API_TOKEN: "a-real-secret-token-0123456789" } as NodeJS.ProcessEnv;
+
+test("zero Google OAuth broker env vars set is not fatal (broker simply unused)", () => {
+  const issues = validateStartupEnv(baseAdminEnv);
+  assert.ok(issues.every((i) => i.level !== "fatal"));
+});
+
+test("all three Google OAuth broker env vars set is not fatal", () => {
+  const issues = validateStartupEnv({
+    ...baseAdminEnv,
+    GOOGLE_CLIENT_ID: "client-id",
+    GOOGLE_CLIENT_SECRET: "client-secret",
+    GOOGLE_REFRESH_TOKEN: "refresh-token",
+  } as NodeJS.ProcessEnv);
+  assert.ok(issues.every((i) => i.level !== "fatal"));
+});
+
+test("exactly one of the three Google OAuth broker env vars set is fatal", () => {
+  const issues = validateStartupEnv({ ...baseAdminEnv, GOOGLE_CLIENT_ID: "client-id" } as NodeJS.ProcessEnv);
+  assert.ok(
+    issues.some((i) => i.level === "fatal" && /GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REFRESH_TOKEN/.test(i.message)),
+    `expected a fatal partial-config issue, got: ${JSON.stringify(issues)}`,
+  );
+});
+
+test("exactly two of the three Google OAuth broker env vars set is fatal", () => {
+  const issues = validateStartupEnv({
+    ...baseAdminEnv,
+    GOOGLE_CLIENT_ID: "client-id",
+    GOOGLE_CLIENT_SECRET: "client-secret",
+  } as NodeJS.ProcessEnv);
+  assert.ok(
+    issues.some((i) => i.level === "fatal" && /GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|GOOGLE_REFRESH_TOKEN/.test(i.message)),
+    `expected a fatal partial-config issue, got: ${JSON.stringify(issues)}`,
+  );
+  // Every combination of exactly-2-of-3 is fatal, not just this one pairing.
+  const otherPairs = [
+    { GOOGLE_CLIENT_ID: "x", GOOGLE_REFRESH_TOKEN: "y" },
+    { GOOGLE_CLIENT_SECRET: "x", GOOGLE_REFRESH_TOKEN: "y" },
+  ];
+  for (const pair of otherPairs) {
+    const pairIssues = validateStartupEnv({ ...baseAdminEnv, ...pair } as NodeJS.ProcessEnv);
+    assert.ok(pairIssues.some((i) => i.level === "fatal"), `expected fatal for ${JSON.stringify(pair)}`);
+  }
+});
+
+test("the partial-Google-config fatal message never echoes a secret value", () => {
+  const issues = validateStartupEnv({
+    ...baseAdminEnv,
+    GOOGLE_CLIENT_ID: "super-secret-client-id-value",
+    GOOGLE_CLIENT_SECRET: "super-secret-client-secret-value",
+  } as NodeJS.ProcessEnv);
+  const fatal = issues.find((i) => i.level === "fatal" && /GOOGLE_/.test(i.message));
+  assert.ok(fatal);
+  assert.ok(!fatal!.message.includes("super-secret-client-id-value"));
+  assert.ok(!fatal!.message.includes("super-secret-client-secret-value"));
+});

@@ -324,6 +324,67 @@ indefinitely on it. `marketDataFetcher.ts` and `tradabilityGuard.ts` already
 had their own `AbortSignal.timeout(10s)` + fail-closed logic before this task
 and were left as-is (no churn) rather than migrated to the new helper.
 
+## Connect Gmail (unattended scheduled ingestion)
+
+By default, Gmail-based email signal sources only work on a MANUAL sync
+triggered from a browser session that supplies its own OAuth
+`Authorization` header (`src/services/googleAuth.ts`) -- a SCHEDULED cycle
+has no browser session and this header is always null, so every email
+signal source is structurally inert unattended. `src/server/
+googleTokenBroker.ts` closes that gap: given a one-time-obtained Google
+refresh token, it mints its own short-lived access tokens for the server,
+with no human in the loop after setup.
+
+Setup (one-time, ~5 minutes):
+
+1. Create (or reuse) a project at
+   [console.cloud.google.com](https://console.cloud.google.com).
+2. Enable the **Gmail API** for that project (APIs & Services -> Library ->
+   search "Gmail API" -> Enable).
+3. Create an **OAuth 2.0 Client ID** of type **"Desktop app"** (APIs &
+   Services -> Credentials -> Create Credentials -> OAuth client ID). Note
+   the client ID and client secret.
+4. Run the helper script from the repo root:
+   ```bash
+   node scripts/get-google-refresh-token.mjs --client-id=YOUR_CLIENT_ID --client-secret=YOUR_CLIENT_SECRET
+   # or: GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... node scripts/get-google-refresh-token.mjs
+   ```
+   It starts a local listener on `localhost:8724`, prints a Google consent
+   URL -- open it, approve **read-only** Gmail access for the account you
+   want the server reading -- then prints the refresh token and three
+   ready-to-paste `.env` lines.
+5. Paste the printed `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` /
+   `GOOGLE_REFRESH_TOKEN` lines into `.env` (gitignored; see
+   `.env.example`).
+6. Restart the server. Scheduled cycles pick this up automatically -- no
+   further action needed. Watch for `[googleTokenBroker]` log lines on the
+   first cycle if something's wrong (never logs the token values
+   themselves, only status codes / static text).
+
+**All-or-nothing**: the server refuses to boot if exactly 1 or 2 of the 3
+`GOOGLE_*` vars are set (`src/server/startupChecks.ts`) -- a partial set is
+almost certainly an unfinished setup, not an intentional "broker disabled"
+choice, and the fail-closed contract means it must be loud rather than
+silently leaving scheduled ingestion inert. Leave all three unset to keep
+using the pre-existing browser-header-only behavior.
+
+**Precedence**: a browser-supplied `Authorization` header (manual sync from
+the dashboard, signed into Google) always wins over the broker; the broker
+is purely the fallback for when no such header is present (every scheduled
+cycle, and any manual sync called without one, e.g. via `curl`). This
+applies identically to Gmail ingestion and Google Sheets export -- both
+already forwarded whatever `authHeader` `runSyncCycle` resolved before this
+feature existed.
+
+**Caching**: the broker exchanges the refresh token for an access token
+once and caches it in-memory until 5 minutes before it expires (Google
+access tokens live ~1h), single-flight (concurrent callers within one
+cycle share one exchange, never duplicate it). A failed exchange (revoked
+refresh token, network error, etc.) returns null -- Gmail ingestion falls
+back to the existing zero-email-signals path (throttled Telegram alert,
+honest logs), the same degradation as "no OAuth token at all"; it does not
+crash the cycle.
+
 ## Verification status of these artifacts
 
 `docker build` / `docker compose config` were not runnable in the development
@@ -353,3 +414,19 @@ development environment (same no-Docker-daemon constraint as Task 12); the
 underlying backup file (`VACUUM INTO` output) IS verified to be a valid,
 queryable SQLite database by the automated tests. An operator should run the
 restore drill for real before relying on it in production.
+
+The Gmail refresh-token broker ("Connect Gmail" above, Phase 2 follow-up) is
+covered by `tests/googleTokenBroker.test.ts` (exchange/cache/single-flight/
+fail-closed unit behavior), `tests/startupChecks.test.ts` (the all-or-nothing
+boot check), `tests/googleTokenBrokerIntegration.test.ts` (scheduled-cycle
+and manual-sync wiring end-to-end, including browser-header precedence and
+the failed-exchange degradation path), and
+`tests/getGoogleRefreshTokenScript.test.ts` (the helper script's `--help` and
+missing-credentials paths, plus a live check that valid-looking credentials
+get past validation and print a real Google consent URL). The full
+interactive OAuth round-trip against real Google infrastructure (an operator
+actually clicking "Allow" in a browser) was NOT run in the development
+environment (no browser, no real Google Cloud project credentials available
+there) -- an operator should run the actual "Connect Gmail" setup steps once
+for real before relying on unattended scheduled Gmail ingestion in
+production.
