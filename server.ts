@@ -56,6 +56,7 @@ import { checkAssetTradable } from "./src/server/tradabilityGuard";
 import { ReconciliationReport, RegimeAssessment } from "./src/server/domainTypes";
 import { parseFiniteNumber } from "./src/server/numericSafety";
 import { EMPTY_SYNC_ALERT_STATE_KEY, EMPTY_SYNC_ALERT_WINDOW_MS, shouldSendThrottledAlert } from "./src/server/alertThrottle";
+import { getBrokerAuthHeader } from "./src/server/googleTokenBroker";
 import { createScheduler, resolveIntervalMinutes, MAX_BUYS_PER_CYCLE, MAX_CONSECUTIVE_FAILURES } from "./src/server/scheduler";
 import {
   CRASH_LOOP_MAX_BOOTS,
@@ -2039,6 +2040,23 @@ async function runSyncCycle(trigger: "manual" | "scheduled", authHeader: string 
       appStore.addLog(sl);
       logs.push(sl);
     };
+
+    // Phase 2 follow-up (docs/GO_LIVE_PLAN.md sign-off item 2): server-side
+    // Gmail refresh-token auth. `authHeader` is browser-supplied (only ever
+    // present for a manual sync driven by a live session) -- when the caller
+    // didn't supply one (every scheduled cycle, and any manual sync without
+    // a browser session), fall back to the refresh-token broker if
+    // configured. This ONE reassignment covers every downstream consumer of
+    // `authHeader` in this function (Gmail ingestion below AND every
+    // appendTradeToSheets call site) -- browser-supplied still wins whenever
+    // present, unchanged from existing behavior. Not configured or an
+    // exchange failure both resolve to null here, same as "no header at
+    // all" -- the existing zero-email-signals degradation path below already
+    // covers that honestly (throttled alert), and the broker itself already
+    // logged the reason (once, not per cycle).
+    if (!authHeader) {
+      authHeader = await getBrokerAuthHeader();
+    }
 
     const currentConfig: AppConfig = appStore.getConfig();
     // Phase 2 Task 14: read once, mutated in place at each simulated-fill
